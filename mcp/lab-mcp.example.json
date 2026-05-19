@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "lab-mcp": {
-      "command": "/path/to/lab-cli",
+      "command": "lab",
       "args": [
         "--db",
         "/path/to/lab.sqlite",

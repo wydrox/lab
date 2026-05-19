@@ -334,17 +334,23 @@ fn main() -> Result<()> {
             store,
         } => {
             let all = !ksef && !mail && !saldeo;
+            if all {
+                eprintln!("Sync: wszystkie źródła (KSeF + Gmail/PDF + Saldeo)");
+            }
             let conn = if store { Some(open_db(&db_path)?) } else { None };
             let mut synced: Vec<String> = Vec::new();
             if ksef || all {
+                eprintln!("  [KSeF] synchronizacja...");
                 let input = ksef_input.clone().unwrap_or_else(|| default_ksef_out_path(year));
                 let result = ksef_sync(year, &input, None)?;
                 if let Some(ref conn) = conn {
                     store_records(conn, &result.records)?;
                 }
+                eprintln!("  [KSeF] gotowe: {} rekordów", result.summary.records_count);
                 synced.push(format!("ksef ({})", result.summary.records_count));
             }
             if mail || all {
+                eprintln!("  [Gmail] pobieranie załączników...");
                 let token_path = gmail_token_file.clone().unwrap_or_else(default_gmail_token_path);
                 let token =
                     gmail_access_token("GMAIL_ACCESS_TOKEN", &token_path, gmail_client_secret.as_deref())?;
@@ -357,12 +363,14 @@ fn main() -> Result<()> {
                     500,
                     &["pdf".to_string()],
                 )?;
+                eprintln!("  [Gmail] pobrano {} plików, skanowanie PDF...", gmail_result.files_saved);
                 let mail_records = scan_input(SourceKind::Mail, &mail_out)?;
                 let candidates =
                     productmesh_invoice_candidates(&mail_records, &productmesh_nip);
                 if let Some(ref conn) = conn {
                     store_records(conn, &candidates)?;
                 }
+                eprintln!("  [Gmail] gotowe: {} PDF, {} faktur", mail_records.len(), candidates.len());
                 synced.push(format!(
                     "mail ({} files, {} pdfs, {} candidates)",
                     gmail_result.files_saved,
@@ -371,11 +379,13 @@ fn main() -> Result<()> {
                 ));
             }
             if saldeo || all {
+                eprintln!("  [Saldeo] pobieranie dokumentów...");
                 let result =
                     saldeo_fetch(year, &default_saldeo_storage_state_path(), &default_saldeo_out_path(year))?;
                 if let Some(ref conn) = conn {
                     store_records(conn, &result.records)?;
                 }
+                eprintln!("  [Saldeo] gotowe: {} dokumentów", result.summary.documents_count);
                 synced.push(format!("saldeo ({})", result.summary.documents_count));
             }
             write_json(
@@ -2761,6 +2771,9 @@ fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<Value> {
             let all = !json_bool(args, "ksef", false)
                 && !json_bool(args, "mail", false)
                 && !json_bool(args, "saldeo", false);
+            if all {
+                eprintln!("Sync: wszystkie źródła (KSeF + Gmail/PDF + Saldeo)");
+            }
             let conn = if json_bool(args, "store", false) {
                 Some(open_db(db_path)?)
             } else {
@@ -2769,6 +2782,7 @@ fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<Value> {
             let mut synced: Vec<String> = Vec::new();
             let mut records_count = 0usize;
             if json_bool(args, "ksef", false) || all {
+                eprintln!("  [KSeF] synchronizacja...");
                 let input = json_path_arg(args, "ksef_input")
                     .unwrap_or_else(|| default_ksef_out_path(year));
                 let result = ksef_sync(year, &input, None)?;
@@ -2776,9 +2790,11 @@ fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<Value> {
                 if let Some(ref conn) = conn {
                     store_records(conn, &result.records)?;
                 }
+                eprintln!("  [KSeF] gotowe: {} rekordów", result.summary.records_count);
                 synced.push(format!("ksef ({})", result.summary.records_count));
             }
             if json_bool(args, "mail", false) || all {
+                eprintln!("  [Gmail] pobieranie załączników...");
                 let token_path = json_path_arg(args, "gmail_token_file")
                     .unwrap_or_else(default_gmail_token_path);
                 let token = gmail_access_token(
@@ -2795,6 +2811,7 @@ fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<Value> {
                     500,
                     &["pdf".to_string()],
                 )?;
+                eprintln!("  [Gmail] pobrano {} plików, skanowanie PDF...", gmail_result.files_saved);
                 let mail_records = scan_input(SourceKind::Mail, &mail_out)?;
                 let nip = json_string_arg(args, "productmesh_nip")
                     .unwrap_or_else(|| "5242920020".to_string());
@@ -2803,6 +2820,7 @@ fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<Value> {
                 if let Some(ref conn) = conn {
                     store_records(conn, &candidates)?;
                 }
+                eprintln!("  [Gmail] gotowe: {} PDF, {} faktur", mail_records.len(), candidates.len());
                 synced.push(format!(
                     "mail ({} files, {} pdfs, {} candidates)",
                     gmail_result.files_saved,
@@ -2811,12 +2829,14 @@ fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<Value> {
                 ));
             }
             if json_bool(args, "saldeo", false) || all {
+                eprintln!("  [Saldeo] pobieranie dokumentów...");
                 let result =
                     saldeo_fetch(year, &default_saldeo_storage_state_path(), &default_saldeo_out_path(year))?;
                 records_count += result.summary.records_count;
                 if let Some(ref conn) = conn {
                     store_records(conn, &result.records)?;
                 }
+                eprintln!("  [Saldeo] gotowe: {} dokumentów", result.summary.documents_count);
                 synced.push(format!("saldeo ({})", result.summary.documents_count));
             }
             Ok(serde_json::json!({"synced": synced, "year": year, "records_count": records_count, "stored": conn.is_some()}))
@@ -3746,26 +3766,86 @@ fn onboard(db_path: &Path, check: bool, gmail_client_secret: Option<&Path>) -> R
     if !db_exists {
         open_db(db_path)?;
         eprintln!("Utworzono bazę: {}", db_path.display());
-    } else {
-        eprintln!("Baza istnieje: {}", db_path.display());
     }
 
+    let year = Utc::now().year();
+    let ksef_dir = default_ksef_out_path(year);
+    let ksef_exists = ksef_dir.exists()
+        && std::fs::read_dir(&ksef_dir)
+            .map(|mut d| d.any(|e| e.is_ok()))
+            .unwrap_or(false);
+
+    eprintln!("LAB — konfiguracja środowiska\n");
+    eprintln!("  Baza danych:     {}", if db_exists { "✓" } else { "✓ (nowa)" });
+    eprintln!("  pdftotext:       {}", if pdftotext_ok { "✓" } else { "✗ (brew install poppler)" });
+    eprintln!("  python3/pypdf:   {}", if python_ok { "✓" } else { "✗ (pip install pypdf)" });
+    eprintln!("  Gmail:           {}", if token_valid { "✓" } else if token_exists { "✗ (token wygasł)" } else { "✗" });
+    eprintln!("  Saldeo:          {}", if saldeo_exists { "✓" } else { "✗" });
+    eprintln!("  KSeF (lokalny):  {}", if ksef_exists { format!("✓ ({})", ksef_dir.display()) } else { format!("✗ ({})", ksef_dir.display()) });
+
     let needs_gmail_auth = !token_valid && !check;
-    let gmail_authed = if needs_gmail_auth {
-        if let Some(secret) = gmail_client_secret {
-            eprintln!("\n--- Autoryzacja Gmail ---");
-            let result = gmail_auth(secret, &token_file, false)?;
-            eprintln!("Token Gmail zapisany: {}", result.token_file);
-            true
+    let mut gmail_authed = token_valid;
+
+    if needs_gmail_auth {
+        let secret = if let Some(s) = gmail_client_secret {
+            Some(s.to_path_buf())
         } else {
-            eprintln!(
-                "\n⚠ Gmail nie skonfigurowany. Uruchom:\n  lab gmail-auth --client-secret <ścieżka>"
-            );
-            false
+            eprintln!("Gmail nie jest skonfigurowany.");
+            eprintln!("Potrzebny jest plik Google OAuth Desktop Client JSON.");
+            eprintln!("Można go pobrać z Google Cloud Console → APIs & Services → Credentials.");
+            eprint!("\nPodaj ścieżkę do client_secret JSON (lub Enter aby pominąć): ");
+            io::stdout().flush()?;
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            let path = input.trim().to_string();
+            if path.is_empty() {
+                None
+            } else {
+                let p = PathBuf::from(&path);
+                if p.exists() {
+                    Some(p)
+                } else {
+                    eprintln!("Plik nie istnieje: {path}");
+                    None
+                }
+            }
+        };
+
+        if let Some(secret) = secret {
+            eprintln!("\n--- Autoryzacja Gmail ---");
+            match gmail_auth(&secret, &token_file, false) {
+                Ok(result) => {
+                    eprintln!("✓ Token Gmail zapisany: {}", result.token_file);
+                    gmail_authed = true;
+                }
+                Err(err) => {
+                    eprintln!("✗ Autoryzacja nie powiodła się: {err}");
+                }
+            }
         }
-    } else {
-        token_valid
-    };
+    }
+
+    if !saldeo_exists && !check {
+        eprintln!(
+            "\nSaldeo nie jest skonfigurowane. Zapisz sesję Playwright do:\n  {}",
+            saldeo_state.display()
+        );
+    }
+
+    if !ksef_exists && !check {
+        eprintln!(
+            "\nKSeF: brak lokalnego eksportu w {}. Umieść tam pliki XML/JSON z KSeF.",
+            ksef_dir.display()
+        );
+    }
+
+    let mut steps: Vec<&str> = Vec::new();
+    if !pdftotext_ok { steps.push("brew install poppler"); }
+    if !python_ok { steps.push("python3 -m pip install pypdf"); }
+    if !gmail_authed { steps.push("lab onboard --gmail-client-secret <ścieżka>"); }
+    if !saldeo_exists { steps.push("Zapisz sesję Saldeo Playwright do ~/.config/lab/saldeo-storage-state.json"); }
+    if !ksef_exists { steps.push("Umieść eksport KSeF (XML/JSON) w data/ksef-<rok>"); }
+    if steps.is_empty() { steps.push("Wszystko gotowe. Uruchom: lab sync"); }
 
     let status = serde_json::json!({
         "prerequisites": {
@@ -3782,20 +3862,15 @@ fn onboard(db_path: &Path, check: bool, gmail_client_secret: Option<&Path>) -> R
             "storage_state": saldeo_state.display().to_string(),
             "exists": saldeo_exists
         },
+        "ksef": {
+            "directory": ksef_dir.display().to_string(),
+            "exists": ksef_exists
+        },
         "database": {
             "path": db_path.display().to_string(),
             "exists": db_exists
         },
-        "next_steps": if !pdftotext_ok || !gmail_authed || !saldeo_exists {
-            vec![
-                if !pdftotext_ok { Some("brew install poppler") } else { None },
-                if !python_ok { Some("python3 -m pip install pypdf") } else { None },
-                if !gmail_authed { Some("lab gmail-auth --client-secret <ścieżka>") } else { None },
-                if !saldeo_exists { Some("Zapisz sesję Saldeo Playwright do ~/.config/lab/saldeo-storage-state.json") } else { None },
-            ].into_iter().flatten().collect::<Vec<_>>()
-        } else {
-            vec!["Wszystko gotowe. Uruchom: lab sync --help"]
-        }
+        "next_steps": steps
     });
     write_json(&status, None)
 }
