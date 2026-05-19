@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine, engine::general_purpose::URL_SAFE, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use regex::Regex;
 use reqwest::blocking::Client;
@@ -166,10 +166,10 @@ enum Commands {
         /// Plik Playwright storage state z sesją Saldeo.
         #[arg(long)]
         storage_state: Option<PathBuf>,
-        /// Endpoint uploadu Saldeo. Wymagany przy --confirm, dopóki endpoint webowy nie jest ustabilizowany.
+        /// Endpoint generowania URL-i uploadu Saldeo.
         #[arg(long)]
         upload_url: Option<String>,
-        /// Nazwa pola multipart dla pliku.
+        /// Nazwa pola multipart dla starszego trybu; obecny endpoint używa signed URL.
         #[arg(long, default_value = "file")]
         file_field: String,
         /// Wykonaj upload. Bez tej flagi komenda tylko planuje.
@@ -729,9 +729,7 @@ fn main() -> Result<()> {
                 upload_url: upload_url.clone(),
             })?;
             if confirm {
-                let upload_url = upload_url.as_deref().ok_or_else(|| {
-                    anyhow!("--upload-url jest wymagany przy --confirm; najpierw uruchom dry-run")
-                })?;
+                let upload_url = upload_url.as_deref().unwrap_or(DEFAULT_SALDEO_UPLOAD_URL);
                 let storage_state = storage_state.unwrap_or_else(default_saldeo_storage_state_path);
                 saldeo_upload_plan(&mut plan, &storage_state, upload_url, &file_field)?;
             }
@@ -3703,7 +3701,7 @@ fn mcp_tools() -> Value {
         },
         {
             "name": "saldeo_sync",
-            "description": "Plan or execute upload of invoices missing in Saldeo from tri-reconcile or source records. Upload requires confirm=true and upload_url.",
+            "description": "Plan or execute upload of invoices missing in Saldeo from tri-reconcile or source records. Upload requires confirm=true; upload_url defaults to the verified generate-urls endpoint.",
             "inputSchema": {"type":"object","properties":{"year":{"type":"integer","default":2026},"tri_report":{"type":"string"},"mail":{"type":"string"},"ksef":{"type":"string"},"saldeo":{"type":"string"},"review_score":{"type":"integer","default":70},"confirm":{"type":"boolean","default":false},"upload_url":{"type":"string"},"file_field":{"type":"string","default":"file"}}}
         },
         {
@@ -3959,7 +3957,9 @@ fn saldeo_sync_plan(config: SaldeoSyncPlanConfig<'_>) -> Result<SaldeoSyncPlan> 
         generated_at: Utc::now(),
         year: config.year,
         confirm: config.confirm,
-        upload_url: config.upload_url,
+        upload_url: config
+            .upload_url
+            .or_else(|| Some(DEFAULT_SALDEO_UPLOAD_URL.to_string())),
         summary,
         items,
     })
@@ -4014,11 +4014,14 @@ fn saldeo_sync_summary(items: &[SaldeoSyncItem]) -> SaldeoSyncSummary {
     }
 }
 
+const DEFAULT_SALDEO_UPLOAD_URL: &str =
+    "https://saldeo.brainshare.pl/rest/client/document/generate-urls-for-upload";
+
 fn saldeo_upload_plan(
     plan: &mut SaldeoSyncPlan,
     storage_state: &Path,
     upload_url: &str,
-    file_field: &str,
+    _file_field: &str,
 ) -> Result<()> {
     let session = read_saldeo_session(storage_state)?;
     let client = Client::builder().build()?;
@@ -4029,23 +4032,23 @@ fn saldeo_upload_plan(
         let Some(source_path) = &item.source_path else {
             continue;
         };
+        let upload_year = item.issue_date.map(|d| d.year()).unwrap_or(plan.year);
+        let upload_month = item
+            .issue_date
+            .map(|d| d.month())
+            .unwrap_or_else(|| Utc::now().month());
         match saldeo_upload_file(
             &client,
             &session,
             upload_url,
-            file_field,
             Path::new(source_path),
+            upload_year,
+            upload_month,
         ) {
-            Ok((status, body)) if (200..300).contains(&status) => {
+            Ok((status, body)) => {
                 item.upload_status = "uploaded".to_string();
                 item.saldeo_response_status = Some(status);
                 item.saldeo_response_body = Some(body);
-            }
-            Ok((status, body)) => {
-                item.upload_status = "failed".to_string();
-                item.saldeo_response_status = Some(status);
-                item.saldeo_response_body = Some(body);
-                item.error = Some(format!("HTTP {status}"));
             }
             Err(err) => {
                 item.upload_status = "failed".to_string();
@@ -4097,24 +4100,136 @@ fn saldeo_upload_file(
     client: &Client,
     session: &SaldeoSession,
     upload_url: &str,
-    file_field: &str,
     path: &Path,
+    year: i32,
+    month: u32,
 ) -> Result<(u16, String)> {
-    let form = reqwest::blocking::multipart::Form::new()
-        .file(file_field.to_string(), path)
-        .with_context(|| format!("multipart file {}", path.display()))?;
-    let response = client
+    let file_name = path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .ok_or_else(|| anyhow!("brak nazwy pliku: {}", path.display()))?;
+    let bytes = fs::read(path).with_context(|| format!("odczyt {}", path.display()))?;
+    let content_type = content_type_for_path(path);
+    let body = serde_json::json!({
+        "year": year,
+        "month": month,
+        "documentTypeId": -1,
+        "files": [{
+            "filename": file_name,
+            "contentType": content_type,
+            "size": bytes.len(),
+        }],
+        "clientId": null,
+    });
+    let response: Value = client
         .post(upload_url)
         .header("Cookie", &session.cookie_header)
         .header("X-SALDEO-XSRF-H-TOKEN", &session.xsrf)
         .header("saldeoApp", "angularApp")
         .header("timeout", "60000")
-        .multipart(form)
+        .json(&body)
         .send()
-        .with_context(|| format!("upload Saldeo {}", path.display()))?;
-    let status = response.status().as_u16();
-    let body = response.text().unwrap_or_default();
-    Ok((status, body.chars().take(2000).collect()))
+        .with_context(|| format!("Saldeo generate upload URL {}", path.display()))?
+        .error_for_status()?
+        .json()?;
+    if response.get("status").and_then(|v| v.as_str()) != Some("SUCCESS") {
+        return Err(anyhow!("Saldeo generate upload URL failed: {}", response));
+    }
+    let upload = response
+        .get("data")
+        .and_then(|v| v.get(file_name))
+        .ok_or_else(|| anyhow!("Saldeo response missing file entry for {file_name}: {response}"))?;
+    let doc_upload_id = upload
+        .get("docUploadId")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| anyhow!("Saldeo response missing docUploadId: {upload}"))?;
+    let signed_url = upload
+        .get("url")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Saldeo response missing upload url: {upload}"))?;
+    let download_filename = upload
+        .get("downloadFilename")
+        .and_then(|v| v.as_str())
+        .unwrap_or(file_name);
+    let local_storage = upload
+        .get("localStorage")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let upload_result = if local_storage {
+        let part =
+            reqwest::blocking::multipart::Part::bytes(bytes).file_name(file_name.to_string());
+        let form = reqwest::blocking::multipart::Form::new().part("file", part);
+        client.put(signed_url).multipart(form).send()
+    } else {
+        client
+            .put(signed_url)
+            .header("Content-Type", content_type)
+            .header(
+                "Content-Disposition",
+                format!("attachment; filename=\"{download_filename}\""),
+            )
+            .body(bytes)
+            .send()
+    };
+
+    if let Err(err) = upload_result.and_then(|r| r.error_for_status()) {
+        let _ = saldeo_reject_upload(client, session, doc_upload_id, &err.to_string());
+        return Err(anyhow!("Saldeo signed upload failed: {err}"));
+    }
+
+    let confirm_url =
+        format!("https://saldeo.brainshare.pl/rest/doc-upload/{doc_upload_id}/confirm");
+    let confirm = client
+        .post(&confirm_url)
+        .header("Cookie", &session.cookie_header)
+        .header("X-SALDEO-XSRF-H-TOKEN", &session.xsrf)
+        .header("saldeoApp", "angularApp")
+        .header("timeout", "60000")
+        .json(&serde_json::json!({}))
+        .send()
+        .with_context(|| format!("Saldeo confirm upload {doc_upload_id}"))?;
+    let status = confirm.status().as_u16();
+    let text = confirm.text().unwrap_or_default();
+    if !(200..300).contains(&status) {
+        let _ = saldeo_reject_upload(client, session, doc_upload_id, &text);
+        return Err(anyhow!("Saldeo confirm failed HTTP {status}: {text}"));
+    }
+    Ok((status, text.chars().take(2000).collect()))
+}
+
+fn saldeo_reject_upload(
+    client: &Client,
+    session: &SaldeoSession,
+    doc_upload_id: i64,
+    reason: &str,
+) -> Result<()> {
+    let url = format!("https://saldeo.brainshare.pl/rest/doc-upload/{doc_upload_id}/reject");
+    client
+        .post(url)
+        .header("Cookie", &session.cookie_header)
+        .header("X-SALDEO-XSRF-H-TOKEN", &session.xsrf)
+        .header("saldeoApp", "angularApp")
+        .header("timeout", "60000")
+        .body(reason.to_string())
+        .send()?
+        .error_for_status()?;
+    Ok(())
+}
+
+fn content_type_for_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("pdf") => "application/pdf",
+        Some("xml") => "application/xml",
+        Some("json") => "application/json",
+        Some("txt") => "text/plain",
+        _ => "application/octet-stream",
+    }
 }
 
 fn write_saldeo_sync_csv(plan: &SaldeoSyncPlan, path: &Path) -> Result<()> {

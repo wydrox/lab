@@ -200,13 +200,12 @@ lab-cli saldeo-sync \
   --csv ./out/saldeo-sync-plan-2026.csv
 ```
 
-Upload jest celowo gated. Wykonanie wymaga `--confirm` i znanego endpointu uploadu web/API:
+Upload jest celowo gated. Wykonanie wymaga `--confirm`. LAB używa zweryfikowanego flow Saldeo: `POST /rest/client/document/generate-urls-for-upload` → `PUT` na signed URL → `POST /rest/doc-upload/{id}/confirm`.
 
 ```bash
 lab-cli saldeo-sync \
   --year 2026 \
   --tri-report ./out/tri-reconcile-2026.json \
-  --upload-url 'https://saldeo.brainshare.pl/<upload-endpoint>' \
   --confirm
 ```
 
