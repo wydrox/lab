@@ -29,24 +29,6 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Skanuje katalog/plik z fakturami i wypisuje znormalizowane rekordy.
-    Scan {
-        /// Źródło danych: ksef albo mail.
-        #[arg(long, value_enum)]
-        source: SourceKind,
-        /// Katalog albo plik wejściowy (.xml, .json, .txt, .eml, .pdf).
-        #[arg(long)]
-        input: PathBuf,
-        /// Format wyjścia.
-        #[arg(long, value_enum, default_value = "jsonl")]
-        format: OutputFormat,
-        /// Plik wyjściowy, domyślnie stdout.
-        #[arg(long)]
-        output: Option<PathBuf>,
-        /// Zapisz znormalizowane rekordy do SQLite.
-        #[arg(long)]
-        store: bool,
-    },
     /// Konfiguruje środowisko: sprawdza Gmail, Saldeo, bazę danych.
     Onboard {
         /// Tylko sprawdź status, nie uruchamiaj kreatora.
@@ -86,45 +68,6 @@ enum Commands {
         /// Zapisz rekordy do SQLite.
         #[arg(long)]
         store: bool,
-    },
-    /// Autoryzuje Gmail OAuth i zapisuje token poza repo.
-    GmailAuth {
-        /// Google OAuth Desktop Client JSON.
-        #[arg(long)]
-        client_secret: PathBuf,
-        /// Plik tokenu; domyślnie ~/.config/lab/gmail_token.json.
-        #[arg(long)]
-        token_file: Option<PathBuf>,
-        /// Nie otwieraj przeglądarki automatycznie; tylko wypisz URL.
-        #[arg(long)]
-        no_browser: bool,
-    },
-    /// Pobiera załączniki z Gmail API. Używa GMAIL_ACCESS_TOKEN albo token-file.
-    GmailFetch {
-        /// Zapytanie Gmail, np. "has:attachment filename:pdf newer_than:90d".
-        #[arg(long)]
-        query: String,
-        /// Katalog, do którego zapisać załączniki i metadane wiadomości.
-        #[arg(long)]
-        out: PathBuf,
-        /// Maksymalna liczba wiadomości do pobrania.
-        #[arg(long, default_value_t = 50)]
-        max: usize,
-        /// Użytkownik Gmail API, zwykle "me".
-        #[arg(long, default_value = "me")]
-        user: String,
-        /// Nazwa env var z tokenem OAuth; jeśli ustawiony, ma priorytet.
-        #[arg(long, default_value = "GMAIL_ACCESS_TOKEN")]
-        token_env: String,
-        /// Plik tokenu z gmail-auth; domyślnie ~/.config/lab/gmail_token.json.
-        #[arg(long)]
-        token_file: Option<PathBuf>,
-        /// Google OAuth Desktop Client JSON, potrzebny do odświeżenia tokenu.
-        #[arg(long)]
-        client_secret: Option<PathBuf>,
-        /// Pobierane rozszerzenia załączników.
-        #[arg(long, value_delimiter = ',', default_value = "pdf,xml,json,txt")]
-        extensions: Vec<String>,
     },
     /// Porównuje rekordy z Gmaila/PDF, KSeF i Saldeo.
     /// Z --status pokazuje ostatni raport z bazy.
@@ -373,20 +316,6 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let db_path = cli.db;
     match cli.command {
-        Commands::Scan {
-            source,
-            input,
-            format,
-            output,
-            store,
-        } => {
-            let records = scan_input(source, &input)?;
-            if store {
-                let conn = open_db(&db_path)?;
-                store_records(&conn, &records)?;
-            }
-            write_records(&records, format, output.as_deref())?;
-        }
         Commands::Onboard {
             check,
             gmail_client_secret,
@@ -530,30 +459,6 @@ fn main() -> Result<()> {
                 write_saldeo_sync_csv(&plan, &csv_path)?;
             }
             write_json(&plan, output.as_deref())?;
-        }
-        Commands::GmailAuth {
-            client_secret,
-            token_file,
-            no_browser,
-        } => {
-            let token_path = token_file.unwrap_or_else(default_gmail_token_path);
-            let result = gmail_auth(&client_secret, &token_path, no_browser)?;
-            write_json(&result, None)?;
-        }
-        Commands::GmailFetch {
-            query,
-            out,
-            max,
-            user,
-            token_env,
-            token_file,
-            client_secret,
-            extensions,
-        } => {
-            let token_path = token_file.unwrap_or_else(default_gmail_token_path);
-            let token = gmail_access_token(&token_env, &token_path, client_secret.as_deref())?;
-            let result = gmail_fetch(&token, &user, &query, &out, max, &extensions)?;
-            write_json(&result, None)?;
         }
         Commands::Mcp => run_mcp_server(&db_path)?,
         Commands::Db { command } => handle_db_command(&db_path, command)?,
