@@ -143,6 +143,45 @@ enum Commands {
         #[arg(long)]
         store: bool,
     },
+    /// Planuje albo wykonuje upload brakujących faktur do SaldeoSMART.
+    SaldeoSync {
+        /// Rok raportu/synchronizacji.
+        #[arg(long, default_value_t = 2026)]
+        year: i32,
+        /// Raport tri-reconcile JSON. Jeśli brak, podaj --mail, --ksef i --saldeo.
+        #[arg(long)]
+        tri_report: Option<PathBuf>,
+        /// JSON/JSONL z rekordami Gmail/PDF.
+        #[arg(long)]
+        mail: Option<PathBuf>,
+        /// JSON/JSONL z rekordami KSeF.
+        #[arg(long)]
+        ksef: Option<PathBuf>,
+        /// Raw documents.json z Saldeo albo JSON/JSONL z rekordami Saldeo.
+        #[arg(long)]
+        saldeo: Option<PathBuf>,
+        /// Minimalny score, gdy raport jest liczony z wejść.
+        #[arg(long, default_value_t = 70)]
+        review_score: u8,
+        /// Plik Playwright storage state z sesją Saldeo.
+        #[arg(long)]
+        storage_state: Option<PathBuf>,
+        /// Endpoint uploadu Saldeo. Wymagany przy --confirm, dopóki endpoint webowy nie jest ustabilizowany.
+        #[arg(long)]
+        upload_url: Option<String>,
+        /// Nazwa pola multipart dla pliku.
+        #[arg(long, default_value = "file")]
+        file_field: String,
+        /// Wykonaj upload. Bez tej flagi komenda tylko planuje.
+        #[arg(long)]
+        confirm: bool,
+        /// Plik JSON z planem/wynikiem.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Opcjonalny CSV z planem/wynikiem.
+        #[arg(long)]
+        csv: Option<PathBuf>,
+    },
     /// Pobiera dokumenty z SaldeoSMART przez zapisaną sesję webową.
     SaldeoFetch {
         /// Rok dokumentów do pobrania.
@@ -439,6 +478,43 @@ struct TriRow {
 }
 
 #[derive(Debug, Serialize)]
+struct SaldeoSyncPlan {
+    generated_at: DateTime<Utc>,
+    year: i32,
+    confirm: bool,
+    upload_url: Option<String>,
+    summary: SaldeoSyncSummary,
+    items: Vec<SaldeoSyncItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct SaldeoSyncSummary {
+    total_missing_saldeo: usize,
+    uploadable_count: usize,
+    missing_file_count: usize,
+    uploaded_count: usize,
+    failed_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SaldeoSyncItem {
+    status: String,
+    source: String,
+    related_sources: Vec<String>,
+    invoice_number: Option<String>,
+    issue_date: Option<NaiveDate>,
+    gross_amount_minor: Option<i64>,
+    currency: Option<String>,
+    contractor: Option<String>,
+    source_path: Option<String>,
+    can_upload: bool,
+    upload_status: String,
+    saldeo_response_status: Option<u16>,
+    saldeo_response_body: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct CycleRunSummary {
     generated_at: DateTime<Utc>,
     year: i32,
@@ -627,6 +703,42 @@ fn main() -> Result<()> {
                 store_records(&conn, &result.records)?;
             }
             write_json(&result.summary, None)?;
+        }
+        Commands::SaldeoSync {
+            year,
+            tri_report,
+            mail,
+            ksef,
+            saldeo,
+            review_score,
+            storage_state,
+            upload_url,
+            file_field,
+            confirm,
+            output,
+            csv,
+        } => {
+            let mut plan = saldeo_sync_plan(SaldeoSyncPlanConfig {
+                year,
+                tri_report: tri_report.as_deref(),
+                mail: mail.as_deref(),
+                ksef: ksef.as_deref(),
+                saldeo: saldeo.as_deref(),
+                review_score,
+                confirm,
+                upload_url: upload_url.clone(),
+            })?;
+            if confirm {
+                let upload_url = upload_url.as_deref().ok_or_else(|| {
+                    anyhow!("--upload-url jest wymagany przy --confirm; najpierw uruchom dry-run")
+                })?;
+                let storage_state = storage_state.unwrap_or_else(default_saldeo_storage_state_path);
+                saldeo_upload_plan(&mut plan, &storage_state, upload_url, &file_field)?;
+            }
+            if let Some(csv_path) = csv {
+                write_saldeo_sync_csv(&plan, &csv_path)?;
+            }
+            write_json(&plan, output.as_deref())?;
         }
         Commands::SaldeoFetch {
             year,
@@ -3590,6 +3702,11 @@ fn mcp_tools() -> Value {
             "inputSchema": {"type":"object","required":["input"],"properties":{"year":{"type":"integer","default":2026},"input":{"type":"string"},"out":{"type":"string"},"store":{"type":"boolean","default":false}}}
         },
         {
+            "name": "saldeo_sync",
+            "description": "Plan or execute upload of invoices missing in Saldeo from tri-reconcile or source records. Upload requires confirm=true and upload_url.",
+            "inputSchema": {"type":"object","properties":{"year":{"type":"integer","default":2026},"tri_report":{"type":"string"},"mail":{"type":"string"},"ksef":{"type":"string"},"saldeo":{"type":"string"},"review_score":{"type":"integer","default":70},"confirm":{"type":"boolean","default":false},"upload_url":{"type":"string"},"file_field":{"type":"string","default":"file"}}}
+        },
+        {
             "name": "saldeo_fetch",
             "description": "Fetch Saldeo documents for a year using saved Playwright storage state.",
             "inputSchema": {"type":"object","properties":{"year":{"type":"integer","default":2026},"out":{"type":"string"},"store":{"type":"boolean","default":false}}}
@@ -3667,6 +3784,35 @@ fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<Value> {
                 store_records(&conn, &result.records)?;
             }
             Ok(serde_json::to_value(result.summary)?)
+        }
+        "saldeo_sync" => {
+            let year = json_i32(args, "year", 2026);
+            let tri_report = json_path_arg(args, "tri_report");
+            let mail = json_path_arg(args, "mail");
+            let ksef = json_path_arg(args, "ksef");
+            let saldeo = json_path_arg(args, "saldeo");
+            let mut plan = saldeo_sync_plan(SaldeoSyncPlanConfig {
+                year,
+                tri_report: tri_report.as_deref(),
+                mail: mail.as_deref(),
+                ksef: ksef.as_deref(),
+                saldeo: saldeo.as_deref(),
+                review_score: json_u8(args, "review_score", 70),
+                confirm: json_bool(args, "confirm", false),
+                upload_url: json_string_arg(args, "upload_url"),
+            })?;
+            if json_bool(args, "confirm", false) {
+                let upload_url = json_string_arg(args, "upload_url")
+                    .ok_or_else(|| anyhow!("upload_url is required when confirm=true"))?;
+                saldeo_upload_plan(
+                    &mut plan,
+                    &json_path_arg(args, "storage_state")
+                        .unwrap_or_else(default_saldeo_storage_state_path),
+                    &upload_url,
+                    &json_string_arg(args, "file_field").unwrap_or_else(|| "file".to_string()),
+                )?;
+            }
+            Ok(serde_json::to_value(plan)?)
         }
         "saldeo_fetch" => {
             let year = json_i32(args, "year", 2026);
@@ -3749,12 +3895,284 @@ fn default_accounting_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("ACCOUNTING"))
 }
 
+struct SaldeoSyncPlanConfig<'a> {
+    year: i32,
+    tri_report: Option<&'a Path>,
+    mail: Option<&'a Path>,
+    ksef: Option<&'a Path>,
+    saldeo: Option<&'a Path>,
+    review_score: u8,
+    confirm: bool,
+    upload_url: Option<String>,
+}
+
+fn saldeo_sync_plan(config: SaldeoSyncPlanConfig<'_>) -> Result<SaldeoSyncPlan> {
+    let report = if let Some(path) = config.tri_report {
+        read_tri_report(path)?
+    } else {
+        let mail = config
+            .mail
+            .ok_or_else(|| anyhow!("podaj --tri-report albo komplet --mail --ksef --saldeo"))?;
+        let ksef = config
+            .ksef
+            .ok_or_else(|| anyhow!("podaj --tri-report albo komplet --mail --ksef --saldeo"))?;
+        let saldeo = config
+            .saldeo
+            .ok_or_else(|| anyhow!("podaj --tri-report albo komplet --mail --ksef --saldeo"))?;
+        tri_reconcile(
+            load_records(SourceKind::Mail, mail)?,
+            load_records(SourceKind::Ksef, ksef)?,
+            load_saldeo_records(saldeo)?,
+            config.review_score,
+        )
+    };
+    let mut seen = HashSet::new();
+    let mut items = Vec::new();
+    for row in &report.rows {
+        if row.saldeo.is_some() {
+            continue;
+        }
+        let related_sources = [("mail", row.mail.as_ref()), ("ksef", row.ksef.as_ref())]
+            .into_iter()
+            .filter_map(|(name, record)| record.map(|_| name.to_string()))
+            .collect::<Vec<_>>();
+        let selected = row.mail.as_ref().or(row.ksef.as_ref());
+        if let Some(record) = selected {
+            let key = record
+                .source_path
+                .clone()
+                .or_else(|| record.ksef_reference.clone())
+                .or_else(|| record.invoice_number.clone())
+                .unwrap_or_else(|| tri_row_key(row));
+            if !seen.insert(key) {
+                continue;
+            }
+            items.push(saldeo_sync_item_from_record(
+                &row.status,
+                record,
+                related_sources,
+            ));
+        }
+    }
+    let summary = saldeo_sync_summary(&items);
+    Ok(SaldeoSyncPlan {
+        generated_at: Utc::now(),
+        year: config.year,
+        confirm: config.confirm,
+        upload_url: config.upload_url,
+        summary,
+        items,
+    })
+}
+
+fn saldeo_sync_item_from_record(
+    status: &str,
+    record: &InvoiceRecord,
+    related_sources: Vec<String>,
+) -> SaldeoSyncItem {
+    let source_path = record.source_path.clone();
+    let can_upload = source_path
+        .as_deref()
+        .map(|path| Path::new(path).is_file())
+        .unwrap_or(false);
+    SaldeoSyncItem {
+        status: status.to_string(),
+        source: source_as_str(record.source).to_string(),
+        related_sources,
+        invoice_number: record.invoice_number.clone(),
+        issue_date: record.issue_date,
+        gross_amount_minor: record.gross_amount_minor,
+        currency: record.currency.clone(),
+        contractor: record
+            .seller_name
+            .clone()
+            .or_else(|| record.buyer_name.clone()),
+        source_path,
+        can_upload,
+        upload_status: if can_upload {
+            "planned"
+        } else {
+            "missing_local_file"
+        }
+        .to_string(),
+        saldeo_response_status: None,
+        saldeo_response_body: None,
+        error: None,
+    }
+}
+
+fn saldeo_sync_summary(items: &[SaldeoSyncItem]) -> SaldeoSyncSummary {
+    SaldeoSyncSummary {
+        total_missing_saldeo: items.len(),
+        uploadable_count: items.iter().filter(|i| i.can_upload).count(),
+        missing_file_count: items.iter().filter(|i| !i.can_upload).count(),
+        uploaded_count: items
+            .iter()
+            .filter(|i| i.upload_status == "uploaded")
+            .count(),
+        failed_count: items.iter().filter(|i| i.upload_status == "failed").count(),
+    }
+}
+
+fn saldeo_upload_plan(
+    plan: &mut SaldeoSyncPlan,
+    storage_state: &Path,
+    upload_url: &str,
+    file_field: &str,
+) -> Result<()> {
+    let session = read_saldeo_session(storage_state)?;
+    let client = Client::builder().build()?;
+    for item in &mut plan.items {
+        if !item.can_upload {
+            continue;
+        }
+        let Some(source_path) = &item.source_path else {
+            continue;
+        };
+        match saldeo_upload_file(
+            &client,
+            &session,
+            upload_url,
+            file_field,
+            Path::new(source_path),
+        ) {
+            Ok((status, body)) if (200..300).contains(&status) => {
+                item.upload_status = "uploaded".to_string();
+                item.saldeo_response_status = Some(status);
+                item.saldeo_response_body = Some(body);
+            }
+            Ok((status, body)) => {
+                item.upload_status = "failed".to_string();
+                item.saldeo_response_status = Some(status);
+                item.saldeo_response_body = Some(body);
+                item.error = Some(format!("HTTP {status}"));
+            }
+            Err(err) => {
+                item.upload_status = "failed".to_string();
+                item.error = Some(err.to_string());
+            }
+        }
+    }
+    plan.summary = saldeo_sync_summary(&plan.items);
+    Ok(())
+}
+
+struct SaldeoSession {
+    cookie_header: String,
+    xsrf: String,
+}
+
+fn read_saldeo_session(storage_state: &Path) -> Result<SaldeoSession> {
+    let storage: Value = serde_json::from_str(
+        &fs::read_to_string(storage_state)
+            .with_context(|| format!("odczyt sesji Saldeo {}", storage_state.display()))?,
+    )?;
+    let cookies = storage
+        .get("cookies")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("storage-state Saldeo nie zawiera cookies"))?;
+    let cookie_header = cookies
+        .iter()
+        .filter_map(|cookie| {
+            let name = cookie.get("name")?.as_str()?;
+            let value = cookie.get("value")?.as_str()?;
+            Some(format!("{name}={value}"))
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let xsrf = cookies
+        .iter()
+        .find(|cookie| cookie.get("name").and_then(|v| v.as_str()) == Some("X-SALDEO-XSRF-C-TOKEN"))
+        .and_then(|cookie| cookie.get("value"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("brak X-SALDEO-XSRF-C-TOKEN w storage-state; odśwież sesję Saldeo"))?
+        .to_string();
+    Ok(SaldeoSession {
+        cookie_header,
+        xsrf,
+    })
+}
+
+fn saldeo_upload_file(
+    client: &Client,
+    session: &SaldeoSession,
+    upload_url: &str,
+    file_field: &str,
+    path: &Path,
+) -> Result<(u16, String)> {
+    let form = reqwest::blocking::multipart::Form::new()
+        .file(file_field.to_string(), path)
+        .with_context(|| format!("multipart file {}", path.display()))?;
+    let response = client
+        .post(upload_url)
+        .header("Cookie", &session.cookie_header)
+        .header("X-SALDEO-XSRF-H-TOKEN", &session.xsrf)
+        .header("saldeoApp", "angularApp")
+        .header("timeout", "60000")
+        .multipart(form)
+        .send()
+        .with_context(|| format!("upload Saldeo {}", path.display()))?;
+    let status = response.status().as_u16();
+    let body = response.text().unwrap_or_default();
+    Ok((status, body.chars().take(2000).collect()))
+}
+
+fn write_saldeo_sync_csv(plan: &SaldeoSyncPlan, path: &Path) -> Result<()> {
+    let mut writer =
+        csv::Writer::from_path(path).with_context(|| format!("zapis CSV {}", path.display()))?;
+    writer.write_record([
+        "upload_status",
+        "status",
+        "source",
+        "related_sources",
+        "invoice_number",
+        "issue_date",
+        "gross_amount_minor",
+        "currency",
+        "contractor",
+        "source_path",
+        "can_upload",
+        "saldeo_response_status",
+        "error",
+    ])?;
+    for item in &plan.items {
+        writer.write_record([
+            item.upload_status.clone(),
+            item.status.clone(),
+            item.source.clone(),
+            item.related_sources.join("+"),
+            item.invoice_number.clone().unwrap_or_default(),
+            item.issue_date.map(|d| d.to_string()).unwrap_or_default(),
+            item.gross_amount_minor
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            item.currency.clone().unwrap_or_default(),
+            item.contractor.clone().unwrap_or_default(),
+            item.source_path.clone().unwrap_or_default(),
+            item.can_upload.to_string(),
+            item.saldeo_response_status
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            item.error.clone().unwrap_or_default(),
+        ])?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
 fn default_saldeo_storage_state_path() -> PathBuf {
-    std::env::var_os("HOME")
+    let home = std::env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let lab_path = home
         .join(".config")
         .join("lab")
+        .join("saldeo-storage-state.json");
+    if lab_path.exists() {
+        return lab_path;
+    }
+    home.join(".config")
+        .join("ksef-mail-reconcile")
         .join("saldeo-storage-state.json")
 }
 

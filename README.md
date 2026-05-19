@@ -180,14 +180,37 @@ Przykładowa konfiguracja jest w `mcp/lab-mcp.example.json`. Skopiuj ją do konf
 - `cycle_run`
 - `cycle_missing`
 - `ksef_sync`
+- `saldeo_sync`
 - `saldeo_fetch`
 - `tri_reconcile`
 - `db_stats`
 - `tri_runs`
 
-## SaldeoSMART i porównanie 3-stronne
+## SaldeoSMART sync i porównanie 3-stronne
 
 Saldeo używa zapisanej sesji webowej Playwright (`~/.config/lab/saldeo-storage-state.json`). Sekrety trzymaj w macOS Keychain; nie zapisuj ich w repo.
+
+Plan uploadu faktur, których brakuje w Saldeo, z KSeF/Gmail względem raportu tri-reconcile:
+
+```bash
+lab-cli saldeo-sync \
+  --year 2026 \
+  --tri-report ./out/tri-reconcile-2026.json \
+  --output ./out/saldeo-sync-plan-2026.json \
+  --csv ./out/saldeo-sync-plan-2026.csv
+```
+
+Upload jest celowo gated. Wykonanie wymaga `--confirm` i znanego endpointu uploadu web/API:
+
+```bash
+lab-cli saldeo-sync \
+  --year 2026 \
+  --tri-report ./out/tri-reconcile-2026.json \
+  --upload-url 'https://saldeo.brainshare.pl/<upload-endpoint>' \
+  --confirm
+```
+
+Uwaga: LAB potrafi zaplanować braki z KSeF i Gmaila, ale wysłać do Saldeo może tylko lokalne pliki (`source_path`), np. PDF z Gmaila albo XML z eksportu KSeF.
 
 ```bash
 lab-cli --db ./data/full-2026.sqlite saldeo-fetch \
