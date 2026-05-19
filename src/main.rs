@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine, engine::general_purpose::URL_SAFE, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
+use dialoguer::{Confirm, Input, Password};
 use regex::Regex;
 use reqwest::blocking::Client;
 use rusqlite::{Connection, params, types::Type};
@@ -3833,12 +3834,15 @@ fn onboard(db_path: &Path, check: bool, gmail_client_secret: Option<&Path>) -> R
     // 1. Gmail
     if !gmail_authed {
         eprintln!("── Gmail ──");
+        eprintln!("Potrzebny plik Google OAuth Desktop Client JSON.");
+        eprintln!("Pobierz go z Google Cloud Console → APIs & Services → Credentials.\n");
         let secret = if let Some(s) = gmail_client_secret {
             Some(s.to_path_buf())
         } else {
-            eprintln!("Potrzebny plik Google OAuth Desktop Client JSON.");
-            eprintln!("Pobierz go z Google Cloud Console → APIs & Services → Credentials.\n");
-            let path = prompt("Ścieżka do client_secret JSON", "")?;
+            let path: String = Input::new()
+                .with_prompt("Ścieżka do client_secret JSON")
+                .allow_empty(true)
+                .interact_text()?;
             if path.is_empty() {
                 eprintln!("⏭ Pominięto.\n");
                 None
@@ -3859,13 +3863,24 @@ fn onboard(db_path: &Path, check: bool, gmail_client_secret: Option<&Path>) -> R
     } else {
         eprintln!("── Gmail ──");
         eprintln!("✓ już skonfigurowany");
-        if prompt_yn("Odświeżyć token?")? {
+        if Confirm::new()
+            .with_prompt("Odświeżyć token?")
+            .default(false)
+            .interact()?
+        {
             let secret = if let Some(s) = gmail_client_secret {
                 s.to_path_buf()
             } else {
-                let path = prompt("Ścieżka do client_secret JSON", "")?;
-                if path.is_empty() { eprintln!("⏭ Pominięto.\n"); }
-                PathBuf::from(&path)
+                let path: String = Input::new()
+                    .with_prompt("Ścieżka do client_secret JSON")
+                    .allow_empty(true)
+                    .interact_text()?;
+                if path.is_empty() {
+                    eprintln!("⏭ Pominięto.");
+                    PathBuf::new()
+                } else {
+                    PathBuf::from(&path)
+                }
             };
             if secret.as_os_str().is_empty() {
                 // skip
@@ -3905,28 +3920,44 @@ fn onboard(db_path: &Path, check: bool, gmail_client_secret: Option<&Path>) -> R
         if !ksef_key_ok { eprintln!("  KSEF_KEY_PATH — ścieżka do klucza .key"); }
         if !ksef_password_ok { eprintln!("  KSEF_CERT_PASSWORD — hasło do certyfikatu"); }
         if !ksef_token_ok { eprintln!("  KSEF_TOKEN — token API"); }
-        if prompt_yn("\nUstawić teraz interaktywnie?")? {
+        if Confirm::new()
+            .with_prompt("Ustawić teraz interaktywnie?")
+            .default(false)
+            .interact()?
+        {
             eprintln!("Dodaj do ~/.zshrc (lub uruchom przed lab):");
             if !ksef_cert_ok {
-                let val = prompt("KSEF_CERT_PATH", ksef_cert.as_deref().unwrap_or(""))?;
+                let val: String = Input::new()
+                    .with_prompt("KSEF_CERT_PATH")
+                    .default(ksef_cert.as_deref().unwrap_or("").to_string())
+                    .interact_text()?;
                 if !val.is_empty() && Path::new(&val).exists() {
                     eprintln!("  export KSEF_CERT_PATH={val}");
                 }
             }
             if !ksef_key_ok {
-                let val = prompt("KSEF_KEY_PATH", ksef_key.as_deref().unwrap_or(""))?;
+                let val: String = Input::new()
+                    .with_prompt("KSEF_KEY_PATH")
+                    .default(ksef_key.as_deref().unwrap_or("").to_string())
+                    .interact_text()?;
                 if !val.is_empty() && Path::new(&val).exists() {
                     eprintln!("  export KSEF_KEY_PATH={val}");
                 }
             }
             if !ksef_password_ok {
-                let val = prompt("KSEF_CERT_PASSWORD", "")?;
+                let val = Password::new()
+                    .with_prompt("KSEF_CERT_PASSWORD")
+                    .allow_empty_password(true)
+                    .interact()?;
                 if !val.is_empty() {
                     eprintln!("  export KSEF_CERT_PASSWORD='***'  # wpisz prawdziwe hasło");
                 }
             }
             if !ksef_token_ok {
-                let val = prompt("KSEF_TOKEN", "")?;
+                let val = Password::new()
+                    .with_prompt("KSEF_TOKEN")
+                    .allow_empty_password(true)
+                    .interact()?;
                 if !val.is_empty() {
                     eprintln!("  export KSEF_TOKEN='***'  # wpisz prawdziwy token");
                 }
@@ -3961,31 +3992,6 @@ fn onboard(db_path: &Path, check: bool, gmail_client_secret: Option<&Path>) -> R
     }
 
     write_json(&serde_json::json!({"all_ok": all_ok}), None)
-}
-
-fn prompt(label: &str, default: &str) -> Result<String> {
-    if default.is_empty() {
-        eprint!("  {label}: ");
-    } else {
-        eprint!("  {label} [{default}]: ");
-    }
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let trimmed = input.trim().to_string();
-    if trimmed.is_empty() && !default.is_empty() {
-        Ok(default.to_string())
-    } else {
-        Ok(trimmed)
-    }
-}
-
-fn prompt_yn(question: &str) -> Result<bool> {
-    eprint!("  {question} [t/N]: ");
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    Ok(input.trim().eq_ignore_ascii_case("t") || input.trim().eq_ignore_ascii_case("y"))
 }
 
 fn saldeo_session_valid(storage_state: &Path) -> bool {
