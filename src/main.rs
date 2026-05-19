@@ -47,46 +47,44 @@ enum Commands {
         #[arg(long)]
         store: bool,
     },
-    /// Uzgadnia rekordy KSeF z rekordami mailowymi.
-    Reconcile {
-        /// Katalog, plik JSONL albo JSON z rekordami KSeF.
+    /// Konfiguruje środowisko: sprawdza Gmail, Saldeo, bazę danych.
+    Onboard {
+        /// Tylko sprawdź status, nie uruchamiaj kreatora.
         #[arg(long)]
-        ksef: PathBuf,
-        /// Katalog, plik JSONL albo JSON z rekordami z maila.
+        check: bool,
+        /// Google OAuth Desktop Client JSON do autoryzacji Gmail.
         #[arg(long)]
-        mail: PathBuf,
-        /// Minimalny wynik dla pewnego dopasowania.
-        #[arg(long, default_value_t = 70)]
-        match_score: u8,
-        /// Minimalny wynik dla statusu needs_review.
-        #[arg(long, default_value_t = 45)]
-        review_score: u8,
-        /// Opcjonalny CSV z dopasowaniami.
-        #[arg(long)]
-        csv: Option<PathBuf>,
-        /// Plik JSON z raportem, domyślnie stdout.
-        #[arg(long)]
-        output: Option<PathBuf>,
-        /// Zapisz rekordy i wynik uzgodnienia do SQLite.
-        #[arg(long)]
-        store: bool,
+        gmail_client_secret: Option<PathBuf>,
     },
-    /// Uzgadnia rekordy zapisane wcześniej w SQLite przez scan --store.
-    ReconcileDb {
-        /// Minimalny wynik dla pewnego dopasowania.
-        #[arg(long, default_value_t = 70)]
-        match_score: u8,
-        /// Minimalny wynik dla statusu needs_review.
-        #[arg(long, default_value_t = 45)]
-        review_score: u8,
-        /// Opcjonalny CSV z dopasowaniami.
+    /// Synchronizuje dane z Gmaila/PDF, KSeF i/lub Saldeo.
+    /// Bez flag synchronizuje wszystkie trzy źródła.
+    Sync {
+        /// Tylko KSeF.
         #[arg(long)]
-        csv: Option<PathBuf>,
-        /// Plik JSON z raportem, domyślnie stdout.
+        ksef: bool,
+        /// Tylko Gmail/PDF (pobiera załączniki, parsuje, filtruje).
         #[arg(long)]
-        output: Option<PathBuf>,
-        /// Zapisz wynik uzgodnienia do SQLite.
-        #[arg(long, default_value_t = true)]
+        mail: bool,
+        /// Tylko Saldeo.
+        #[arg(long)]
+        saldeo: bool,
+        /// Rok rozliczeniowy.
+        #[arg(long, default_value_t = 2026)]
+        year: i32,
+        /// Katalog/plik z eksportem KSeF (XML, JSON, JSONL). Domyślnie data/ksef-<year>.
+        #[arg(long)]
+        ksef_input: Option<PathBuf>,
+        /// Google OAuth Desktop Client JSON do odświeżenia tokenu Gmail.
+        #[arg(long)]
+        gmail_client_secret: Option<PathBuf>,
+        /// Plik tokenu Gmail; domyślnie ~/.config/lab/gmail_token.json.
+        #[arg(long)]
+        gmail_token_file: Option<PathBuf>,
+        /// NIP do filtrowania PDF-ów z Gmaila.
+        #[arg(long, default_value = "5242920020")]
+        productmesh_nip: String,
+        /// Zapisz rekordy do SQLite.
+        #[arg(long)]
         store: bool,
     },
     /// Autoryzuje Gmail OAuth i zapisuje token poza repo.
@@ -128,24 +126,40 @@ enum Commands {
         #[arg(long, value_delimiter = ',', default_value = "pdf,xml,json,txt")]
         extensions: Vec<String>,
     },
-    /// Synchronizuje eksport KSeF do znormalizowanych rekordów LAB.
-    KsefSync {
-        /// Rok rozliczeniowy.
-        #[arg(long, default_value_t = 2026)]
-        year: i32,
-        /// Katalog, plik JSONL, JSON albo XML z eksportem/rekordami KSeF.
+    /// Porównuje rekordy z Gmaila/PDF, KSeF i Saldeo.
+    /// Z --status pokazuje ostatni raport z bazy.
+    Reconcile {
+        /// Pokaż ostatni raport uzgodnienia z bazy zamiast liczyć na nowo.
         #[arg(long)]
-        input: PathBuf,
-        /// Katalog na records.json i records.jsonl.
+        status: bool,
+        /// JSON/JSONL z rekordami Gmail/PDF.
         #[arg(long)]
-        out: Option<PathBuf>,
-        /// Zapisz rekordy do SQLite.
+        mail: Option<PathBuf>,
+        /// JSON/JSONL z rekordami KSeF.
+        #[arg(long)]
+        ksef: Option<PathBuf>,
+        /// Raw documents.json z Saldeo albo JSON/JSONL z rekordami Saldeo.
+        #[arg(long)]
+        saldeo: Option<PathBuf>,
+        /// Minimalny score dopasowania.
+        #[arg(long, default_value_t = 45)]
+        review_score: u8,
+        /// Plik JSON z raportem.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Opcjonalny CSV z raportem.
+        #[arg(long)]
+        csv: Option<PathBuf>,
+        /// Zapisz temporalny snapshot tri-reconcile w SQLite.
         #[arg(long)]
         store: bool,
+        /// Rok przy --store i --status.
+        #[arg(long, default_value_t = 2026)]
+        year: i32,
     },
-    /// Planuje albo wykonuje upload brakujących faktur do SaldeoSMART.
-    SaldeoSync {
-        /// Rok raportu/synchronizacji.
+    /// Wysyła brakujące faktury do SaldeoSMART.
+    Upload {
+        /// Rok rozliczeniowy.
         #[arg(long, default_value_t = 2026)]
         year: i32,
         /// Raport tri-reconcile JSON. Jeśli brak, podaj --mail, --ksef i --saldeo.
@@ -160,74 +174,15 @@ enum Commands {
         /// Raw documents.json z Saldeo albo JSON/JSONL z rekordami Saldeo.
         #[arg(long)]
         saldeo: Option<PathBuf>,
-        /// Minimalny score, gdy raport jest liczony z wejść.
+        /// Minimalny score dopasowania, gdy raport jest liczony z wejść.
         #[arg(long, default_value_t = 70)]
         review_score: u8,
-        /// Plik Playwright storage state z sesją Saldeo.
-        #[arg(long)]
-        storage_state: Option<PathBuf>,
-        /// Endpoint generowania URL-i uploadu Saldeo.
-        #[arg(long)]
-        upload_url: Option<String>,
-        /// Nazwa pola multipart dla starszego trybu; obecny endpoint używa signed URL.
-        #[arg(long, default_value = "file")]
-        file_field: String,
-        /// Wykonaj upload. Bez tej flagi komenda tylko planuje.
-        #[arg(long)]
-        confirm: bool,
-        /// Plik JSON z planem/wynikiem.
+        /// Plik JSON z wynikiem.
         #[arg(long)]
         output: Option<PathBuf>,
-        /// Opcjonalny CSV z planem/wynikiem.
+        /// Opcjonalny CSV z wynikiem.
         #[arg(long)]
         csv: Option<PathBuf>,
-    },
-    /// Pobiera dokumenty z SaldeoSMART przez zapisaną sesję webową.
-    SaldeoFetch {
-        /// Rok dokumentów do pobrania.
-        #[arg(long, default_value_t = 2026)]
-        year: i32,
-        /// Plik Playwright storage state z sesją Saldeo.
-        #[arg(long)]
-        storage_state: Option<PathBuf>,
-        /// Katalog na raw JSON i znormalizowany JSONL.
-        #[arg(long, default_value = "data/saldeo-2026")]
-        out: PathBuf,
-        /// Zapisz rekordy do SQLite.
-        #[arg(long)]
-        store: bool,
-    },
-    /// Porównuje trzy źródła: Gmail/PDF, KSeF i Saldeo.
-    TriReconcile {
-        /// JSON/JSONL z rekordami Gmail/PDF.
-        #[arg(long)]
-        mail: PathBuf,
-        /// JSON/JSONL z rekordami KSeF.
-        #[arg(long)]
-        ksef: PathBuf,
-        /// Raw documents.json z Saldeo albo JSON/JSONL z rekordami Saldeo.
-        #[arg(long)]
-        saldeo: PathBuf,
-        /// Minimalny score dopasowania.
-        #[arg(long, default_value_t = 45)]
-        review_score: u8,
-        /// Plik JSON z raportem.
-        #[arg(long)]
-        output: Option<PathBuf>,
-        /// Opcjonalny CSV z raportem.
-        #[arg(long)]
-        csv: Option<PathBuf>,
-        /// Zapisz temporalny snapshot tri-reconcile w SQLite.
-        #[arg(long)]
-        store: bool,
-        /// Rok snapshotu przy --store.
-        #[arg(long, default_value_t = 2026)]
-        year: i32,
-    },
-    /// Cykliczny flow 1/14 miesiąca: Gmail → skan PDF → Saldeo → tri-reconcile → braki dla księgowej.
-    Cycle {
-        #[command(subcommand)]
-        command: CycleCommands,
     },
     /// Uruchamia prosty serwer MCP po stdio dla agentów.
     Mcp,
@@ -241,94 +196,6 @@ enum Commands {
         /// Nazwa env var z tokenem OAuth do Gmaila.
         #[arg(long, default_value = "GMAIL_ACCESS_TOKEN")]
         token_env: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum CycleCommands {
-    /// Wykonuje cały cykliczny flow dla roku.
-    Run {
-        /// Rok rozliczeniowy.
-        #[arg(long, default_value_t = 2026)]
-        year: i32,
-        /// NIP ProductMesh używany do filtrowania PDF-ów z Gmaila.
-        #[arg(long, default_value = "5242920020")]
-        productmesh_nip: String,
-        /// Rekordy KSeF JSON/JSONL. Domyślnie data/ksef-productmesh-<year>/ksef_records.jsonl.
-        #[arg(long)]
-        ksef: Option<PathBuf>,
-        /// Google OAuth Desktop Client JSON, potrzebny gdy token Gmail wymaga odświeżenia.
-        #[arg(long)]
-        gmail_client_secret: Option<PathBuf>,
-        /// Plik tokenu Gmail. Domyślnie ~/.config/lab/gmail_token.json.
-        #[arg(long)]
-        gmail_token_file: Option<PathBuf>,
-        /// Zapytanie Gmail. Domyślnie PDF-y z całego roku.
-        #[arg(long)]
-        gmail_query: Option<String>,
-        /// Maksymalna liczba wiadomości Gmail do pobrania.
-        #[arg(long, default_value_t = 500)]
-        gmail_max: usize,
-        /// Pomiń Gmail fetch i użyj istniejącego katalogu PDF.
-        #[arg(long)]
-        skip_gmail_fetch: bool,
-        /// Katalog PDF-ów z Gmaila. Domyślnie data/mail-all-pdf-<year>-pdfs.
-        #[arg(long)]
-        mail_out: Option<PathBuf>,
-        /// Pomiń Saldeo fetch i użyj istniejących data/saldeo-<year>/records.jsonl.
-        #[arg(long)]
-        skip_saldeo_fetch: bool,
-        /// Katalog danych Saldeo. Domyślnie data/saldeo-<year>.
-        #[arg(long)]
-        saldeo_out: Option<PathBuf>,
-        /// Katalog raportów. Domyślnie out/.
-        #[arg(long, default_value = "out")]
-        out: PathBuf,
-        /// Zapisz rekordy do SQLite.
-        #[arg(long)]
-        store: bool,
-        /// Minimalny score dla tri-reconcile.
-        #[arg(long, default_value_t = 70)]
-        review_score: u8,
-        /// Skopiuj braki z Gmaila do folderu non-KSeF files.
-        #[arg(long)]
-        copy_missing_non_ksef: bool,
-        /// Root księgowy. Domyślnie ./ACCOUNTING albo PRODUCTMESH_ACCOUNTING_ROOT.
-        #[arg(long)]
-        accounting_root: Option<PathBuf>,
-    },
-    /// Wypisuje/składa raport faktur z Gmaila, których nie ma w Saldeo.
-    Missing {
-        /// Raport tri-reconcile JSON. Domyślnie out/tri-reconcile-<year>.json.
-        #[arg(long)]
-        tri_report: Option<PathBuf>,
-        /// Rok użyty do domyślnych ścieżek.
-        #[arg(long, default_value_t = 2026)]
-        year: i32,
-        /// Plik JSON z brakami.
-        #[arg(long)]
-        output: Option<PathBuf>,
-        /// Plik CSV z brakami.
-        #[arg(long)]
-        csv: Option<PathBuf>,
-        /// Skopiuj braki do folderu non-KSeF files.
-        #[arg(long)]
-        copy_non_ksef: bool,
-        /// Root księgowy. Domyślnie ./ACCOUNTING albo PRODUCTMESH_ACCOUNTING_ROOT.
-        #[arg(long)]
-        accounting_root: Option<PathBuf>,
-    },
-    /// Generuje przykładowe polecenia do uruchamiania 1. i 14. dnia miesiąca.
-    Schedule {
-        /// Rok rozliczeniowy.
-        #[arg(long, default_value_t = 2026)]
-        year: i32,
-        /// Rekordy KSeF JSON/JSONL.
-        #[arg(long)]
-        ksef: Option<PathBuf>,
-        /// Ścieżka do binarki. Domyślnie bieżący executable.
-        #[arg(long)]
-        bin: Option<PathBuf>,
     },
 }
 
@@ -391,27 +258,6 @@ struct InvoiceRecord {
     email_subject: Option<String>,
     email_from: Option<String>,
     warnings: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ReconcileReport {
-    generated_at: DateTime<Utc>,
-    match_score: u8,
-    review_score: u8,
-    summary: ReconcileSummary,
-    matches: Vec<InvoiceMatch>,
-    unmatched_ksef: Vec<InvoiceRecord>,
-    unmatched_mail: Vec<InvoiceRecord>,
-}
-
-#[derive(Debug, Serialize)]
-struct ReconcileSummary {
-    ksef_count: usize,
-    mail_count: usize,
-    matched_count: usize,
-    review_count: usize,
-    unmatched_ksef_count: usize,
-    unmatched_mail_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -514,36 +360,6 @@ struct SaldeoSyncItem {
     error: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct CycleRunSummary {
-    generated_at: DateTime<Utc>,
-    year: i32,
-    gmail: Option<GmailFetchResult>,
-    scanned_mail_pdfs: usize,
-    productmesh_candidates: usize,
-    ksef_records: usize,
-    saldeo_documents: Option<usize>,
-    tri_summary: TriSummary,
-    temporal_diff: Option<TemporalDiffSummary>,
-    missing_for_accountant_count: usize,
-    copied_missing_count: usize,
-    paths: CycleRunPaths,
-}
-
-#[derive(Debug, Serialize)]
-struct CycleRunPaths {
-    mail_scan_json: String,
-    mail_candidates_json: String,
-    mail_candidates_jsonl: String,
-    ksef_records_jsonl: String,
-    saldeo_records_jsonl: String,
-    tri_json: String,
-    tri_csv: String,
-    missing_json: String,
-    missing_csv: String,
-    non_ksef_dir: String,
-}
-
 #[derive(Debug, Clone, Serialize)]
 struct TemporalDiffSummary {
     run_id: i64,
@@ -551,56 +367,6 @@ struct TemporalDiffSummary {
     added_count: usize,
     removed_count: usize,
     changed_count: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MissingInvoice {
-    invoice_number: String,
-    contractor: String,
-    issue_date: Option<NaiveDate>,
-    gross_amount_minor: Option<i64>,
-    amount: String,
-    currency: String,
-    source_path: String,
-    target_path: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct MissingReport {
-    generated_at: DateTime<Utc>,
-    count: usize,
-    invoices: Vec<MissingInvoice>,
-}
-
-#[derive(Debug, Serialize)]
-struct CycleSchedule {
-    note: String,
-    cron_line: String,
-    command: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct InvoiceMatch {
-    status: MatchStatus,
-    score: u8,
-    reasons: Vec<String>,
-    ksef: InvoiceRecord,
-    mail: InvoiceRecord,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum MatchStatus {
-    Matched,
-    NeedsReview,
-}
-
-#[derive(Debug, Clone)]
-struct Candidate {
-    ksef_idx: usize,
-    mail_idx: usize,
-    score: u8,
-    reasons: Vec<String>,
 }
 
 fn main() -> Result<()> {
@@ -621,51 +387,149 @@ fn main() -> Result<()> {
             }
             write_records(&records, format, output.as_deref())?;
         }
-        Commands::Reconcile {
+        Commands::Onboard {
+            check,
+            gmail_client_secret,
+        } => {
+            onboard(&db_path, check, gmail_client_secret.as_deref())?;
+        }
+        Commands::Sync {
             ksef,
             mail,
-            match_score,
-            review_score,
-            csv,
-            output,
+            saldeo,
+            year,
+            ksef_input,
+            gmail_client_secret,
+            gmail_token_file,
+            productmesh_nip,
             store,
         } => {
-            if review_score > match_score {
-                return Err(anyhow!("review-score nie może być większy niż match-score"));
+            let all = !ksef && !mail && !saldeo;
+            let conn = if store { Some(open_db(&db_path)?) } else { None };
+            let mut synced: Vec<String> = Vec::new();
+            if ksef || all {
+                let input = ksef_input.clone().unwrap_or_else(|| default_ksef_out_path(year));
+                let result = ksef_sync(year, &input, None)?;
+                if let Some(ref conn) = conn {
+                    store_records(conn, &result.records)?;
+                }
+                synced.push(format!("ksef ({})", result.summary.records_count));
             }
-            let ksef_records = load_records(SourceKind::Ksef, &ksef)?;
-            let mail_records = load_records(SourceKind::Mail, &mail)?;
-            let report = reconcile(ksef_records, mail_records, match_score, review_score);
-            if store {
-                let conn = open_db(&db_path)?;
-                store_reconcile_report(&conn, &report)?;
+            if mail || all {
+                let token_path = gmail_token_file.clone().unwrap_or_else(default_gmail_token_path);
+                let token =
+                    gmail_access_token("GMAIL_ACCESS_TOKEN", &token_path, gmail_client_secret.as_deref())?;
+                let mail_out = default_mail_out_path(year);
+                let gmail_result = gmail_fetch(
+                    &token,
+                    "me",
+                    &default_gmail_query(year),
+                    &mail_out,
+                    500,
+                    &["pdf".to_string()],
+                )?;
+                let mail_records = scan_input(SourceKind::Mail, &mail_out)?;
+                let candidates =
+                    productmesh_invoice_candidates(&mail_records, &productmesh_nip);
+                if let Some(ref conn) = conn {
+                    store_records(conn, &candidates)?;
+                }
+                synced.push(format!(
+                    "mail ({} files, {} pdfs, {} candidates)",
+                    gmail_result.files_saved,
+                    mail_records.len(),
+                    candidates.len()
+                ));
             }
-            if let Some(csv_path) = csv {
-                write_matches_csv(&report.matches, &csv_path)?;
+            if saldeo || all {
+                let result =
+                    saldeo_fetch(year, &default_saldeo_storage_state_path(), &default_saldeo_out_path(year))?;
+                if let Some(ref conn) = conn {
+                    store_records(conn, &result.records)?;
+                }
+                synced.push(format!("saldeo ({})", result.summary.documents_count));
             }
-            write_json(&report, output.as_deref())?;
+            write_json(
+                &serde_json::json!({"synced": synced, "year": year, "stored": store}),
+                None,
+            )?;
         }
-        Commands::ReconcileDb {
-            match_score,
+        Commands::Reconcile {
+            status,
+            mail,
+            ksef,
+            saldeo,
             review_score,
-            csv,
             output,
+            csv,
             store,
+            year,
         } => {
-            if review_score > match_score {
-                return Err(anyhow!("review-score nie może być większy niż match-score"));
+            if status {
+                let conn = open_db(&db_path)?;
+                let report = load_last_tri_report(&conn, year)?;
+                return write_json(&report, output.as_deref());
             }
-            let conn = open_db(&db_path)?;
-            let ksef_records = load_records_from_db(&conn, Some(SourceKind::Ksef), None)?;
-            let mail_records = load_records_from_db(&conn, Some(SourceKind::Mail), None)?;
-            let report = reconcile(ksef_records, mail_records, match_score, review_score);
-            if store {
-                store_reconcile_report(&conn, &report)?;
-            }
+            let mail_path =
+                mail.ok_or_else(|| anyhow!("podaj --mail (JSON/JSONL z rekordami Gmail/PDF)"))?;
+            let ksef_path =
+                ksef.ok_or_else(|| anyhow!("podaj --ksef (JSON/JSONL z rekordami KSeF)"))?;
+            let saldeo_path = saldeo
+                .ok_or_else(|| anyhow!("podaj --saldeo (JSON/JSONL z rekordami Saldeo)"))?;
+            let mail_records = load_records(SourceKind::Mail, &mail_path)?;
+            let ksef_records = load_records(SourceKind::Ksef, &ksef_path)?;
+            let saldeo_records = load_saldeo_records(&saldeo_path)?;
+            let report =
+                tri_reconcile(mail_records, ksef_records, saldeo_records, review_score);
+            let temporal_diff = if store {
+                let conn = open_db(&db_path)?;
+                Some(store_tri_reconcile_report(&conn, year, &report)?)
+            } else {
+                None
+            };
             if let Some(csv_path) = csv {
-                write_matches_csv(&report.matches, &csv_path)?;
+                write_tri_csv(&report, &csv_path)?;
             }
-            write_json(&report, output.as_deref())?;
+            if temporal_diff.is_some() && output.is_none() {
+                write_json(
+                    &serde_json::json!({"report": report, "temporal_diff": temporal_diff}),
+                    None,
+                )?;
+            } else {
+                write_json(&report, output.as_deref())?;
+            }
+        }
+        Commands::Upload {
+            year,
+            tri_report,
+            mail,
+            ksef,
+            saldeo,
+            review_score,
+            output,
+            csv,
+        } => {
+            let mut plan = saldeo_sync_plan(SaldeoSyncPlanConfig {
+                year,
+                tri_report: tri_report.as_deref(),
+                mail: mail.as_deref(),
+                ksef: ksef.as_deref(),
+                saldeo: saldeo.as_deref(),
+                review_score,
+                confirm: true,
+                upload_url: None,
+            })?;
+            let storage_state = default_saldeo_storage_state_path();
+            saldeo_upload_plan(
+                &mut plan,
+                &storage_state,
+                DEFAULT_SALDEO_UPLOAD_URL,
+                "file",
+            )?;
+            if let Some(csv_path) = csv {
+                write_saldeo_sync_csv(&plan, &csv_path)?;
+            }
+            write_json(&plan, output.as_deref())?;
         }
         Commands::GmailAuth {
             client_secret,
@@ -691,100 +555,6 @@ fn main() -> Result<()> {
             let result = gmail_fetch(&token, &user, &query, &out, max, &extensions)?;
             write_json(&result, None)?;
         }
-        Commands::KsefSync {
-            year,
-            input,
-            out,
-            store,
-        } => {
-            let result = ksef_sync(year, &input, out.as_deref())?;
-            if store {
-                let conn = open_db(&db_path)?;
-                store_records(&conn, &result.records)?;
-            }
-            write_json(&result.summary, None)?;
-        }
-        Commands::SaldeoSync {
-            year,
-            tri_report,
-            mail,
-            ksef,
-            saldeo,
-            review_score,
-            storage_state,
-            upload_url,
-            file_field,
-            confirm,
-            output,
-            csv,
-        } => {
-            let mut plan = saldeo_sync_plan(SaldeoSyncPlanConfig {
-                year,
-                tri_report: tri_report.as_deref(),
-                mail: mail.as_deref(),
-                ksef: ksef.as_deref(),
-                saldeo: saldeo.as_deref(),
-                review_score,
-                confirm,
-                upload_url: upload_url.clone(),
-            })?;
-            if confirm {
-                let upload_url = upload_url.as_deref().unwrap_or(DEFAULT_SALDEO_UPLOAD_URL);
-                let storage_state = storage_state.unwrap_or_else(default_saldeo_storage_state_path);
-                saldeo_upload_plan(&mut plan, &storage_state, upload_url, &file_field)?;
-            }
-            if let Some(csv_path) = csv {
-                write_saldeo_sync_csv(&plan, &csv_path)?;
-            }
-            write_json(&plan, output.as_deref())?;
-        }
-        Commands::SaldeoFetch {
-            year,
-            storage_state,
-            out,
-            store,
-        } => {
-            let storage_state = storage_state.unwrap_or_else(default_saldeo_storage_state_path);
-            let result = saldeo_fetch(year, &storage_state, &out)?;
-            if store {
-                let conn = open_db(&db_path)?;
-                store_records(&conn, &result.records)?;
-            }
-            write_json(&result.summary, None)?;
-        }
-        Commands::TriReconcile {
-            mail,
-            ksef,
-            saldeo,
-            review_score,
-            output,
-            csv,
-            store,
-            year,
-        } => {
-            let mail_records = load_records(SourceKind::Mail, &mail)?;
-            let ksef_records = load_records(SourceKind::Ksef, &ksef)?;
-            let saldeo_records = load_saldeo_records(&saldeo)?;
-            let report = tri_reconcile(mail_records, ksef_records, saldeo_records, review_score);
-            let temporal_diff = if store {
-                let conn = open_db(&db_path)?;
-                Some(store_tri_reconcile_report(&conn, year, &report)?)
-            } else {
-                None
-            };
-            if let Some(csv_path) = csv {
-                write_tri_csv(&report, &csv_path)?;
-            }
-            if temporal_diff.is_some() && output.is_none() {
-                write_json(
-                    &serde_json::json!({"report": report, "temporal_diff": temporal_diff}),
-                    None,
-                )?;
-            } else {
-                write_json(&report, output.as_deref())?;
-            }
-        }
-        Commands::Cycle { command } => handle_cycle_command(&db_path, command)?,
         Commands::Mcp => run_mcp_server(&db_path)?,
         Commands::Db { command } => handle_db_command(&db_path, command)?,
         Commands::Doctor { token_env } => doctor(&token_env)?,
@@ -977,13 +747,6 @@ fn source_from_db(value: &str) -> rusqlite::Result<SourceKind> {
     }
 }
 
-fn match_status_as_str(status: &MatchStatus) -> &'static str {
-    match status {
-        MatchStatus::Matched => "matched",
-        MatchStatus::NeedsReview => "needs_review",
-    }
-}
-
 fn store_records(conn: &Connection, records: &[InvoiceRecord]) -> Result<Vec<i64>> {
     records
         .iter()
@@ -1125,54 +888,6 @@ fn invoice_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InvoiceRecord> 
         email_from: row.get(18)?,
         warnings: serde_json::from_str(&warnings_json).unwrap_or_default(),
     })
-}
-
-fn store_reconcile_report(conn: &Connection, report: &ReconcileReport) -> Result<i64> {
-    let run_id = insert_reconcile_run(conn, report)?;
-    for item in &report.matches {
-        let ksef_id = upsert_invoice(conn, &item.ksef)?;
-        let mail_id = upsert_invoice(conn, &item.mail)?;
-        conn.execute(
-            r#"
-            INSERT INTO invoice_matches (run_id, status, score, reasons_json, ksef_invoice_id, mail_invoice_id)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-            "#,
-            params![
-                run_id,
-                match_status_as_str(&item.status),
-                item.score,
-                serde_json::to_string(&item.reasons)?,
-                ksef_id,
-                mail_id,
-            ],
-        )?;
-    }
-    store_records(conn, &report.unmatched_ksef)?;
-    store_records(conn, &report.unmatched_mail)?;
-    Ok(run_id)
-}
-
-fn insert_reconcile_run(conn: &Connection, report: &ReconcileReport) -> Result<i64> {
-    conn.execute(
-        r#"
-        INSERT INTO reconcile_runs (
-            generated_at, match_score, review_score, ksef_count, mail_count, matched_count,
-            review_count, unmatched_ksef_count, unmatched_mail_count
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-        "#,
-        params![
-            report.generated_at.to_rfc3339(),
-            report.match_score,
-            report.review_score,
-            report.summary.ksef_count as i64,
-            report.summary.mail_count as i64,
-            report.summary.matched_count as i64,
-            report.summary.review_count as i64,
-            report.summary.unmatched_ksef_count as i64,
-            report.summary.unmatched_mail_count as i64,
-        ],
-    )?;
-    Ok(conn.last_insert_rowid())
 }
 
 fn store_tri_reconcile_report(
@@ -1369,6 +1084,71 @@ fn list_tri_runs(conn: &Connection, limit: usize) -> Result<Value> {
         out.push(row?);
     }
     Ok(serde_json::json!(out))
+}
+
+fn load_last_tri_report(conn: &Connection, year: i32) -> Result<TriReconcileReport> {
+    let run_id: i64 = conn
+        .query_row(
+            "SELECT id FROM tri_reconcile_runs WHERE year = ?1 ORDER BY id DESC LIMIT 1",
+            params![year],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("brak przebiegu tri-reconcile dla roku {year}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT status, mail_invoice_number, ksef_invoice_number, saldeo_invoice_number,
+                issue_date, gross_amount_minor, currency, row_json
+         FROM tri_reconcile_rows WHERE run_id = ?1 ORDER BY id",
+    )?;
+    let rows = stmt.query_map(params![run_id], |row| {
+        let status: String = row.get(0)?;
+        let row_json: String = row.get(7)?;
+        let tri_row: TriRow =
+            serde_json::from_str(&row_json).unwrap_or_else(|_| TriRow {
+                status,
+                mail_score_to_ksef: None,
+                mail_score_to_saldeo: None,
+                ksef_score_to_saldeo: None,
+                mail: None,
+                ksef: None,
+                saldeo: None,
+            });
+        Ok(tri_row)
+    })?;
+    let mut tri_rows = Vec::new();
+    for row in rows {
+        tri_rows.push(row?);
+    }
+    let summary = tri_summary_from_rows(&tri_rows);
+    Ok(TriReconcileReport {
+        generated_at: Utc::now(),
+        review_score: 0,
+        summary,
+        rows: tri_rows,
+    })
+}
+
+fn tri_summary_from_rows(rows: &[TriRow]) -> TriSummary {
+    TriSummary {
+        mail_count: rows.iter().filter(|r| r.mail.is_some()).count(),
+        ksef_count: rows.iter().filter(|r| r.ksef.is_some()).count(),
+        saldeo_count: rows.iter().filter(|r| r.saldeo.is_some()).count(),
+        in_all_three: rows.iter().filter(|r| r.status == "in_all_three").count(),
+        gmail_ksef_missing_saldeo: rows
+            .iter()
+            .filter(|r| r.status == "gmail_ksef_missing_saldeo")
+            .count(),
+        gmail_saldeo_missing_ksef: rows
+            .iter()
+            .filter(|r| r.status == "gmail_saldeo_missing_ksef")
+            .count(),
+        gmail_only: rows.iter().filter(|r| r.status == "gmail_only").count(),
+        ksef_saldeo_missing_gmail: rows
+            .iter()
+            .filter(|r| r.status == "ksef_saldeo_missing_gmail")
+            .count(),
+        ksef_only: rows.iter().filter(|r| r.status == "ksef_only").count(),
+        saldeo_only: rows.iter().filter(|r| r.status == "saldeo_only").count(),
+    }
 }
 
 fn db_stats(conn: &Connection) -> Result<Value> {
@@ -2202,89 +1982,6 @@ for page in reader.pages:
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-fn reconcile(
-    ksef_records: Vec<InvoiceRecord>,
-    mail_records: Vec<InvoiceRecord>,
-    match_score: u8,
-    review_score: u8,
-) -> ReconcileReport {
-    let mut candidates = Vec::new();
-    for (ksef_idx, ksef) in ksef_records.iter().enumerate() {
-        for (mail_idx, mail) in mail_records.iter().enumerate() {
-            let (score, reasons) = score_pair(ksef, mail);
-            if score >= review_score {
-                candidates.push(Candidate {
-                    ksef_idx,
-                    mail_idx,
-                    score,
-                    reasons,
-                });
-            }
-        }
-    }
-    candidates.sort_by(|a, b| b.score.cmp(&a.score));
-
-    let mut used_ksef = HashSet::new();
-    let mut used_mail = HashSet::new();
-    let mut matches = Vec::new();
-    for candidate in candidates {
-        if used_ksef.contains(&candidate.ksef_idx) || used_mail.contains(&candidate.mail_idx) {
-            continue;
-        }
-        used_ksef.insert(candidate.ksef_idx);
-        used_mail.insert(candidate.mail_idx);
-        matches.push(InvoiceMatch {
-            status: if candidate.score >= match_score {
-                MatchStatus::Matched
-            } else {
-                MatchStatus::NeedsReview
-            },
-            score: candidate.score,
-            reasons: candidate.reasons,
-            ksef: ksef_records[candidate.ksef_idx].clone(),
-            mail: mail_records[candidate.mail_idx].clone(),
-        });
-    }
-
-    let unmatched_ksef = ksef_records
-        .iter()
-        .enumerate()
-        .filter(|(idx, _)| !used_ksef.contains(idx))
-        .map(|(_, record)| record.clone())
-        .collect::<Vec<_>>();
-    let unmatched_mail = mail_records
-        .iter()
-        .enumerate()
-        .filter(|(idx, _)| !used_mail.contains(idx))
-        .map(|(_, record)| record.clone())
-        .collect::<Vec<_>>();
-    let matched_count = matches
-        .iter()
-        .filter(|m| m.status == MatchStatus::Matched)
-        .count();
-    let review_count = matches
-        .iter()
-        .filter(|m| m.status == MatchStatus::NeedsReview)
-        .count();
-
-    ReconcileReport {
-        generated_at: Utc::now(),
-        match_score,
-        review_score,
-        summary: ReconcileSummary {
-            ksef_count: ksef_records.len(),
-            mail_count: mail_records.len(),
-            matched_count,
-            review_count,
-            unmatched_ksef_count: unmatched_ksef.len(),
-            unmatched_mail_count: unmatched_mail.len(),
-        },
-        matches,
-        unmatched_ksef,
-        unmatched_mail,
-    }
-}
-
 fn score_pair(ksef: &InvoiceRecord, mail: &InvoiceRecord) -> (u8, Vec<String>) {
     let mut score: u16 = 0;
     let mut reasons = Vec::new();
@@ -2365,42 +2062,6 @@ fn comparable_invoice_number(value: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric())
         .flat_map(|c| c.to_uppercase())
         .collect()
-}
-
-fn write_matches_csv(matches: &[InvoiceMatch], path: &Path) -> Result<()> {
-    let mut writer =
-        csv::Writer::from_path(path).with_context(|| format!("zapis CSV {}", path.display()))?;
-    writer.write_record([
-        "status",
-        "score",
-        "reasons",
-        "ksef_path",
-        "mail_path",
-        "invoice_number",
-        "seller_tax_id",
-        "buyer_tax_id",
-        "gross_amount_minor",
-        "issue_date",
-    ])?;
-    for m in matches {
-        writer.write_record([
-            format!("{:?}", m.status),
-            m.score.to_string(),
-            m.reasons.join(";"),
-            m.ksef.source_path.clone().unwrap_or_default(),
-            m.mail.source_path.clone().unwrap_or_default(),
-            m.ksef.invoice_number.clone().unwrap_or_default(),
-            m.ksef.seller_tax_id.clone().unwrap_or_default(),
-            m.ksef.buyer_tax_id.clone().unwrap_or_default(),
-            m.ksef
-                .gross_amount_minor
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            m.ksef.issue_date.map(|v| v.to_string()).unwrap_or_default(),
-        ])?;
-    }
-    writer.flush()?;
-    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -2930,269 +2591,6 @@ fn ksef_sync(year: i32, input: &Path, out_dir: Option<&Path>) -> Result<KsefSync
     })
 }
 
-fn handle_cycle_command(db_path: &Path, command: CycleCommands) -> Result<()> {
-    match command {
-        CycleCommands::Run {
-            year,
-            productmesh_nip,
-            ksef,
-            gmail_client_secret,
-            gmail_token_file,
-            gmail_query,
-            gmail_max,
-            skip_gmail_fetch,
-            mail_out,
-            skip_saldeo_fetch,
-            saldeo_out,
-            out,
-            store,
-            review_score,
-            copy_missing_non_ksef,
-            accounting_root,
-        } => {
-            let summary = run_cycle(CycleRunConfig {
-                db_path: db_path.to_path_buf(),
-                year,
-                productmesh_nip,
-                ksef: ksef.unwrap_or_else(|| default_ksef_records_path(year)),
-                gmail_client_secret,
-                gmail_token_file,
-                gmail_query,
-                gmail_max,
-                skip_gmail_fetch,
-                mail_out: mail_out.unwrap_or_else(|| default_mail_out_path(year)),
-                skip_saldeo_fetch,
-                saldeo_out: saldeo_out.unwrap_or_else(|| default_saldeo_out_path(year)),
-                out_dir: out,
-                store,
-                review_score,
-                copy_missing_non_ksef,
-                accounting_root: accounting_root.unwrap_or_else(default_accounting_root),
-            })?;
-            write_json(&summary, None)?;
-        }
-        CycleCommands::Missing {
-            tri_report,
-            year,
-            output,
-            csv,
-            copy_non_ksef,
-            accounting_root,
-        } => {
-            let tri_report = tri_report
-                .unwrap_or_else(|| PathBuf::from(format!("out/tri-reconcile-{year}.json")));
-            let report = read_tri_report(&tri_report)?;
-            let accounting_root = accounting_root.unwrap_or_else(default_accounting_root);
-            let non_ksef_dir = non_ksef_dir(&accounting_root, year);
-            let mut missing = missing_report_from_tri(&report);
-            let copied = if copy_non_ksef {
-                copy_missing_invoices(&mut missing.invoices, &non_ksef_dir)?
-            } else {
-                0
-            };
-            if let Some(csv_path) = csv {
-                write_missing_csv(&missing, &csv_path)?;
-            }
-            if let Some(output_path) = output {
-                write_json(&missing, Some(&output_path))?;
-            } else {
-                write_json(
-                    &serde_json::json!({
-                        "copied": copied,
-                        "report": missing,
-                    }),
-                    None,
-                )?;
-            }
-        }
-        CycleCommands::Schedule { year, ksef, bin } => {
-            let bin = bin
-                .or_else(|| std::env::current_exe().ok())
-                .unwrap_or_else(|| PathBuf::from("lab-cli"));
-            let ksef = ksef.unwrap_or_else(|| default_ksef_records_path(year));
-            let command = format!(
-                "{} --db {} cycle run --year {} --ksef {} --store --copy-missing-non-ksef",
-                shell_quote(&bin.display().to_string()),
-                shell_quote(&db_path.display().to_string()),
-                year,
-                shell_quote(&ksef.display().to_string())
-            );
-            let schedule = CycleSchedule {
-                note: "Uruchamiaj 1. i 14. dnia miesiąca, np. cron/launchd. Komenda jest idempotentna względem SQLite i nazw plików.".to_string(),
-                cron_line: format!("0 8 1,14 * * cd {} && {}", shell_quote(&std::env::current_dir()?.display().to_string()), command),
-                command,
-            };
-            write_json(&schedule, None)?;
-        }
-    }
-    Ok(())
-}
-
-struct CycleRunConfig {
-    db_path: PathBuf,
-    year: i32,
-    productmesh_nip: String,
-    ksef: PathBuf,
-    gmail_client_secret: Option<PathBuf>,
-    gmail_token_file: Option<PathBuf>,
-    gmail_query: Option<String>,
-    gmail_max: usize,
-    skip_gmail_fetch: bool,
-    mail_out: PathBuf,
-    skip_saldeo_fetch: bool,
-    saldeo_out: PathBuf,
-    out_dir: PathBuf,
-    store: bool,
-    review_score: u8,
-    copy_missing_non_ksef: bool,
-    accounting_root: PathBuf,
-}
-
-fn run_cycle(config: CycleRunConfig) -> Result<CycleRunSummary> {
-    fs::create_dir_all(&config.out_dir)
-        .with_context(|| format!("mkdir {}", config.out_dir.display()))?;
-
-    let gmail = if config.skip_gmail_fetch {
-        None
-    } else {
-        let token_path = config
-            .gmail_token_file
-            .unwrap_or_else(default_gmail_token_path);
-        let token = gmail_access_token(
-            "GMAIL_ACCESS_TOKEN",
-            &token_path,
-            config.gmail_client_secret.as_deref(),
-        )?;
-        let query = config
-            .gmail_query
-            .unwrap_or_else(|| default_gmail_query(config.year));
-        Some(gmail_fetch(
-            &token,
-            "me",
-            &query,
-            &config.mail_out,
-            config.gmail_max,
-            &["pdf".to_string()],
-        )?)
-    };
-
-    let mail_records = scan_input(SourceKind::Mail, &config.mail_out)?;
-    let candidates = productmesh_invoice_candidates(&mail_records, &config.productmesh_nip);
-    if config.store {
-        let conn = open_db(&config.db_path)?;
-        store_records(&conn, &candidates)?;
-    }
-
-    let mail_scan_json = config
-        .out_dir
-        .join(format!("mail-all-pdf-{}-scan.json", config.year));
-    let mail_candidates_json = config.out_dir.join(format!(
-        "mail-all-pdf-{}-productmesh-candidates.json",
-        config.year
-    ));
-    let mail_candidates_jsonl = config.out_dir.join(format!(
-        "mail-all-pdf-{}-productmesh-candidates.jsonl",
-        config.year
-    ));
-    write_records(&mail_records, OutputFormat::Json, Some(&mail_scan_json))?;
-    write_records(&candidates, OutputFormat::Json, Some(&mail_candidates_json))?;
-    write_records(
-        &candidates,
-        OutputFormat::Jsonl,
-        Some(&mail_candidates_jsonl),
-    )?;
-
-    let ksef_sync = ksef_sync(config.year, &config.ksef, None)?;
-    if config.store {
-        let conn = open_db(&config.db_path)?;
-        store_records(&conn, &ksef_sync.records)?;
-    }
-    let ksef_records_path = PathBuf::from(&ksef_sync.summary.jsonl_output);
-
-    let (saldeo_records_path, saldeo_documents) = if config.skip_saldeo_fetch {
-        (config.saldeo_out.join("records.jsonl"), None)
-    } else {
-        let result = saldeo_fetch(
-            config.year,
-            &default_saldeo_storage_state_path(),
-            &config.saldeo_out,
-        )?;
-        if config.store {
-            let conn = open_db(&config.db_path)?;
-            store_records(&conn, &result.records)?;
-        }
-        (
-            PathBuf::from(&result.summary.records_output),
-            Some(result.summary.documents_count),
-        )
-    };
-
-    let ksef_records = ksef_sync.records;
-    let saldeo_records = load_saldeo_records(&saldeo_records_path)?;
-    let tri = tri_reconcile(
-        candidates,
-        ksef_records,
-        saldeo_records,
-        config.review_score,
-    );
-    let tri_json = config
-        .out_dir
-        .join(format!("tri-reconcile-{}.json", config.year));
-    let tri_csv = config
-        .out_dir
-        .join(format!("tri-reconcile-{}.csv", config.year));
-    write_tri_csv(&tri, &tri_csv)?;
-    write_json(&tri, Some(&tri_json))?;
-    let temporal_diff = if config.store {
-        let conn = open_db(&config.db_path)?;
-        Some(store_tri_reconcile_report(&conn, config.year, &tri)?)
-    } else {
-        None
-    };
-
-    let missing_json = config
-        .out_dir
-        .join(format!("accountant-missing-{}.json", config.year));
-    let missing_csv = config
-        .out_dir
-        .join(format!("accountant-missing-{}.csv", config.year));
-    let non_ksef_dir = non_ksef_dir(&config.accounting_root, config.year);
-    let mut missing = missing_report_from_tri(&tri);
-    let copied_missing_count = if config.copy_missing_non_ksef {
-        copy_missing_invoices(&mut missing.invoices, &non_ksef_dir)?
-    } else {
-        0
-    };
-    write_missing_csv(&missing, &missing_csv)?;
-    write_json(&missing, Some(&missing_json))?;
-
-    Ok(CycleRunSummary {
-        generated_at: Utc::now(),
-        year: config.year,
-        gmail,
-        scanned_mail_pdfs: mail_records.len(),
-        productmesh_candidates: tri.summary.mail_count,
-        ksef_records: tri.summary.ksef_count,
-        saldeo_documents,
-        tri_summary: tri.summary,
-        temporal_diff,
-        missing_for_accountant_count: missing.count,
-        copied_missing_count,
-        paths: CycleRunPaths {
-            mail_scan_json: mail_scan_json.display().to_string(),
-            mail_candidates_json: mail_candidates_json.display().to_string(),
-            mail_candidates_jsonl: mail_candidates_jsonl.display().to_string(),
-            ksef_records_jsonl: ksef_records_path.display().to_string(),
-            saldeo_records_jsonl: saldeo_records_path.display().to_string(),
-            tri_json: tri_json.display().to_string(),
-            tri_csv: tri_csv.display().to_string(),
-            missing_json: missing_json.display().to_string(),
-            missing_csv: missing_csv.display().to_string(),
-            non_ksef_dir: non_ksef_dir.display().to_string(),
-        },
-    })
-}
-
 fn default_gmail_query(year: i32) -> String {
     format!(
         "after:{year}/01/01 before:{}/01/01 has:attachment filename:pdf",
@@ -3210,17 +2608,6 @@ fn default_saldeo_out_path(year: i32) -> PathBuf {
 
 fn default_ksef_out_path(year: i32) -> PathBuf {
     PathBuf::from(format!("data/ksef-{year}"))
-}
-
-fn default_ksef_records_path(year: i32) -> PathBuf {
-    default_ksef_out_path(year).join("records.jsonl")
-}
-
-fn non_ksef_dir(accounting_root: &Path, year: i32) -> PathBuf {
-    accounting_root
-        .join("cost invoices")
-        .join(year.to_string())
-        .join("non-KSeF files")
 }
 
 fn productmesh_invoice_candidates(
@@ -3274,288 +2661,16 @@ fn read_tri_report(path: &Path) -> Result<TriReconcileReport> {
         .with_context(|| format!("niepoprawny tri report {}", path.display()))
 }
 
-fn missing_report_from_tri(report: &TriReconcileReport) -> MissingReport {
-    let mut invoices = report
-        .rows
-        .iter()
-        .filter(|row| row.status == "gmail_only")
-        .filter_map(|row| row.mail.as_ref())
-        .map(missing_invoice_from_record)
-        .collect::<Vec<_>>();
-    invoices.sort_by(|a, b| {
-        (a.issue_date, &a.contractor, &a.invoice_number).cmp(&(
-            b.issue_date,
-            &b.contractor,
-            &b.invoice_number,
-        ))
-    });
-    MissingReport {
-        generated_at: Utc::now(),
-        count: invoices.len(),
-        invoices,
-    }
-}
 
-fn missing_invoice_from_record(record: &InvoiceRecord) -> MissingInvoice {
-    let mut invoice_number = record
-        .invoice_number
-        .clone()
-        .unwrap_or_else(|| "UNKNOWN".to_string());
-    let mut contractor = record
-        .seller_name
-        .clone()
-        .or_else(|| record.buyer_name.clone())
-        .unwrap_or_default();
-    let mut issue_date = record.issue_date;
-    let mut gross_amount_minor = record.gross_amount_minor;
-    let mut currency = record.currency.clone().unwrap_or_default();
 
-    if let Some(path) = record.source_path.as_ref().map(PathBuf::from)
-        && path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("pdf"))
-            .unwrap_or(false)
-        && let Ok(text) = extract_pdf_text(&path)
-    {
-        if (invoice_number == "UNKNOWN" || invoice_number == "INVOICE")
-            && let Some(value) = english_invoice_number(&text)
-        {
-            invoice_number = value;
-        }
-        if issue_date.is_none() {
-            issue_date = english_issue_date(&text);
-        }
-        if let Some(known) = known_contractor_from_text(&text)
-            && (contractor.is_empty() || contractor.to_lowercase().contains("booking reference"))
-        {
-            contractor = known;
-        }
-        if (gross_amount_minor.is_none()
-            || gross_amount_minor.unwrap_or_default().abs() > 100_000_000)
-            && let Some((amount, cur)) = english_total_amount(&text)
-        {
-            gross_amount_minor = Some(amount);
-            if currency.is_empty() {
-                currency = cur;
-            }
-        }
-        if currency.is_empty()
-            && let Some((_, cur)) = english_total_amount(&text)
-        {
-            currency = cur;
-        }
-    }
 
-    if contractor.is_empty() {
-        contractor = "UNKNOWN".to_string();
-    }
-    let amount = gross_amount_minor
-        .map(|v| format!("{:.2}", v as f64 / 100.0))
-        .unwrap_or_default();
 
-    MissingInvoice {
-        invoice_number,
-        contractor,
-        issue_date,
-        gross_amount_minor,
-        amount,
-        currency,
-        source_path: record.source_path.clone().unwrap_or_default(),
-        target_path: None,
-    }
-}
 
-fn english_invoice_number(text: &str) -> Option<String> {
-    for pattern in [
-        r"(?i)Invoice number\s+([^\n]+)",
-        r"(?i)Invoice number:\s*([^\n]+)",
-    ] {
-        let re = Regex::new(pattern).unwrap();
-        if let Some(value) = re.captures(text).and_then(|c| c.get(1)) {
-            return Some(clean_invoice_number(value.as_str()));
-        }
-    }
-    None
-}
 
-fn english_issue_date(text: &str) -> Option<NaiveDate> {
-    let re = Regex::new(r"(?i)Date of issue\s+([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})").unwrap();
-    if let Some(caps) = re.captures(text) {
-        let month = match caps.get(1)?.as_str().to_ascii_lowercase().as_str() {
-            "january" => 1,
-            "february" => 2,
-            "march" => 3,
-            "april" => 4,
-            "may" => 5,
-            "june" => 6,
-            "july" => 7,
-            "august" => 8,
-            "september" => 9,
-            "october" => 10,
-            "november" => 11,
-            "december" => 12,
-            _ => return None,
-        };
-        let day: u32 = caps.get(2)?.as_str().parse().ok()?;
-        let year: i32 = caps.get(3)?.as_str().parse().ok()?;
-        return NaiveDate::from_ymd_opt(year, month, day);
-    }
-    let re = Regex::new(r"(?i)Date of issue:\s*(\d{2})/(\d{2})/(\d{4})").unwrap();
-    re.captures(text).and_then(|caps| {
-        let day: u32 = caps.get(1)?.as_str().parse().ok()?;
-        let month: u32 = caps.get(2)?.as_str().parse().ok()?;
-        let year: i32 = caps.get(3)?.as_str().parse().ok()?;
-        NaiveDate::from_ymd_opt(year, month, day)
-    })
-}
 
-fn known_contractor_from_text(text: &str) -> Option<String> {
-    let lower = text.to_lowercase();
-    for (needle, name) in [
-        ("anthropic", "Anthropic PBC"),
-        ("openrouter", "OpenRouter Inc"),
-        ("moonshot", "Moonshot AI PTE LTD"),
-        ("ryanair", "Ryanair DAC"),
-        (
-            "santander consumer multirent",
-            "Santander Consumer Multirent Sp. z o.o.",
-        ),
-        ("elocity", "Elocity sp. z o.o."),
-    ] {
-        if lower.contains(needle) {
-            return Some(name.to_string());
-        }
-    }
-    None
-}
 
-fn english_total_amount(text: &str) -> Option<(i64, String)> {
-    let re = Regex::new(r"(?i)Total\s*([€$])\s*([0-9]+(?:[.,][0-9]{2})?)").unwrap();
-    if let Some(caps) = re.captures(text) {
-        let currency = match caps.get(1)?.as_str() {
-            "€" => "EUR",
-            "$" => "USD",
-            _ => "",
-        };
-        let amount = parse_money_minor(caps.get(2)?.as_str())?;
-        return Some((amount, currency.to_string()));
-    }
-    let re = Regex::new(r"(?im)^TOTAL\s+[0-9]+(?:[.,][0-9]{2})?\s+[0-9]+(?:[.,][0-9]{2})?\s+([0-9]+(?:[.,][0-9]{2})?)").unwrap();
-    if text.to_lowercase().contains("ryanair")
-        && let Some(caps) = re.captures(text)
-    {
-        return Some((parse_money_minor(caps.get(1)?.as_str())?, "PLN".to_string()));
-    }
-    None
-}
 
-fn write_missing_csv(report: &MissingReport, path: &Path) -> Result<()> {
-    let mut writer =
-        csv::Writer::from_path(path).with_context(|| format!("zapis CSV {}", path.display()))?;
-    writer.write_record([
-        "issue_date",
-        "invoice_number",
-        "contractor",
-        "amount",
-        "currency",
-        "source_path",
-        "target_path",
-    ])?;
-    for invoice in &report.invoices {
-        writer.write_record([
-            invoice
-                .issue_date
-                .map(|d| d.to_string())
-                .unwrap_or_default(),
-            invoice.invoice_number.clone(),
-            invoice.contractor.clone(),
-            invoice.amount.clone(),
-            invoice.currency.clone(),
-            invoice.source_path.clone(),
-            invoice.target_path.clone().unwrap_or_default(),
-        ])?;
-    }
-    writer.flush()?;
-    Ok(())
-}
 
-fn copy_missing_invoices(invoices: &mut [MissingInvoice], non_ksef_dir: &Path) -> Result<usize> {
-    fs::create_dir_all(non_ksef_dir)
-        .with_context(|| format!("mkdir {}", non_ksef_dir.display()))?;
-    let mut copied = 0usize;
-    for invoice in &mut *invoices {
-        if invoice.source_path.is_empty() {
-            continue;
-        }
-        let source = PathBuf::from(&invoice.source_path);
-        if !source.exists() {
-            continue;
-        }
-        let file_name = standardized_invoice_filename(invoice);
-        let target = non_ksef_dir.join(file_name);
-        if !target.exists() {
-            fs::copy(&source, &target).with_context(|| {
-                format!("kopiowanie {} -> {}", source.display(), target.display())
-            })?;
-            copied += 1;
-        }
-        invoice.target_path = Some(target.display().to_string());
-    }
-    write_non_ksef_manifest(invoices, non_ksef_dir)?;
-    Ok(copied)
-}
-
-fn standardized_invoice_filename(invoice: &MissingInvoice) -> String {
-    let date = invoice
-        .issue_date
-        .map(|d| d.to_string())
-        .unwrap_or_else(|| "unknown-date".to_string());
-    let amount = if invoice.amount.is_empty() {
-        "unknown-amount".to_string()
-    } else {
-        invoice.amount.clone()
-    };
-    let currency = if invoice.currency.is_empty() {
-        "XXX".to_string()
-    } else {
-        invoice.currency.clone()
-    };
-    format!(
-        "{} - {} - {} - {} {}.pdf",
-        safe_filename_part(&invoice.invoice_number),
-        safe_filename_part(&invoice.contractor),
-        date,
-        amount,
-        safe_filename_part(&currency)
-    )
-}
-
-fn safe_filename_part(value: &str) -> String {
-    value
-        .replace(['/', ':', '\\'], "_")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn write_non_ksef_manifest(invoices: &[MissingInvoice], non_ksef_dir: &Path) -> Result<()> {
-    let manifest = non_ksef_dir.join("_manifest.csv");
-    let mut writer = csv::Writer::from_path(&manifest)
-        .with_context(|| format!("zapis CSV {}", manifest.display()))?;
-    writer.write_record(["source", "target"])?;
-    for invoice in invoices {
-        if let Some(target) = &invoice.target_path {
-            writer.write_record([invoice.source_path.clone(), target.clone()])?;
-        }
-    }
-    writer.flush()?;
-    Ok(())
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
 
 fn run_mcp_server(db_path: &Path) -> Result<()> {
     let stdin = io::stdin();
@@ -3674,45 +2789,50 @@ fn handle_mcp_request(db_path: &Path, method: &str, params: Value) -> Result<Val
 fn mcp_tools() -> Value {
     serde_json::json!([
         {
-            "name": "cycle_run",
-            "description": "Run the recurring ProductMesh invoice flow: Gmail PDFs, KSeF sync, Saldeo fetch, tri-reconcile, missing report, temporal diff.",
+            "name": "sync",
+            "description": "Sync invoice data from Gmail/PDF, KSeF, and/or Saldeo. Without source flags, syncs all three sources.",
             "inputSchema": {"type":"object","properties":{
+                "ksef":{"type":"boolean","description":"Sync only KSeF"},
+                "mail":{"type":"boolean","description":"Sync only Gmail/PDF (fetch attachments, parse, filter, store)"},
+                "saldeo":{"type":"boolean","description":"Sync only Saldeo"},
                 "year":{"type":"integer","default":2026},
+                "ksef_input":{"type":"string","description":"Path to KSeF export directory/file"},
+                "gmail_client_secret":{"type":"string","description":"Google OAuth Desktop Client JSON for token refresh"},
+                "gmail_token_file":{"type":"string","description":"Path to Gmail token file"},
+                "productmesh_nip":{"type":"string","default":"5242920020","description":"NIP filter for mail scanning"},
+                "store":{"type":"boolean","default":false,"description":"Store records in SQLite"}
+            }}
+        },
+        {
+            "name": "reconcile",
+            "description": "Compare Gmail/PDF, KSeF, and Saldeo records (tri-reconcile).",
+            "inputSchema": {"type":"object","required":["mail","ksef","saldeo"],"properties":{
+                "mail":{"type":"string","description":"Path to Gmail/PDF records JSON/JSONL"},
                 "ksef":{"type":"string","description":"Path to KSeF records JSON/JSONL"},
-                "skip_gmail_fetch":{"type":"boolean","default":false},
-                "skip_saldeo_fetch":{"type":"boolean","default":false},
-                "copy_missing_non_ksef":{"type":"boolean","default":false},
-                "gmail_max":{"type":"integer","default":500}
+                "saldeo":{"type":"string","description":"Path to Saldeo records JSON/JSONL or raw documents.json"},
+                "review_score":{"type":"integer","default":45,"description":"Minimum match score"},
+                "store":{"type":"boolean","default":false,"description":"Store temporal snapshot in SQLite"},
+                "year":{"type":"integer","default":2026}
             }}
         },
         {
-            "name": "cycle_missing",
-            "description": "Read tri-reconcile report and list Gmail-only invoices missing in Saldeo; optionally copy to non-KSeF files.",
+            "name": "reconcile_status",
+            "description": "Show the last tri-reconcile report from the database for a given year.",
+            "inputSchema": {"type":"object","properties":{
+                "year":{"type":"integer","default":2026}
+            }}
+        },
+        {
+            "name": "upload",
+            "description": "Upload invoices missing in Saldeo. Requires tri_report path or mail+ksef+saldeo paths.",
             "inputSchema": {"type":"object","properties":{
                 "year":{"type":"integer","default":2026},
-                "tri_report":{"type":"string"},
-                "copy_non_ksef":{"type":"boolean","default":false}
+                "tri_report":{"type":"string","description":"Path to tri-reconcile report JSON"},
+                "mail":{"type":"string","description":"Path to Gmail/PDF records JSON/JSONL"},
+                "ksef":{"type":"string","description":"Path to KSeF records JSON/JSONL"},
+                "saldeo":{"type":"string","description":"Path to Saldeo records JSON/JSONL"},
+                "review_score":{"type":"integer","default":70,"description":"Minimum match score when computing from sources"}
             }}
-        },
-        {
-            "name": "ksef_sync",
-            "description": "Sync a local KSeF export/records path into LAB normalized records and optionally store in SQLite.",
-            "inputSchema": {"type":"object","required":["input"],"properties":{"year":{"type":"integer","default":2026},"input":{"type":"string"},"out":{"type":"string"},"store":{"type":"boolean","default":false}}}
-        },
-        {
-            "name": "saldeo_sync",
-            "description": "Plan or execute upload of invoices missing in Saldeo from tri-reconcile or source records. Upload requires confirm=true; upload_url defaults to the verified generate-urls endpoint.",
-            "inputSchema": {"type":"object","properties":{"year":{"type":"integer","default":2026},"tri_report":{"type":"string"},"mail":{"type":"string"},"ksef":{"type":"string"},"saldeo":{"type":"string"},"review_score":{"type":"integer","default":70},"confirm":{"type":"boolean","default":false},"upload_url":{"type":"string"},"file_field":{"type":"string","default":"file"}}}
-        },
-        {
-            "name": "saldeo_fetch",
-            "description": "Fetch Saldeo documents for a year using saved Playwright storage state.",
-            "inputSchema": {"type":"object","properties":{"year":{"type":"integer","default":2026},"out":{"type":"string"},"store":{"type":"boolean","default":false}}}
-        },
-        {
-            "name": "tri_reconcile",
-            "description": "Compare Gmail/PDF records, KSeF records and Saldeo records.",
-            "inputSchema": {"type":"object","required":["mail","ksef","saldeo"],"properties":{"mail":{"type":"string"},"ksef":{"type":"string"},"saldeo":{"type":"string"},"review_score":{"type":"integer","default":70},"store":{"type":"boolean","default":false},"year":{"type":"integer","default":2026}}}
         },
         {
             "name": "db_stats",
@@ -3722,68 +2842,108 @@ fn mcp_tools() -> Value {
         {
             "name": "tri_runs",
             "description": "List temporal tri-reconcile runs and diff counters.",
-            "inputSchema": {"type":"object","properties":{"limit":{"type":"integer","default":20}}}
+            "inputSchema": {"type":"object","properties":{
+                "limit":{"type":"integer","default":20}
+            }}
         }
     ])
 }
 
 fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<Value> {
     match name {
-        "cycle_run" => {
+        "sync" => {
             let year = json_i32(args, "year", 2026);
-            let summary = run_cycle(CycleRunConfig {
-                db_path: db_path.to_path_buf(),
-                year,
-                productmesh_nip: json_string_arg(args, "productmesh_nip")
-                    .unwrap_or_else(|| "5242920020".to_string()),
-                ksef: json_path_arg(args, "ksef")
-                    .unwrap_or_else(|| default_ksef_records_path(year)),
-                gmail_client_secret: json_path_arg(args, "gmail_client_secret"),
-                gmail_token_file: json_path_arg(args, "gmail_token_file"),
-                gmail_query: json_string_arg(args, "gmail_query"),
-                gmail_max: json_usize(args, "gmail_max", 500),
-                skip_gmail_fetch: json_bool(args, "skip_gmail_fetch", false),
-                mail_out: json_path_arg(args, "mail_out")
-                    .unwrap_or_else(|| default_mail_out_path(year)),
-                skip_saldeo_fetch: json_bool(args, "skip_saldeo_fetch", false),
-                saldeo_out: json_path_arg(args, "saldeo_out")
-                    .unwrap_or_else(|| default_saldeo_out_path(year)),
-                out_dir: json_path_arg(args, "out").unwrap_or_else(|| PathBuf::from("out")),
-                store: json_bool(args, "store", false),
-                review_score: json_u8(args, "review_score", 70),
-                copy_missing_non_ksef: json_bool(args, "copy_missing_non_ksef", false),
-                accounting_root: json_path_arg(args, "accounting_root")
-                    .unwrap_or_else(default_accounting_root),
-            })?;
-            Ok(serde_json::to_value(summary)?)
-        }
-        "cycle_missing" => {
-            let year = json_i32(args, "year", 2026);
-            let tri_report = json_path_arg(args, "tri_report")
-                .unwrap_or_else(|| PathBuf::from(format!("out/tri-reconcile-{year}.json")));
-            let report = read_tri_report(&tri_report)?;
-            let mut missing = missing_report_from_tri(&report);
-            if json_bool(args, "copy_non_ksef", false) {
-                let dir = non_ksef_dir(
-                    &json_path_arg(args, "accounting_root").unwrap_or_else(default_accounting_root),
-                    year,
-                );
-                let copied = copy_missing_invoices(&mut missing.invoices, &dir)?;
-                return Ok(serde_json::json!({"copied": copied, "report": missing}));
+            let all = !json_bool(args, "ksef", false)
+                && !json_bool(args, "mail", false)
+                && !json_bool(args, "saldeo", false);
+            let conn = if json_bool(args, "store", false) {
+                Some(open_db(db_path)?)
+            } else {
+                None
+            };
+            let mut synced: Vec<String> = Vec::new();
+            let mut records_count = 0usize;
+            if json_bool(args, "ksef", false) || all {
+                let input = json_path_arg(args, "ksef_input")
+                    .unwrap_or_else(|| default_ksef_out_path(year));
+                let result = ksef_sync(year, &input, None)?;
+                records_count += result.summary.records_count;
+                if let Some(ref conn) = conn {
+                    store_records(conn, &result.records)?;
+                }
+                synced.push(format!("ksef ({})", result.summary.records_count));
             }
-            Ok(serde_json::to_value(missing)?)
+            if json_bool(args, "mail", false) || all {
+                let token_path = json_path_arg(args, "gmail_token_file")
+                    .unwrap_or_else(default_gmail_token_path);
+                let token = gmail_access_token(
+                    "GMAIL_ACCESS_TOKEN",
+                    &token_path,
+                    json_path_arg(args, "gmail_client_secret").as_deref(),
+                )?;
+                let mail_out = default_mail_out_path(year);
+                let gmail_result = gmail_fetch(
+                    &token,
+                    "me",
+                    &default_gmail_query(year),
+                    &mail_out,
+                    500,
+                    &["pdf".to_string()],
+                )?;
+                let mail_records = scan_input(SourceKind::Mail, &mail_out)?;
+                let nip = json_string_arg(args, "productmesh_nip")
+                    .unwrap_or_else(|| "5242920020".to_string());
+                let candidates = productmesh_invoice_candidates(&mail_records, &nip);
+                records_count += candidates.len();
+                if let Some(ref conn) = conn {
+                    store_records(conn, &candidates)?;
+                }
+                synced.push(format!(
+                    "mail ({} files, {} pdfs, {} candidates)",
+                    gmail_result.files_saved,
+                    mail_records.len(),
+                    candidates.len()
+                ));
+            }
+            if json_bool(args, "saldeo", false) || all {
+                let result =
+                    saldeo_fetch(year, &default_saldeo_storage_state_path(), &default_saldeo_out_path(year))?;
+                records_count += result.summary.records_count;
+                if let Some(ref conn) = conn {
+                    store_records(conn, &result.records)?;
+                }
+                synced.push(format!("saldeo ({})", result.summary.documents_count));
+            }
+            Ok(serde_json::json!({"synced": synced, "year": year, "records_count": records_count, "stored": conn.is_some()}))
         }
-        "ksef_sync" => {
-            let year = json_i32(args, "year", 2026);
-            let input = json_path_arg(args, "input").ok_or_else(|| anyhow!("missing input"))?;
-            let result = ksef_sync(year, &input, json_path_arg(args, "out").as_deref())?;
+        "reconcile" => {
+            let mail = json_path_arg(args, "mail")
+                .ok_or_else(|| anyhow!("missing mail"))?;
+            let ksef = json_path_arg(args, "ksef")
+                .ok_or_else(|| anyhow!("missing ksef"))?;
+            let saldeo = json_path_arg(args, "saldeo")
+                .ok_or_else(|| anyhow!("missing saldeo"))?;
+            let report = tri_reconcile(
+                load_records(SourceKind::Mail, &mail)?,
+                load_records(SourceKind::Ksef, &ksef)?,
+                load_saldeo_records(&saldeo)?,
+                json_u8(args, "review_score", 45),
+            );
             if json_bool(args, "store", false) {
                 let conn = open_db(db_path)?;
-                store_records(&conn, &result.records)?;
+                let diff =
+                    store_tri_reconcile_report(&conn, json_i32(args, "year", 2026), &report)?;
+                return Ok(serde_json::json!({"report": report, "temporal_diff": diff}));
             }
-            Ok(serde_json::to_value(result.summary)?)
+            Ok(serde_json::to_value(report)?)
         }
-        "saldeo_sync" => {
+        "reconcile_status" => {
+            let year = json_i32(args, "year", 2026);
+            let conn = open_db(db_path)?;
+            let report = load_last_tri_report(&conn, year)?;
+            Ok(serde_json::to_value(report)?)
+        }
+        "upload" => {
             let year = json_i32(args, "year", 2026);
             let tri_report = json_path_arg(args, "tri_report");
             let mail = json_path_arg(args, "mail");
@@ -3796,49 +2956,16 @@ fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<Value> {
                 ksef: ksef.as_deref(),
                 saldeo: saldeo.as_deref(),
                 review_score: json_u8(args, "review_score", 70),
-                confirm: json_bool(args, "confirm", false),
-                upload_url: json_string_arg(args, "upload_url"),
+                confirm: true,
+                upload_url: None,
             })?;
-            if json_bool(args, "confirm", false) {
-                let upload_url = json_string_arg(args, "upload_url")
-                    .ok_or_else(|| anyhow!("upload_url is required when confirm=true"))?;
-                saldeo_upload_plan(
-                    &mut plan,
-                    &json_path_arg(args, "storage_state")
-                        .unwrap_or_else(default_saldeo_storage_state_path),
-                    &upload_url,
-                    &json_string_arg(args, "file_field").unwrap_or_else(|| "file".to_string()),
-                )?;
-            }
+            saldeo_upload_plan(
+                &mut plan,
+                &default_saldeo_storage_state_path(),
+                DEFAULT_SALDEO_UPLOAD_URL,
+                "file",
+            )?;
             Ok(serde_json::to_value(plan)?)
-        }
-        "saldeo_fetch" => {
-            let year = json_i32(args, "year", 2026);
-            let out = json_path_arg(args, "out").unwrap_or_else(|| default_saldeo_out_path(year));
-            let result = saldeo_fetch(year, &default_saldeo_storage_state_path(), &out)?;
-            if json_bool(args, "store", false) {
-                let conn = open_db(db_path)?;
-                store_records(&conn, &result.records)?;
-            }
-            Ok(serde_json::to_value(result.summary)?)
-        }
-        "tri_reconcile" => {
-            let mail = json_path_arg(args, "mail").ok_or_else(|| anyhow!("missing mail"))?;
-            let ksef = json_path_arg(args, "ksef").ok_or_else(|| anyhow!("missing ksef"))?;
-            let saldeo = json_path_arg(args, "saldeo").ok_or_else(|| anyhow!("missing saldeo"))?;
-            let report = tri_reconcile(
-                load_records(SourceKind::Mail, &mail)?,
-                load_records(SourceKind::Ksef, &ksef)?,
-                load_saldeo_records(&saldeo)?,
-                json_u8(args, "review_score", 70),
-            );
-            if json_bool(args, "store", false) {
-                let conn = open_db(db_path)?;
-                let diff =
-                    store_tri_reconcile_report(&conn, json_i32(args, "year", 2026), &report)?;
-                return Ok(serde_json::json!({"report": report, "temporal_diff": diff}));
-            }
-            Ok(serde_json::to_value(report)?)
         }
         "db_stats" => {
             let conn = open_db(db_path)?;
@@ -3885,12 +3012,6 @@ fn json_u8(args: &Value, key: &str, default: u8) -> u8 {
         .and_then(|v| v.as_u64())
         .and_then(|v| u8::try_from(v).ok())
         .unwrap_or(default)
-}
-
-fn default_accounting_root() -> PathBuf {
-    std::env::var_os("PRODUCTMESH_ACCOUNTING_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("ACCOUNTING"))
 }
 
 struct SaldeoSyncPlanConfig<'a> {
@@ -4694,6 +3815,84 @@ fn write_tri_csv(report: &TriReconcileReport, path: &Path) -> Result<()> {
     }
     writer.flush()?;
     Ok(())
+}
+
+fn onboard(db_path: &Path, check: bool, gmail_client_secret: Option<&Path>) -> Result<()> {
+    let token_file = default_gmail_token_path();
+    let token_exists = token_file.exists();
+    let token_valid = token_exists
+        && read_gmail_token(&token_file)
+            .map(|t| {
+                t.expires_at
+                    .map(|exp| exp > Utc::now() + chrono::Duration::seconds(60))
+                    .unwrap_or(true)
+            })
+            .unwrap_or(false);
+
+    let saldeo_state = default_saldeo_storage_state_path();
+    let saldeo_exists = saldeo_state.exists();
+
+    let pdftotext_ok = Command::new("pdftotext").arg("-v").output().is_ok();
+    let python_ok = Command::new("python3").arg("-c").arg("from pypdf import PdfReader").output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    let db_exists = db_path.exists();
+    if !db_exists {
+        open_db(db_path)?;
+        eprintln!("Utworzono bazę: {}", db_path.display());
+    } else {
+        eprintln!("Baza istnieje: {}", db_path.display());
+    }
+
+    let needs_gmail_auth = !token_valid && !check;
+    let gmail_authed = if needs_gmail_auth {
+        if let Some(secret) = gmail_client_secret {
+            eprintln!("\n--- Autoryzacja Gmail ---");
+            let result = gmail_auth(secret, &token_file, false)?;
+            eprintln!("Token Gmail zapisany: {}", result.token_file);
+            true
+        } else {
+            eprintln!(
+                "\n⚠ Gmail nie skonfigurowany. Uruchom:\n  lab gmail-auth --client-secret <ścieżka>"
+            );
+            false
+        }
+    } else {
+        token_valid
+    };
+
+    let status = serde_json::json!({
+        "prerequisites": {
+            "pdftotext": pdftotext_ok,
+            "python3_pypdf": python_ok
+        },
+        "gmail": {
+            "token_file": token_file.display().to_string(),
+            "token_exists": token_exists,
+            "token_valid": gmail_authed,
+            "env_var": std::env::var("GMAIL_ACCESS_TOKEN").is_ok()
+        },
+        "saldeo": {
+            "storage_state": saldeo_state.display().to_string(),
+            "exists": saldeo_exists
+        },
+        "database": {
+            "path": db_path.display().to_string(),
+            "exists": db_exists
+        },
+        "next_steps": if !pdftotext_ok || !gmail_authed || !saldeo_exists {
+            vec![
+                if !pdftotext_ok { Some("brew install poppler") } else { None },
+                if !python_ok { Some("python3 -m pip install pypdf") } else { None },
+                if !gmail_authed { Some("lab gmail-auth --client-secret <ścieżka>") } else { None },
+                if !saldeo_exists { Some("Zapisz sesję Saldeo Playwright do ~/.config/lab/saldeo-storage-state.json") } else { None },
+            ].into_iter().flatten().collect::<Vec<_>>()
+        } else {
+            vec!["Wszystko gotowe. Uruchom: lab sync --help"]
+        }
+    });
+    write_json(&status, None)
 }
 
 fn doctor(token_env: &str) -> Result<()> {
