@@ -3776,7 +3776,6 @@ fn onboard(db_path: &Path, check: bool, gmail_client_secret: Option<&Path>) -> R
     let db_exists = db_path.exists();
     if !db_exists {
         open_db(db_path)?;
-        eprintln!("Utworzono bazę: {}", db_path.display());
     }
 
     let year = Utc::now().year();
@@ -3794,127 +3793,199 @@ fn onboard(db_path: &Path, check: bool, gmail_client_secret: Option<&Path>) -> R
     let ksef_token_ok = std::env::var("KSEF_TOKEN").ok().map(|v| !v.is_empty()).unwrap_or(false);
     let ksef_api_ok = ksef_cert_ok && ksef_key_ok && ksef_password_ok && ksef_token_ok;
 
+    let mut gmail_authed = token_valid;
+    let interactive = !check;
+
     eprintln!("LAB — konfiguracja środowiska\n");
     eprintln!("  Baza danych:     {}", if db_exists { "✓" } else { "✓ (nowa)" });
     eprintln!("  pdftotext:       {}", if pdftotext_ok { "✓" } else { "✗ (brew install poppler)" });
     eprintln!("  python3/pypdf:   {}", if python_ok { "✓" } else { "✗ (pip install pypdf)" });
-    eprintln!("  Gmail:           {}", if token_valid { "✓" } else if token_exists { "✗ (token wygasł)" } else { "✗" });
-    eprintln!("  Saldeo:          {}", if saldeo_valid { "✓" } else if saldeo_exists { "✗ (sesja wygasła — odśwież)" } else { "✗" });
-    eprintln!("  KSeF certyfikat: {}", if ksef_cert_ok { format!("✓ ({})", ksef_cert.as_deref().unwrap_or("")) } else { "✗ (ustaw KSEF_CERT_PATH)".to_string() });
-    eprintln!("  KSeF klucz:      {}", if ksef_key_ok { format!("✓ ({})", ksef_key.as_deref().unwrap_or("")) } else { "✗ (ustaw KSEF_KEY_PATH)".to_string() });
-    eprintln!("  KSeF hasło:      {}", if ksef_password_ok { "✓" } else { "✗ (ustaw KSEF_CERT_PASSWORD)" });
-    eprintln!("  KSeF token:      {}", if ksef_token_ok { "✓" } else { "✗ (ustaw KSEF_TOKEN)" });
+    eprintln!("  Gmail:           {}", if gmail_authed { "✓" } else if token_exists { "✗ (token wygasł)" } else { "✗" });
+    eprintln!("  Saldeo:          {}", if saldeo_valid { "✓" } else if saldeo_exists { "✗ (sesja wygasła)" } else { "✗" });
+    eprintln!("  KSeF certyfikat: {}", if ksef_cert_ok { format!("✓ ({})", ksef_cert.as_deref().unwrap_or("")) } else { "✗".to_string() });
+    eprintln!("  KSeF klucz:      {}", if ksef_key_ok { format!("✓ ({})", ksef_key.as_deref().unwrap_or("")) } else { "✗".to_string() });
+    eprintln!("  KSeF hasło:      {}", if ksef_password_ok { "✓" } else { "✗" });
+    eprintln!("  KSeF token:      {}", if ksef_token_ok { "✓" } else { "✗" });
     eprintln!("  KSeF dane:       {}", if ksef_data_exists { format!("✓ ({})", ksef_dir.display()) } else { format!("✗ ({})", ksef_dir.display()) });
 
-    let needs_gmail_auth = !token_valid && !check;
-    let mut gmail_authed = token_valid;
+    if !interactive {
+        let mut steps: Vec<&str> = Vec::new();
+        if !pdftotext_ok { steps.push("brew install poppler"); }
+        if !python_ok { steps.push("python3 -m pip install pypdf"); }
+        if !gmail_authed { steps.push("lab onboard --gmail-client-secret <ścieżka>"); }
+        if !saldeo_valid { steps.push("Odśwież sesję Saldeo (~/.config/lab/saldeo-storage-state.json)"); }
+        if !ksef_api_ok { steps.push("Ustaw KSEF_CERT_PATH, KSEF_KEY_PATH, KSEF_CERT_PASSWORD, KSEF_TOKEN"); }
+        if !ksef_data_exists { steps.push("Umieść eksport KSeF w data/ksef-<rok>"); }
+        if steps.is_empty() { steps.push("Wszystko gotowe. Uruchom: lab sync"); }
+        let status = serde_json::json!({
+            "prerequisites": { "pdftotext": pdftotext_ok, "python3_pypdf": python_ok },
+            "gmail": { "token_valid": gmail_authed },
+            "saldeo": { "session_valid": saldeo_valid },
+            "ksef": { "api_ok": ksef_api_ok, "data_exists": ksef_data_exists },
+            "database": { "exists": db_exists },
+            "next_steps": steps
+        });
+        return write_json(&status, None);
+    }
 
-    if needs_gmail_auth {
+    // --- Interactive mode ---
+
+    // 1. Gmail
+    if !gmail_authed {
+        eprintln!("── Gmail ──");
         let secret = if let Some(s) = gmail_client_secret {
             Some(s.to_path_buf())
         } else {
-            eprintln!("Gmail nie jest skonfigurowany.");
-            eprintln!("Potrzebny jest plik Google OAuth Desktop Client JSON.");
-            eprintln!("Można go pobrać z Google Cloud Console → APIs & Services → Credentials.");
-            eprint!("\nPodaj ścieżkę do client_secret JSON (lub Enter aby pominąć): ");
-            io::stdout().flush()?;
-            let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
-            let path = input.trim().to_string();
+            eprintln!("Potrzebny plik Google OAuth Desktop Client JSON.");
+            eprintln!("Pobierz go z Google Cloud Console → APIs & Services → Credentials.\n");
+            let path = prompt("Ścieżka do client_secret JSON", "")?;
             if path.is_empty() {
+                eprintln!("⏭ Pominięto.\n");
                 None
             } else {
                 let p = PathBuf::from(&path);
-                if p.exists() {
-                    Some(p)
-                } else {
-                    eprintln!("Plik nie istnieje: {path}");
-                    None
-                }
+                if p.exists() { Some(p) } else { eprintln!("✗ Plik nie istnieje.\n"); None }
             }
         };
-
         if let Some(secret) = secret {
-            eprintln!("\n--- Autoryzacja Gmail ---");
             match gmail_auth(&secret, &token_file, false) {
                 Ok(result) => {
-                    eprintln!("✓ Token Gmail zapisany: {}", result.token_file);
+                    eprintln!("✓ Gmail skonfigurowany. Token: {}\n", result.token_file);
                     gmail_authed = true;
                 }
-                Err(err) => {
-                    eprintln!("✗ Autoryzacja nie powiodła się: {err}");
+                Err(err) => eprintln!("✗ Błąd autoryzacji: {err}\n"),
+            }
+        }
+    } else {
+        eprintln!("── Gmail ──");
+        eprintln!("✓ już skonfigurowany");
+        if prompt_yn("Odświeżyć token?")? {
+            let secret = if let Some(s) = gmail_client_secret {
+                s.to_path_buf()
+            } else {
+                let path = prompt("Ścieżka do client_secret JSON", "")?;
+                if path.is_empty() { eprintln!("⏭ Pominięto.\n"); }
+                PathBuf::from(&path)
+            };
+            if secret.as_os_str().is_empty() {
+                // skip
+            } else if secret.exists() {
+                match gmail_auth(&secret, &token_file, false) {
+                    Ok(result) => eprintln!("✓ Token odświeżony: {}\n", result.token_file),
+                    Err(err) => eprintln!("✗ Błąd: {err}\n"),
+                }
+            } else {
+                eprintln!("✗ Plik nie istnieje.\n");
+            }
+        }
+        eprintln!();
+    }
+
+    // 2. Saldeo
+    eprintln!("── Saldeo ──");
+    if saldeo_valid {
+        eprintln!("✓ sesja aktywna\n");
+    } else {
+        if saldeo_exists {
+            eprintln!("✗ Sesja wygasła (401).");
+        } else {
+            eprintln!("✗ Brak pliku sesji.");
+        }
+        eprintln!("Plik sesji: {}", saldeo_state.display());
+        eprintln!("Uruchom przeglądarkę Playwright, zaloguj się do Saldeo i zapisz storage state.\n");
+    }
+
+    // 3. KSeF API
+    eprintln!("── KSeF API ──");
+    if ksef_api_ok {
+        eprintln!("✓ wszystkie env vars ustawione\n");
+    } else {
+        eprintln!("Brakujące zmienne środowiskowe:");
+        if !ksef_cert_ok { eprintln!("  KSEF_CERT_PATH — ścieżka do certyfikatu .pem"); }
+        if !ksef_key_ok { eprintln!("  KSEF_KEY_PATH — ścieżka do klucza .key"); }
+        if !ksef_password_ok { eprintln!("  KSEF_CERT_PASSWORD — hasło do certyfikatu"); }
+        if !ksef_token_ok { eprintln!("  KSEF_TOKEN — token API"); }
+        if prompt_yn("\nUstawić teraz interaktywnie?")? {
+            eprintln!("Dodaj do ~/.zshrc (lub uruchom przed lab):");
+            if !ksef_cert_ok {
+                let val = prompt("KSEF_CERT_PATH", ksef_cert.as_deref().unwrap_or(""))?;
+                if !val.is_empty() && Path::new(&val).exists() {
+                    eprintln!("  export KSEF_CERT_PATH={val}");
+                }
+            }
+            if !ksef_key_ok {
+                let val = prompt("KSEF_KEY_PATH", ksef_key.as_deref().unwrap_or(""))?;
+                if !val.is_empty() && Path::new(&val).exists() {
+                    eprintln!("  export KSEF_KEY_PATH={val}");
+                }
+            }
+            if !ksef_password_ok {
+                let val = prompt("KSEF_CERT_PASSWORD", "")?;
+                if !val.is_empty() {
+                    eprintln!("  export KSEF_CERT_PASSWORD='***'  # wpisz prawdziwe hasło");
+                }
+            }
+            if !ksef_token_ok {
+                let val = prompt("KSEF_TOKEN", "")?;
+                if !val.is_empty() {
+                    eprintln!("  export KSEF_TOKEN='***'  # wpisz prawdziwy token");
                 }
             }
         }
+        eprintln!();
     }
 
-    if !saldeo_valid && !check {
-        if saldeo_exists {
-            eprintln!("\nSaldeo: sesja wygasła. Odśwież storage state Playwright i zapisz do:");
-            eprintln!("  {}", saldeo_state.display());
-        } else {
-            eprintln!("\nSaldeo nie jest skonfigurowane. Zapisz sesję Playwright do:");
-            eprintln!("  {}", saldeo_state.display());
-        }
+    // 4. KSeF dane
+    eprintln!("── KSeF dane ──");
+    if ksef_data_exists {
+        eprintln!("✓ {}\n", ksef_dir.display());
+    } else {
+        eprintln!("✗ Brak lokalnego eksportu: {}", ksef_dir.display());
+        eprintln!("Umieść tam pliki XML/JSON z KSeF i uruchom: lab sync --ksef\n");
     }
 
-    if !ksef_api_ok && !check {
-        eprintln!("\nKSeF API nie jest w pełni skonfigurowane. Ustaw zmienne środowiskowe:");
-        if !ksef_cert_ok { eprintln!("  export KSEF_CERT_PATH=/ścieżka/do/certyfikatu.pem"); }
-        if !ksef_key_ok { eprintln!("  export KSEF_KEY_PATH=/ścieżka/do/klucza.key"); }
-        if !ksef_password_ok { eprintln!("  export KSEF_CERT_PASSWORD='...'"); }
-        if !ksef_token_ok { eprintln!("  export KSEF_TOKEN='...'"); }
+    // 5. Podsumowanie
+    let all_ok = pdftotext_ok && python_ok && gmail_authed && saldeo_valid && ksef_api_ok && ksef_data_exists;
+    eprintln!("═══ Podsumowanie ═══");
+    if all_ok {
+        eprintln!("Wszystko gotowe. Uruchom: lab sync");
+    } else {
+        let mut missing = Vec::new();
+        if !pdftotext_ok { missing.push("pdftotext"); }
+        if !gmail_authed { missing.push("Gmail"); }
+        if !saldeo_valid { missing.push("Saldeo"); }
+        if !ksef_api_ok { missing.push("KSeF API"); }
+        if !ksef_data_exists { missing.push("KSeF dane"); }
+        eprintln!("Do skonfigurowania: {}", missing.join(", "));
+        eprintln!("Uruchom `lab onboard` ponownie, aby dokończyć.");
     }
 
-    if !ksef_data_exists && !check {
-        eprintln!("\nKSeF: brak lokalnego eksportu w {}. Umieść tam pliki XML/JSON z KSeF.", ksef_dir.display());
+    write_json(&serde_json::json!({"all_ok": all_ok}), None)
+}
+
+fn prompt(label: &str, default: &str) -> Result<String> {
+    if default.is_empty() {
+        eprint!("  {label}: ");
+    } else {
+        eprint!("  {label} [{default}]: ");
     }
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let trimmed = input.trim().to_string();
+    if trimmed.is_empty() && !default.is_empty() {
+        Ok(default.to_string())
+    } else {
+        Ok(trimmed)
+    }
+}
 
-    let mut steps: Vec<&str> = Vec::new();
-    if !pdftotext_ok { steps.push("brew install poppler"); }
-    if !python_ok { steps.push("python3 -m pip install pypdf"); }
-    if !gmail_authed { steps.push("lab onboard --gmail-client-secret <ścieżka>"); }
-    if !saldeo_valid { steps.push("Odśwież sesję Saldeo Playwright (~/.config/lab/saldeo-storage-state.json)"); }
-    if !ksef_api_ok { steps.push("Ustaw KSEF_CERT_PATH, KSEF_KEY_PATH, KSEF_CERT_PASSWORD, KSEF_TOKEN"); }
-    if !ksef_data_exists { steps.push("Umieść eksport KSeF (XML/JSON) w data/ksef-<rok>"); }
-    if steps.is_empty() { steps.push("Wszystko gotowe. Uruchom: lab sync"); }
-
-    let status = serde_json::json!({
-        "prerequisites": {
-            "pdftotext": pdftotext_ok,
-            "python3_pypdf": python_ok
-        },
-        "gmail": {
-            "token_file": token_file.display().to_string(),
-            "token_exists": token_exists,
-            "token_valid": gmail_authed,
-            "env_var": std::env::var("GMAIL_ACCESS_TOKEN").is_ok()
-        },
-        "saldeo": {
-            "storage_state": saldeo_state.display().to_string(),
-            "file_exists": saldeo_exists,
-            "session_valid": saldeo_valid
-        },
-        "ksef": {
-            "api": {
-                "cert_ok": ksef_cert_ok,
-                "key_ok": ksef_key_ok,
-                "password_ok": ksef_password_ok,
-                "token_ok": ksef_token_ok,
-                "all_ok": ksef_api_ok
-            },
-            "data": {
-                "directory": ksef_dir.display().to_string(),
-                "exists": ksef_data_exists
-            }
-        },
-        "database": {
-            "path": db_path.display().to_string(),
-            "exists": db_exists
-        },
-        "next_steps": steps
-    });
-    write_json(&status, None)
+fn prompt_yn(question: &str) -> Result<bool> {
+    eprint!("  {question} [t/N]: ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().eq_ignore_ascii_case("t") || input.trim().eq_ignore_ascii_case("y"))
 }
 
 fn saldeo_session_valid(storage_state: &Path) -> bool {
