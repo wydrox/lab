@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "ksef-mail-reconcile": {
+      "command": "/path/to/ksef-mail-reconcile",
+      "args": [
+        "--db",
+        "/path/to/reconcile.sqlite",
+        "mcp"
+      ],
+      "cwd": "/path/to/ksef-mail-reconcile"
+    }
+  }
+}
