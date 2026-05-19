@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "lab-mcp": {
+      "command": "/path/to/lab-cli",
+      "args": [
+        "--db",
+        "/path/to/lab.sqlite",
+        "mcp"
+      ],
+      "cwd": "/path/to/lab"
+    }
+  }
+}

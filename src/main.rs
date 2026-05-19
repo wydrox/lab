@@ -17,11 +17,11 @@ use std::process::Command;
 use walkdir::WalkDir;
 
 #[derive(Parser, Debug)]
-#[command(name = "ksef-mail-reconcile")]
-#[command(about = "Uzgadnia faktury z eksportu KSeF z fakturami z Gmaila", long_about = None)]
+#[command(name = "lab-cli")]
+#[command(about = "LAB — Lazy Accounting Buddy", long_about = None)]
 struct Cli {
     /// Dedykowana baza SQLite na rekordy, przebiegi i dopasowania.
-    #[arg(long, global = true, default_value = "ksef-mail-reconcile.sqlite")]
+    #[arg(long, global = true, default_value = "lab.sqlite")]
     db: PathBuf,
     #[command(subcommand)]
     command: Commands,
@@ -94,7 +94,7 @@ enum Commands {
         /// Google OAuth Desktop Client JSON.
         #[arg(long)]
         client_secret: PathBuf,
-        /// Plik tokenu; domyślnie ~/.config/ksef-mail-reconcile/gmail_token.json.
+        /// Plik tokenu; domyślnie ~/.config/lab/gmail_token.json.
         #[arg(long)]
         token_file: Option<PathBuf>,
         /// Nie otwieraj przeglądarki automatycznie; tylko wypisz URL.
@@ -118,7 +118,7 @@ enum Commands {
         /// Nazwa env var z tokenem OAuth; jeśli ustawiony, ma priorytet.
         #[arg(long, default_value = "GMAIL_ACCESS_TOKEN")]
         token_env: String,
-        /// Plik tokenu z gmail-auth; domyślnie ~/.config/ksef-mail-reconcile/gmail_token.json.
+        /// Plik tokenu z gmail-auth; domyślnie ~/.config/lab/gmail_token.json.
         #[arg(long)]
         token_file: Option<PathBuf>,
         /// Google OAuth Desktop Client JSON, potrzebny do odświeżenia tokenu.
@@ -127,6 +127,21 @@ enum Commands {
         /// Pobierane rozszerzenia załączników.
         #[arg(long, value_delimiter = ',', default_value = "pdf,xml,json,txt")]
         extensions: Vec<String>,
+    },
+    /// Synchronizuje eksport KSeF do znormalizowanych rekordów LAB.
+    KsefSync {
+        /// Rok rozliczeniowy.
+        #[arg(long, default_value_t = 2026)]
+        year: i32,
+        /// Katalog, plik JSONL, JSON albo XML z eksportem/rekordami KSeF.
+        #[arg(long)]
+        input: PathBuf,
+        /// Katalog na records.json i records.jsonl.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Zapisz rekordy do SQLite.
+        #[arg(long)]
+        store: bool,
     },
     /// Pobiera dokumenty z SaldeoSMART przez zapisaną sesję webową.
     SaldeoFetch {
@@ -163,6 +178,12 @@ enum Commands {
         /// Opcjonalny CSV z raportem.
         #[arg(long)]
         csv: Option<PathBuf>,
+        /// Zapisz temporalny snapshot tri-reconcile w SQLite.
+        #[arg(long)]
+        store: bool,
+        /// Rok snapshotu przy --store.
+        #[arg(long, default_value_t = 2026)]
+        year: i32,
     },
     /// Cykliczny flow 1/14 miesiąca: Gmail → skan PDF → Saldeo → tri-reconcile → braki dla księgowej.
     Cycle {
@@ -200,7 +221,7 @@ enum CycleCommands {
         /// Google OAuth Desktop Client JSON, potrzebny gdy token Gmail wymaga odświeżenia.
         #[arg(long)]
         gmail_client_secret: Option<PathBuf>,
-        /// Plik tokenu Gmail. Domyślnie ~/.config/ksef-mail-reconcile/gmail_token.json.
+        /// Plik tokenu Gmail. Domyślnie ~/.config/lab/gmail_token.json.
         #[arg(long)]
         gmail_token_file: Option<PathBuf>,
         /// Zapytanie Gmail. Domyślnie PDF-y z całego roku.
@@ -287,6 +308,12 @@ enum DbCommands {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
+    /// Lista temporalnych przebiegów tri-reconcile z licznikami diffów.
+    TriRuns {
+        /// Maksymalna liczba przebiegów.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
@@ -349,6 +376,21 @@ struct ReconcileSummary {
 }
 
 #[derive(Debug, Serialize)]
+struct KsefSyncResult {
+    summary: KsefSyncSummary,
+    records: Vec<InvoiceRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct KsefSyncSummary {
+    year: i32,
+    records_count: usize,
+    input: String,
+    json_output: String,
+    jsonl_output: String,
+}
+
+#[derive(Debug, Serialize)]
 struct SaldeoFetchResult {
     summary: SaldeoFetchSummary,
     records: Vec<InvoiceRecord>,
@@ -403,8 +445,10 @@ struct CycleRunSummary {
     gmail: Option<GmailFetchResult>,
     scanned_mail_pdfs: usize,
     productmesh_candidates: usize,
+    ksef_records: usize,
     saldeo_documents: Option<usize>,
     tri_summary: TriSummary,
+    temporal_diff: Option<TemporalDiffSummary>,
     missing_for_accountant_count: usize,
     copied_missing_count: usize,
     paths: CycleRunPaths,
@@ -415,12 +459,22 @@ struct CycleRunPaths {
     mail_scan_json: String,
     mail_candidates_json: String,
     mail_candidates_jsonl: String,
+    ksef_records_jsonl: String,
     saldeo_records_jsonl: String,
     tri_json: String,
     tri_csv: String,
     missing_json: String,
     missing_csv: String,
     non_ksef_dir: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TemporalDiffSummary {
+    run_id: i64,
+    previous_run_id: Option<i64>,
+    added_count: usize,
+    removed_count: usize,
+    changed_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -561,6 +615,19 @@ fn main() -> Result<()> {
             let result = gmail_fetch(&token, &user, &query, &out, max, &extensions)?;
             write_json(&result, None)?;
         }
+        Commands::KsefSync {
+            year,
+            input,
+            out,
+            store,
+        } => {
+            let result = ksef_sync(year, &input, out.as_deref())?;
+            if store {
+                let conn = open_db(&db_path)?;
+                store_records(&conn, &result.records)?;
+            }
+            write_json(&result.summary, None)?;
+        }
         Commands::SaldeoFetch {
             year,
             storage_state,
@@ -582,15 +649,30 @@ fn main() -> Result<()> {
             review_score,
             output,
             csv,
+            store,
+            year,
         } => {
             let mail_records = load_records(SourceKind::Mail, &mail)?;
             let ksef_records = load_records(SourceKind::Ksef, &ksef)?;
             let saldeo_records = load_saldeo_records(&saldeo)?;
             let report = tri_reconcile(mail_records, ksef_records, saldeo_records, review_score);
+            let temporal_diff = if store {
+                let conn = open_db(&db_path)?;
+                Some(store_tri_reconcile_report(&conn, year, &report)?)
+            } else {
+                None
+            };
             if let Some(csv_path) = csv {
                 write_tri_csv(&report, &csv_path)?;
             }
-            write_json(&report, output.as_deref())?;
+            if temporal_diff.is_some() && output.is_none() {
+                write_json(
+                    &serde_json::json!({"report": report, "temporal_diff": temporal_diff}),
+                    None,
+                )?;
+            } else {
+                write_json(&report, output.as_deref())?;
+            }
         }
         Commands::Cycle { command } => handle_cycle_command(&db_path, command)?,
         Commands::Mcp => run_mcp_server(&db_path)?,
@@ -703,6 +785,38 @@ fn open_db(path: &Path) -> Result<Connection> {
             ksef_invoice_id INTEGER NOT NULL REFERENCES invoices(id),
             mail_invoice_id INTEGER NOT NULL REFERENCES invoices(id)
         );
+        CREATE TABLE IF NOT EXISTS tri_reconcile_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            generated_at TEXT NOT NULL,
+            year INTEGER NOT NULL,
+            review_score INTEGER NOT NULL,
+            mail_count INTEGER NOT NULL,
+            ksef_count INTEGER NOT NULL,
+            saldeo_count INTEGER NOT NULL,
+            summary_json TEXT NOT NULL,
+            report_hash TEXT NOT NULL,
+            previous_run_id INTEGER,
+            added_count INTEGER NOT NULL,
+            removed_count INTEGER NOT NULL,
+            changed_count INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_tri_reconcile_runs_year ON tri_reconcile_runs(year, id);
+        CREATE TABLE IF NOT EXISTS tri_reconcile_rows (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL REFERENCES tri_reconcile_runs(id) ON DELETE CASCADE,
+            row_key TEXT NOT NULL,
+            row_hash TEXT NOT NULL,
+            status TEXT NOT NULL,
+            mail_invoice_number TEXT,
+            ksef_invoice_number TEXT,
+            saldeo_invoice_number TEXT,
+            issue_date TEXT,
+            gross_amount_minor INTEGER,
+            currency TEXT,
+            row_json TEXT NOT NULL,
+            UNIQUE(run_id, row_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_tri_reconcile_rows_run_key ON tri_reconcile_rows(run_id, row_key);
         "#,
     )?;
     ensure_invoice_columns(&conn)?;
@@ -951,6 +1065,154 @@ fn insert_reconcile_run(conn: &Connection, report: &ReconcileReport) -> Result<i
     Ok(conn.last_insert_rowid())
 }
 
+fn store_tri_reconcile_report(
+    conn: &Connection,
+    year: i32,
+    report: &TriReconcileReport,
+) -> Result<TemporalDiffSummary> {
+    let previous_run_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM tri_reconcile_runs WHERE year = ?1 ORDER BY id DESC LIMIT 1",
+            params![year],
+            |row| row.get(0),
+        )
+        .ok();
+    let previous_rows = if let Some(run_id) = previous_run_id {
+        load_tri_row_hashes(conn, run_id)?
+    } else {
+        HashMap::new()
+    };
+    let current_rows = tri_row_hashes(report)?;
+    let added_count = current_rows
+        .keys()
+        .filter(|key| !previous_rows.contains_key(*key))
+        .count();
+    let removed_count = previous_rows
+        .keys()
+        .filter(|key| !current_rows.contains_key(*key))
+        .count();
+    let changed_count = current_rows
+        .iter()
+        .filter(|(key, hash)| previous_rows.get(*key).is_some_and(|old| old != *hash))
+        .count();
+    let report_json = serde_json::to_vec(report)?;
+    let report_hash = hex::encode(Sha256::digest(&report_json));
+    conn.execute(
+        r#"
+        INSERT INTO tri_reconcile_runs (
+            generated_at, year, review_score, mail_count, ksef_count, saldeo_count,
+            summary_json, report_hash, previous_run_id, added_count, removed_count, changed_count
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        "#,
+        params![
+            report.generated_at.to_rfc3339(),
+            year,
+            report.review_score,
+            report.summary.mail_count as i64,
+            report.summary.ksef_count as i64,
+            report.summary.saldeo_count as i64,
+            serde_json::to_string(&report.summary)?,
+            report_hash,
+            previous_run_id,
+            added_count as i64,
+            removed_count as i64,
+            changed_count as i64,
+        ],
+    )?;
+    let run_id = conn.last_insert_rowid();
+    for row in &report.rows {
+        let row_key = tri_row_key(row);
+        let row_json = serde_json::to_string(row)?;
+        let row_hash = hex::encode(Sha256::digest(row_json.as_bytes()));
+        let primary = row
+            .mail
+            .as_ref()
+            .or(row.ksef.as_ref())
+            .or(row.saldeo.as_ref());
+        conn.execute(
+            r#"
+            INSERT INTO tri_reconcile_rows (
+                run_id, row_key, row_hash, status, mail_invoice_number, ksef_invoice_number,
+                saldeo_invoice_number, issue_date, gross_amount_minor, currency, row_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            "#,
+            params![
+                run_id,
+                row_key,
+                row_hash,
+                row.status,
+                row.mail.as_ref().and_then(|r| r.invoice_number.clone()),
+                row.ksef.as_ref().and_then(|r| r.invoice_number.clone()),
+                row.saldeo.as_ref().and_then(|r| r.invoice_number.clone()),
+                primary.and_then(|r| r.issue_date).map(|d| d.to_string()),
+                primary.and_then(|r| r.gross_amount_minor),
+                primary.and_then(|r| r.currency.clone()),
+                row_json,
+            ],
+        )?;
+    }
+    Ok(TemporalDiffSummary {
+        run_id,
+        previous_run_id,
+        added_count,
+        removed_count,
+        changed_count,
+    })
+}
+
+fn load_tri_row_hashes(conn: &Connection, run_id: i64) -> Result<HashMap<String, String>> {
+    let mut stmt =
+        conn.prepare("SELECT row_key, row_hash FROM tri_reconcile_rows WHERE run_id = ?1")?;
+    let rows = stmt.query_map(params![run_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (key, hash) = row?;
+        out.insert(key, hash);
+    }
+    Ok(out)
+}
+
+fn tri_row_hashes(report: &TriReconcileReport) -> Result<HashMap<String, String>> {
+    let mut out = HashMap::new();
+    for row in &report.rows {
+        let json = serde_json::to_string(row)?;
+        out.insert(
+            tri_row_key(row),
+            hex::encode(Sha256::digest(json.as_bytes())),
+        );
+    }
+    Ok(out)
+}
+
+fn tri_row_key(row: &TriRow) -> String {
+    for record in [row.ksef.as_ref(), row.mail.as_ref(), row.saldeo.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(reference) = &record.ksef_reference {
+            return format!("ksef:{reference}");
+        }
+    }
+    let primary = row
+        .mail
+        .as_ref()
+        .or(row.ksef.as_ref())
+        .or(row.saldeo.as_ref());
+    if let Some(record) = primary {
+        return format!(
+            "inv:{}|date:{}|gross:{}|cur:{}",
+            record.invoice_number.clone().unwrap_or_default(),
+            record.issue_date.map(|d| d.to_string()).unwrap_or_default(),
+            record
+                .gross_amount_minor
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            record.currency.clone().unwrap_or_default()
+        );
+    }
+    "empty".to_string()
+}
+
 fn handle_db_command(path: &Path, command: DbCommands) -> Result<()> {
     let conn = open_db(path)?;
     match command {
@@ -963,7 +1225,40 @@ fn handle_db_command(path: &Path, command: DbCommands) -> Result<()> {
             let records = load_records_from_db(&conn, source, Some(limit))?;
             write_json(&records, None)
         }
+        DbCommands::TriRuns { limit } => write_json(&list_tri_runs(&conn, limit)?, None),
     }
+}
+
+fn list_tri_runs(conn: &Connection, limit: usize) -> Result<Value> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, generated_at, year, mail_count, ksef_count, saldeo_count,
+               previous_run_id, added_count, removed_count, changed_count, report_hash
+        FROM tri_reconcile_runs
+        ORDER BY id DESC
+        LIMIT ?1
+        "#,
+    )?;
+    let rows = stmt.query_map(params![limit as i64], |row| {
+        Ok(serde_json::json!({
+            "id": row.get::<_, i64>(0)?,
+            "generated_at": row.get::<_, String>(1)?,
+            "year": row.get::<_, i64>(2)?,
+            "mail_count": row.get::<_, i64>(3)?,
+            "ksef_count": row.get::<_, i64>(4)?,
+            "saldeo_count": row.get::<_, i64>(5)?,
+            "previous_run_id": row.get::<_, Option<i64>>(6)?,
+            "added_count": row.get::<_, i64>(7)?,
+            "removed_count": row.get::<_, i64>(8)?,
+            "changed_count": row.get::<_, i64>(9)?,
+            "report_hash": row.get::<_, String>(10)?,
+        }))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(serde_json::json!(out))
 }
 
 fn db_stats(conn: &Connection) -> Result<Value> {
@@ -980,10 +1275,18 @@ fn db_stats(conn: &Connection) -> Result<Value> {
     let runs: i64 = conn.query_row("SELECT COUNT(*) FROM reconcile_runs", [], |row| row.get(0))?;
     let matches: i64 =
         conn.query_row("SELECT COUNT(*) FROM invoice_matches", [], |row| row.get(0))?;
+    let tri_runs: i64 = conn.query_row("SELECT COUNT(*) FROM tri_reconcile_runs", [], |row| {
+        row.get(0)
+    })?;
+    let tri_rows: i64 = conn.query_row("SELECT COUNT(*) FROM tri_reconcile_rows", [], |row| {
+        row.get(0)
+    })?;
     Ok(serde_json::json!({
         "invoices_by_source": by_source,
         "reconcile_runs": runs,
         "invoice_matches": matches,
+        "tri_reconcile_runs": tri_runs,
+        "tri_reconcile_rows": tri_rows,
     }))
 }
 
@@ -2035,7 +2338,7 @@ fn default_gmail_token_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".config")
-        .join("ksef-mail-reconcile")
+        .join("lab")
         .join("gmail_token.json")
 }
 
@@ -2495,6 +2798,28 @@ fn sanitize_filename(value: &str) -> String {
     s.trim_matches('_').chars().take(180).collect()
 }
 
+fn ksef_sync(year: i32, input: &Path, out_dir: Option<&Path>) -> Result<KsefSyncResult> {
+    let records = load_records(SourceKind::Ksef, input)?;
+    let out_dir = out_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_ksef_out_path(year));
+    fs::create_dir_all(&out_dir).with_context(|| format!("mkdir {}", out_dir.display()))?;
+    let json_output = out_dir.join("records.json");
+    let jsonl_output = out_dir.join("records.jsonl");
+    write_records(&records, OutputFormat::Json, Some(&json_output))?;
+    write_records(&records, OutputFormat::Jsonl, Some(&jsonl_output))?;
+    Ok(KsefSyncResult {
+        summary: KsefSyncSummary {
+            year,
+            records_count: records.len(),
+            input: input.display().to_string(),
+            json_output: json_output.display().to_string(),
+            jsonl_output: jsonl_output.display().to_string(),
+        },
+        records,
+    })
+}
+
 fn handle_cycle_command(db_path: &Path, command: CycleCommands) -> Result<()> {
     match command {
         CycleCommands::Run {
@@ -2573,7 +2898,7 @@ fn handle_cycle_command(db_path: &Path, command: CycleCommands) -> Result<()> {
         CycleCommands::Schedule { year, ksef, bin } => {
             let bin = bin
                 .or_else(|| std::env::current_exe().ok())
-                .unwrap_or_else(|| PathBuf::from("ksef-mail-reconcile"));
+                .unwrap_or_else(|| PathBuf::from("lab-cli"));
             let ksef = ksef.unwrap_or_else(|| default_ksef_records_path(year));
             let command = format!(
                 "{} --db {} cycle run --year {} --ksef {} --store --copy-missing-non-ksef",
@@ -2667,6 +2992,13 @@ fn run_cycle(config: CycleRunConfig) -> Result<CycleRunSummary> {
         Some(&mail_candidates_jsonl),
     )?;
 
+    let ksef_sync = ksef_sync(config.year, &config.ksef, None)?;
+    if config.store {
+        let conn = open_db(&config.db_path)?;
+        store_records(&conn, &ksef_sync.records)?;
+    }
+    let ksef_records_path = PathBuf::from(&ksef_sync.summary.jsonl_output);
+
     let (saldeo_records_path, saldeo_documents) = if config.skip_saldeo_fetch {
         (config.saldeo_out.join("records.jsonl"), None)
     } else {
@@ -2685,7 +3017,7 @@ fn run_cycle(config: CycleRunConfig) -> Result<CycleRunSummary> {
         )
     };
 
-    let ksef_records = load_records(SourceKind::Ksef, &config.ksef)?;
+    let ksef_records = ksef_sync.records;
     let saldeo_records = load_saldeo_records(&saldeo_records_path)?;
     let tri = tri_reconcile(
         candidates,
@@ -2701,6 +3033,12 @@ fn run_cycle(config: CycleRunConfig) -> Result<CycleRunSummary> {
         .join(format!("tri-reconcile-{}.csv", config.year));
     write_tri_csv(&tri, &tri_csv)?;
     write_json(&tri, Some(&tri_json))?;
+    let temporal_diff = if config.store {
+        let conn = open_db(&config.db_path)?;
+        Some(store_tri_reconcile_report(&conn, config.year, &tri)?)
+    } else {
+        None
+    };
 
     let missing_json = config
         .out_dir
@@ -2724,14 +3062,17 @@ fn run_cycle(config: CycleRunConfig) -> Result<CycleRunSummary> {
         gmail,
         scanned_mail_pdfs: mail_records.len(),
         productmesh_candidates: tri.summary.mail_count,
+        ksef_records: tri.summary.ksef_count,
         saldeo_documents,
         tri_summary: tri.summary,
+        temporal_diff,
         missing_for_accountant_count: missing.count,
         copied_missing_count,
         paths: CycleRunPaths {
             mail_scan_json: mail_scan_json.display().to_string(),
             mail_candidates_json: mail_candidates_json.display().to_string(),
             mail_candidates_jsonl: mail_candidates_jsonl.display().to_string(),
+            ksef_records_jsonl: ksef_records_path.display().to_string(),
             saldeo_records_jsonl: saldeo_records_path.display().to_string(),
             tri_json: tri_json.display().to_string(),
             tri_csv: tri_csv.display().to_string(),
@@ -2757,8 +3098,12 @@ fn default_saldeo_out_path(year: i32) -> PathBuf {
     PathBuf::from(format!("data/saldeo-{year}"))
 }
 
+fn default_ksef_out_path(year: i32) -> PathBuf {
+    PathBuf::from(format!("data/ksef-{year}"))
+}
+
 fn default_ksef_records_path(year: i32) -> PathBuf {
-    PathBuf::from(format!("data/ksef-productmesh-{year}/ksef_records.jsonl"))
+    default_ksef_out_path(year).join("records.jsonl")
 }
 
 fn non_ksef_dir(accounting_root: &Path, year: i32) -> PathBuf {
@@ -3195,7 +3540,7 @@ fn handle_mcp_request(db_path: &Path, method: &str, params: Value) -> Result<Val
         "initialize" => Ok(serde_json::json!({
             "protocolVersion": "2024-11-05",
             "capabilities": { "tools": {} },
-            "serverInfo": { "name": "ksef-mail-reconcile", "version": env!("CARGO_PKG_VERSION") }
+            "serverInfo": { "name": "lab-mcp", "version": env!("CARGO_PKG_VERSION") }
         })),
         "tools/list" => Ok(serde_json::json!({ "tools": mcp_tools() })),
         "tools/call" => {
@@ -3220,7 +3565,7 @@ fn mcp_tools() -> Value {
     serde_json::json!([
         {
             "name": "cycle_run",
-            "description": "Run the recurring ProductMesh invoice flow: Gmail PDFs, Saldeo fetch, tri-reconcile, missing report.",
+            "description": "Run the recurring ProductMesh invoice flow: Gmail PDFs, KSeF sync, Saldeo fetch, tri-reconcile, missing report, temporal diff.",
             "inputSchema": {"type":"object","properties":{
                 "year":{"type":"integer","default":2026},
                 "ksef":{"type":"string","description":"Path to KSeF records JSON/JSONL"},
@@ -3240,6 +3585,11 @@ fn mcp_tools() -> Value {
             }}
         },
         {
+            "name": "ksef_sync",
+            "description": "Sync a local KSeF export/records path into LAB normalized records and optionally store in SQLite.",
+            "inputSchema": {"type":"object","required":["input"],"properties":{"year":{"type":"integer","default":2026},"input":{"type":"string"},"out":{"type":"string"},"store":{"type":"boolean","default":false}}}
+        },
+        {
             "name": "saldeo_fetch",
             "description": "Fetch Saldeo documents for a year using saved Playwright storage state.",
             "inputSchema": {"type":"object","properties":{"year":{"type":"integer","default":2026},"out":{"type":"string"},"store":{"type":"boolean","default":false}}}
@@ -3247,12 +3597,17 @@ fn mcp_tools() -> Value {
         {
             "name": "tri_reconcile",
             "description": "Compare Gmail/PDF records, KSeF records and Saldeo records.",
-            "inputSchema": {"type":"object","required":["mail","ksef","saldeo"],"properties":{"mail":{"type":"string"},"ksef":{"type":"string"},"saldeo":{"type":"string"},"review_score":{"type":"integer","default":70}}}
+            "inputSchema": {"type":"object","required":["mail","ksef","saldeo"],"properties":{"mail":{"type":"string"},"ksef":{"type":"string"},"saldeo":{"type":"string"},"review_score":{"type":"integer","default":70},"store":{"type":"boolean","default":false},"year":{"type":"integer","default":2026}}}
         },
         {
             "name": "db_stats",
             "description": "Return SQLite record counts.",
             "inputSchema": {"type":"object","properties":{}}
+        },
+        {
+            "name": "tri_runs",
+            "description": "List temporal tri-reconcile runs and diff counters.",
+            "inputSchema": {"type":"object","properties":{"limit":{"type":"integer","default":20}}}
         }
     ])
 }
@@ -3303,6 +3658,16 @@ fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<Value> {
             }
             Ok(serde_json::to_value(missing)?)
         }
+        "ksef_sync" => {
+            let year = json_i32(args, "year", 2026);
+            let input = json_path_arg(args, "input").ok_or_else(|| anyhow!("missing input"))?;
+            let result = ksef_sync(year, &input, json_path_arg(args, "out").as_deref())?;
+            if json_bool(args, "store", false) {
+                let conn = open_db(db_path)?;
+                store_records(&conn, &result.records)?;
+            }
+            Ok(serde_json::to_value(result.summary)?)
+        }
         "saldeo_fetch" => {
             let year = json_i32(args, "year", 2026);
             let out = json_path_arg(args, "out").unwrap_or_else(|| default_saldeo_out_path(year));
@@ -3323,11 +3688,21 @@ fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<Value> {
                 load_saldeo_records(&saldeo)?,
                 json_u8(args, "review_score", 70),
             );
+            if json_bool(args, "store", false) {
+                let conn = open_db(db_path)?;
+                let diff =
+                    store_tri_reconcile_report(&conn, json_i32(args, "year", 2026), &report)?;
+                return Ok(serde_json::json!({"report": report, "temporal_diff": diff}));
+            }
             Ok(serde_json::to_value(report)?)
         }
         "db_stats" => {
             let conn = open_db(db_path)?;
             Ok(serde_json::to_value(db_stats(&conn)?)?)
+        }
+        "tri_runs" => {
+            let conn = open_db(db_path)?;
+            Ok(list_tri_runs(&conn, json_usize(args, "limit", 20))?)
         }
         _ => Err(anyhow!("unknown MCP tool: {name}")),
     }
@@ -3379,7 +3754,7 @@ fn default_saldeo_storage_state_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".config")
-        .join("ksef-mail-reconcile")
+        .join("lab")
         .join("saldeo-storage-state.json")
 }
 

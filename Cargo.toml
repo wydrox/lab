@@ -1,8 +1,8 @@
 [package]
-name = "ksef-mail-reconcile"
+name = "lab-cli"
 version = "0.1.0"
 edition = "2024"
-description = "Małe CLI do uzgadniania faktur z KSeF z fakturami znalezionymi w Gmailu"
+description = "LAB (Lazy Accounting Buddy): agent-friendly accounting reconciliation CLI and MCP server"
 license = "MIT"
 
 [dependencies]

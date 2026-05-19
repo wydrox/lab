@@ -1,4 +1,4 @@
-# ksef-mail-reconcile
+# LAB — Lazy Accounting Buddy
 
 Małe CLI w Rust do uzgadniania faktur z eksportu KSeF z fakturami znalezionymi w Gmailu. Program jest „agent-friendly”: komendy są nieinteraktywne, wejścia/wyjścia mogą być plikami, a raport domyślnie jest JSON.
 
@@ -16,15 +16,15 @@ To nie finalizuje sesji KSeF przez oficjalne API — na start najbezpieczniejszy
 ## Instalacja / build
 
 ```bash
-git clone https://github.com/<owner>/ksef-mail-reconcile.git
-cd ksef-mail-reconcile
+git clone https://github.com/<owner>/lab.git
+cd lab
 cargo build --release
 ```
 
 Binarka będzie w:
 
 ```bash
-./target/release/ksef-mail-reconcile
+./target/release/lab-cli
 ```
 
 PDF-y są parsowane przez `pdftotext` z pakietu poppler, z fallbackiem do Python `pypdf`:
@@ -39,7 +39,7 @@ python3 -m pip install pypdf
 ### 1. Skan KSeF do JSONL
 
 ```bash
-ksef-mail-reconcile scan \
+lab-cli scan \
   --source ksef \
   --input ./data/ksef \
   --format jsonl \
@@ -49,7 +49,7 @@ ksef-mail-reconcile scan \
 ### 2. Skan faktur z maila do JSONL
 
 ```bash
-ksef-mail-reconcile scan \
+lab-cli scan \
   --source mail \
   --input ./data/mail \
   --format jsonl \
@@ -59,7 +59,7 @@ ksef-mail-reconcile scan \
 ### 3. Uzgodnienie
 
 ```bash
-ksef-mail-reconcile reconcile \
+lab-cli reconcile \
   --ksef ./out/ksef.jsonl \
   --mail ./out/mail.jsonl \
   --output ./out/report.json \
@@ -74,31 +74,32 @@ Statusy:
 
 ## SQLite
 
-Domyślna baza to `./ksef-mail-reconcile.sqlite`; można ją zmienić globalną flagą `--db`.
+Domyślna baza to `./lab.sqlite`; można ją zmienić globalną flagą `--db`.
 
 ```bash
-ksef-mail-reconcile --db ./data/reconcile.sqlite db init
-ksef-mail-reconcile --db ./data/reconcile.sqlite scan --source ksef --input ./data/ksef --store --output ./out/ksef.jsonl
-ksef-mail-reconcile --db ./data/reconcile.sqlite scan --source mail --input ./data/mail --store --output ./out/mail.jsonl
-ksef-mail-reconcile --db ./data/reconcile.sqlite reconcile-db --output ./out/report.json --csv ./out/matches.csv
-ksef-mail-reconcile --db ./data/reconcile.sqlite db stats
+lab-cli --db ./data/reconcile.sqlite db init
+lab-cli --db ./data/reconcile.sqlite scan --source ksef --input ./data/ksef --store --output ./out/ksef.jsonl
+lab-cli --db ./data/reconcile.sqlite scan --source mail --input ./data/mail --store --output ./out/mail.jsonl
+lab-cli --db ./data/reconcile.sqlite reconcile-db --output ./out/report.json --csv ./out/matches.csv
+lab-cli --db ./data/reconcile.sqlite db stats
+lab-cli --db ./data/reconcile.sqlite db tri-runs --limit 10
 ```
 
-W bazie są tabele `invoices`, `reconcile_runs`, `invoice_matches`. Sekretów OAuth/KSeF nie zapisujemy w SQLite — tylko dane faktur i wyniki uzgodnień.
+W bazie są tabele `invoices`, `reconcile_runs`, `invoice_matches` oraz temporalne `tri_reconcile_runs` / `tri_reconcile_rows` do śledzenia diffów między przebiegami. Sekretów OAuth/KSeF nie zapisujemy w SQLite — tylko dane faktur i wyniki uzgodnień.
 
 ## Pobieranie załączników z Gmaila
 
-Najwygodniej użyć Google OAuth Desktop Client JSON i komendy `gmail-auth`. Token jest zapisywany poza repo, domyślnie w `~/.config/ksef-mail-reconcile/gmail_token.json`.
+Najwygodniej użyć Google OAuth Desktop Client JSON i komendy `gmail-auth`. Token jest zapisywany poza repo, domyślnie w `~/.config/lab/gmail_token.json`.
 
 ```bash
-ksef-mail-reconcile gmail-auth \
+lab-cli gmail-auth \
   --client-secret /path/to/google-oauth-desktop-client.json
 ```
 
 Potem pobieranie załączników:
 
 ```bash
-ksef-mail-reconcile gmail-fetch \
+lab-cli gmail-fetch \
   --client-secret /path/to/google-oauth-desktop-client.json \
   --query 'has:attachment (filename:pdf OR filename:xml) newer_than:365d' \
   --out ./data/mail \
@@ -113,12 +114,26 @@ export GMAIL_ACCESS_TOKEN='<access-token>'
 
 Program zapisze pełny JSON wiadomości oraz załączniki `.pdf`, `.xml`, `.json`, `.txt`.
 
-## Cykliczny flow 1. i 14. dnia miesiąca
+## KSeF sync
 
-Najprostsza komenda do regularnego przebiegu ProductMesh: Gmail/PDF → skan → Saldeo → tri-reconcile → raport braków dla księgowej.
+LAB synchronizuje lokalny eksport KSeF/rekordy do własnego formatu JSON + JSONL i opcjonalnie SQLite:
 
 ```bash
-ksef-mail-reconcile --db ./data/full-2026.sqlite cycle run \
+lab-cli --db ./data/full-2026.sqlite ksef-sync \
+  --year 2026 \
+  --input ./data/ksef-export \
+  --out ./data/ksef-2026 \
+  --store
+```
+
+To nadal nie zapisuje tokenów ani sekretów KSeF. Oficjalny fetch API może zostać dodany później jako osobny connector.
+
+## Cykliczny flow 1. i 14. dnia miesiąca
+
+Najprostsza komenda do regularnego przebiegu ProductMesh: Gmail/PDF → skan → KSeF sync → Saldeo → tri-reconcile → temporal diff → raport braków dla księgowej.
+
+```bash
+lab-cli --db ./data/full-2026.sqlite cycle run \
   --year 2026 \
   --ksef ./data/ksef-productmesh-2026/ksef_records.jsonl \
   --store \
@@ -128,7 +143,7 @@ ksef-mail-reconcile --db ./data/full-2026.sqlite cycle run \
 Jeżeli chcesz tylko odświeżyć raport na już pobranych danych:
 
 ```bash
-ksef-mail-reconcile cycle run \
+lab-cli cycle run \
   --year 2026 \
   --ksef ./data/ksef-productmesh-2026/ksef_records.jsonl \
   --skip-gmail-fetch \
@@ -138,7 +153,7 @@ ksef-mail-reconcile cycle run \
 Raport faktur z Gmaila, których nie ma w Saldeo:
 
 ```bash
-ksef-mail-reconcile cycle missing \
+lab-cli cycle missing \
   --year 2026 \
   --tri-report ./out/tri-reconcile-2026.json \
   --output ./out/accountant-missing-2026.json \
@@ -149,7 +164,7 @@ ksef-mail-reconcile cycle missing \
 Podpowiedź do crona/launchd dla uruchamiania 1. i 14. dnia miesiąca:
 
 ```bash
-ksef-mail-reconcile cycle schedule --year 2026 --ksef ./data/ksef-productmesh-2026/ksef_records.jsonl
+lab-cli cycle schedule --year 2026 --ksef ./data/ksef-productmesh-2026/ksef_records.jsonl
 ```
 
 ## MCP dla agentów
@@ -157,34 +172,38 @@ ksef-mail-reconcile cycle schedule --year 2026 --ksef ./data/ksef-productmesh-20
 CLI ma serwer MCP po stdio:
 
 ```bash
-ksef-mail-reconcile --db ./data/full-2026.sqlite mcp
+lab-cli --db ./data/full-2026.sqlite mcp
 ```
 
-Przykładowa konfiguracja jest w `mcp/ksef-mail-reconcile.example.json`. Skopiuj ją do konfiguracji swojego klienta MCP i podmień ścieżki. Dostępne narzędzia MCP:
+Przykładowa konfiguracja jest w `mcp/lab-mcp.example.json`. Skopiuj ją do konfiguracji swojego klienta MCP i podmień ścieżki. Dostępne narzędzia MCP:
 
 - `cycle_run`
 - `cycle_missing`
+- `ksef_sync`
 - `saldeo_fetch`
 - `tri_reconcile`
 - `db_stats`
+- `tri_runs`
 
 ## SaldeoSMART i porównanie 3-stronne
 
-Saldeo używa zapisanej sesji webowej Playwright (`~/.config/ksef-mail-reconcile/saldeo-storage-state.json`). Sekrety trzymaj w macOS Keychain; nie zapisuj ich w repo.
+Saldeo używa zapisanej sesji webowej Playwright (`~/.config/lab/saldeo-storage-state.json`). Sekrety trzymaj w macOS Keychain; nie zapisuj ich w repo.
 
 ```bash
-ksef-mail-reconcile --db ./data/full-2026.sqlite saldeo-fetch \
+lab-cli --db ./data/full-2026.sqlite saldeo-fetch \
   --year 2026 \
   --out ./data/saldeo-2026 \
   --store
 
-ksef-mail-reconcile tri-reconcile \
+lab-cli --db ./data/full-2026.sqlite tri-reconcile \
   --mail ./out/mail-all-pdf-2026-productmesh-candidates.jsonl \
-  --ksef ./data/ksef-productmesh-2026/ksef_records.jsonl \
+  --ksef ./data/ksef-2026/records.jsonl \
   --saldeo ./data/saldeo-2026/records.jsonl \
   --review-score 70 \
   --output ./out/tri-reconcile-2026.json \
-  --csv ./out/tri-reconcile-2026.csv
+  --csv ./out/tri-reconcile-2026.csv \
+  --store \
+  --year 2026
 ```
 
 Statusy raportu obejmują m.in. `in_all_three`, `gmail_only`, `ksef_saldeo_missing_gmail`, `saldeo_only`.
@@ -192,7 +211,7 @@ Statusy raportu obejmują m.in. `in_all_three`, `gmail_only`, `ksef_saldeo_missi
 ## Diagnostyka
 
 ```bash
-ksef-mail-reconcile doctor
+lab-cli doctor
 ```
 
 Zwraca JSON z informacją, czy widzi `GMAIL_ACCESS_TOKEN` i `pdftotext`.
@@ -210,7 +229,7 @@ Maksymalnie 100 punktów:
 Progi można zmienić:
 
 ```bash
-ksef-mail-reconcile reconcile --ksef ksef.jsonl --mail mail.jsonl --match-score 80 --review-score 50
+lab-cli reconcile --ksef ksef.jsonl --mail mail.jsonl --match-score 80 --review-score 50
 ```
 
 ## KSeF / sekrety lokalne
