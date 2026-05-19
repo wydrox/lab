@@ -3410,7 +3410,13 @@ fn saldeo_fetch(year: i32, storage_state: &Path, out_dir: &Path) -> Result<Salde
             .json(&body)
             .send()?
             .error_for_status()
-            .with_context(|| format!("Saldeo document/list/search month={month}"))?
+            .map_err(|e| {
+                if e.status() == Some(reqwest::StatusCode::UNAUTHORIZED) {
+                    anyhow!("Saldeo session expired (401). Refresh Playwright storage state:\n  {}", default_saldeo_storage_state_path().display())
+                } else {
+                    anyhow!("Saldeo document/list/search month={month}: {e}")
+                }
+            })?
             .json()?;
         let items = value
             .get("data")
@@ -3756,6 +3762,11 @@ fn onboard(db_path: &Path, check: bool, gmail_client_secret: Option<&Path>) -> R
 
     let saldeo_state = default_saldeo_storage_state_path();
     let saldeo_exists = saldeo_state.exists();
+    let saldeo_valid = if saldeo_exists {
+        saldeo_session_valid(&saldeo_state)
+    } else {
+        false
+    };
 
     let pdftotext_ok = Command::new("pdftotext").arg("-v").output().is_ok();
     let python_ok = Command::new("python3").arg("-c").arg("from pypdf import PdfReader").output()
@@ -3770,18 +3781,30 @@ fn onboard(db_path: &Path, check: bool, gmail_client_secret: Option<&Path>) -> R
 
     let year = Utc::now().year();
     let ksef_dir = default_ksef_out_path(year);
-    let ksef_exists = ksef_dir.exists()
+    let ksef_data_exists = ksef_dir.exists()
         && std::fs::read_dir(&ksef_dir)
             .map(|mut d| d.any(|e| e.is_ok()))
             .unwrap_or(false);
+
+    let ksef_cert = std::env::var("KSEF_CERT_PATH").ok();
+    let ksef_cert_ok = ksef_cert.as_ref().map(|p| Path::new(p).exists()).unwrap_or(false);
+    let ksef_key = std::env::var("KSEF_KEY_PATH").ok();
+    let ksef_key_ok = ksef_key.as_ref().map(|p| Path::new(p).exists()).unwrap_or(false);
+    let ksef_password_ok = std::env::var("KSEF_CERT_PASSWORD").ok().map(|v| !v.is_empty()).unwrap_or(false);
+    let ksef_token_ok = std::env::var("KSEF_TOKEN").ok().map(|v| !v.is_empty()).unwrap_or(false);
+    let ksef_api_ok = ksef_cert_ok && ksef_key_ok && ksef_password_ok && ksef_token_ok;
 
     eprintln!("LAB — konfiguracja środowiska\n");
     eprintln!("  Baza danych:     {}", if db_exists { "✓" } else { "✓ (nowa)" });
     eprintln!("  pdftotext:       {}", if pdftotext_ok { "✓" } else { "✗ (brew install poppler)" });
     eprintln!("  python3/pypdf:   {}", if python_ok { "✓" } else { "✗ (pip install pypdf)" });
     eprintln!("  Gmail:           {}", if token_valid { "✓" } else if token_exists { "✗ (token wygasł)" } else { "✗" });
-    eprintln!("  Saldeo:          {}", if saldeo_exists { "✓" } else { "✗" });
-    eprintln!("  KSeF (lokalny):  {}", if ksef_exists { format!("✓ ({})", ksef_dir.display()) } else { format!("✗ ({})", ksef_dir.display()) });
+    eprintln!("  Saldeo:          {}", if saldeo_valid { "✓" } else if saldeo_exists { "✗ (sesja wygasła — odśwież)" } else { "✗" });
+    eprintln!("  KSeF certyfikat: {}", if ksef_cert_ok { format!("✓ ({})", ksef_cert.as_deref().unwrap_or("")) } else { "✗ (ustaw KSEF_CERT_PATH)".to_string() });
+    eprintln!("  KSeF klucz:      {}", if ksef_key_ok { format!("✓ ({})", ksef_key.as_deref().unwrap_or("")) } else { "✗ (ustaw KSEF_KEY_PATH)".to_string() });
+    eprintln!("  KSeF hasło:      {}", if ksef_password_ok { "✓" } else { "✗ (ustaw KSEF_CERT_PASSWORD)" });
+    eprintln!("  KSeF token:      {}", if ksef_token_ok { "✓" } else { "✗ (ustaw KSEF_TOKEN)" });
+    eprintln!("  KSeF dane:       {}", if ksef_data_exists { format!("✓ ({})", ksef_dir.display()) } else { format!("✗ ({})", ksef_dir.display()) });
 
     let needs_gmail_auth = !token_valid && !check;
     let mut gmail_authed = token_valid;
@@ -3825,26 +3848,35 @@ fn onboard(db_path: &Path, check: bool, gmail_client_secret: Option<&Path>) -> R
         }
     }
 
-    if !saldeo_exists && !check {
-        eprintln!(
-            "\nSaldeo nie jest skonfigurowane. Zapisz sesję Playwright do:\n  {}",
-            saldeo_state.display()
-        );
+    if !saldeo_valid && !check {
+        if saldeo_exists {
+            eprintln!("\nSaldeo: sesja wygasła. Odśwież storage state Playwright i zapisz do:");
+            eprintln!("  {}", saldeo_state.display());
+        } else {
+            eprintln!("\nSaldeo nie jest skonfigurowane. Zapisz sesję Playwright do:");
+            eprintln!("  {}", saldeo_state.display());
+        }
     }
 
-    if !ksef_exists && !check {
-        eprintln!(
-            "\nKSeF: brak lokalnego eksportu w {}. Umieść tam pliki XML/JSON z KSeF.",
-            ksef_dir.display()
-        );
+    if !ksef_api_ok && !check {
+        eprintln!("\nKSeF API nie jest w pełni skonfigurowane. Ustaw zmienne środowiskowe:");
+        if !ksef_cert_ok { eprintln!("  export KSEF_CERT_PATH=/ścieżka/do/certyfikatu.pem"); }
+        if !ksef_key_ok { eprintln!("  export KSEF_KEY_PATH=/ścieżka/do/klucza.key"); }
+        if !ksef_password_ok { eprintln!("  export KSEF_CERT_PASSWORD='...'"); }
+        if !ksef_token_ok { eprintln!("  export KSEF_TOKEN='...'"); }
+    }
+
+    if !ksef_data_exists && !check {
+        eprintln!("\nKSeF: brak lokalnego eksportu w {}. Umieść tam pliki XML/JSON z KSeF.", ksef_dir.display());
     }
 
     let mut steps: Vec<&str> = Vec::new();
     if !pdftotext_ok { steps.push("brew install poppler"); }
     if !python_ok { steps.push("python3 -m pip install pypdf"); }
     if !gmail_authed { steps.push("lab onboard --gmail-client-secret <ścieżka>"); }
-    if !saldeo_exists { steps.push("Zapisz sesję Saldeo Playwright do ~/.config/lab/saldeo-storage-state.json"); }
-    if !ksef_exists { steps.push("Umieść eksport KSeF (XML/JSON) w data/ksef-<rok>"); }
+    if !saldeo_valid { steps.push("Odśwież sesję Saldeo Playwright (~/.config/lab/saldeo-storage-state.json)"); }
+    if !ksef_api_ok { steps.push("Ustaw KSEF_CERT_PATH, KSEF_KEY_PATH, KSEF_CERT_PASSWORD, KSEF_TOKEN"); }
+    if !ksef_data_exists { steps.push("Umieść eksport KSeF (XML/JSON) w data/ksef-<rok>"); }
     if steps.is_empty() { steps.push("Wszystko gotowe. Uruchom: lab sync"); }
 
     let status = serde_json::json!({
@@ -3860,11 +3892,21 @@ fn onboard(db_path: &Path, check: bool, gmail_client_secret: Option<&Path>) -> R
         },
         "saldeo": {
             "storage_state": saldeo_state.display().to_string(),
-            "exists": saldeo_exists
+            "file_exists": saldeo_exists,
+            "session_valid": saldeo_valid
         },
         "ksef": {
-            "directory": ksef_dir.display().to_string(),
-            "exists": ksef_exists
+            "api": {
+                "cert_ok": ksef_cert_ok,
+                "key_ok": ksef_key_ok,
+                "password_ok": ksef_password_ok,
+                "token_ok": ksef_token_ok,
+                "all_ok": ksef_api_ok
+            },
+            "data": {
+                "directory": ksef_dir.display().to_string(),
+                "exists": ksef_data_exists
+            }
         },
         "database": {
             "path": db_path.display().to_string(),
@@ -3873,6 +3915,63 @@ fn onboard(db_path: &Path, check: bool, gmail_client_secret: Option<&Path>) -> R
         "next_steps": steps
     });
     write_json(&status, None)
+}
+
+fn saldeo_session_valid(storage_state: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(storage_state) else {
+        return false;
+    };
+    let Ok(storage): Result<Value, _> = serde_json::from_str(&text) else {
+        return false;
+    };
+    let Some(cookies) = storage.get("cookies").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    let cookie_header = cookies
+        .iter()
+        .filter_map(|cookie| {
+            let name = cookie.get("name")?.as_str()?;
+            let value = cookie.get("value")?.as_str()?;
+            Some(format!("{name}={value}"))
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let xsrf = cookies
+        .iter()
+        .find(|cookie| cookie.get("name").and_then(|v| v.as_str()) == Some("X-SALDEO-XSRF-C-TOKEN"))
+        .and_then(|cookie| cookie.get("value"))
+        .and_then(|v| v.as_str());
+    let Some(xsrf) = xsrf else {
+        return false;
+    };
+    let Ok(client) = Client::builder().build() else {
+        return false;
+    };
+    let body = serde_json::json!({
+        "pagination": { "pageNumber": 0, "pageSize": 1, "totalCount": 0,
+            "columnSorted": { "sortColumn": "DOCUMENT_CREATE_DATE", "sortDirection": "ASC" } },
+        "filter": { "period": { "partOfYear": 1, "year": Utc::now().year(), "selectionType": "selectedMonth" },
+            "duplicatesEnable": false, "duplicates": false, "splitPayment": false,
+            "types": [], "contractors": [], "stages": [], "categories": [], "registers": [],
+            "tags": [], "assignUsers": [], "addedBy": [], "added": [],
+            "paymentStatuses": [], "accountingPaymentTypes": [],
+            "searchQuery": "", "selectKsefDocumentsYesCheckbox": false,
+            "selectKsefDocumentsNoCheckbox": false, "ksefNumber": "",
+            "ksefMiniWorkflowStatus": null, "ksefBoId": null,
+            "dimensionReportDocumentIds": [], "dimensions": null }
+    });
+    match client
+        .post("https://saldeo.brainshare.pl/rest/client/document/list/search")
+        .header("Cookie", &cookie_header)
+        .header("X-SALDEO-XSRF-H-TOKEN", xsrf)
+        .header("saldeoApp", "angularApp")
+        .header("timeout", "60000")
+        .json(&body)
+        .send()
+    {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => false,
+    }
 }
 
 fn doctor(token_env: &str) -> Result<()> {
