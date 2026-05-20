@@ -5,7 +5,13 @@ use base64::{
 };
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use dialoguer::{Confirm, Input, Password, Select, theme::ColorfulTheme};
+use ratatui::{
+    layout::{Constraint, Layout},
+    style::{Color, Modifier, Style},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
+};
 use regex::Regex;
 use reqwest::blocking::Client;
 use rusqlite::{Connection, params, types::Type};
@@ -34,7 +40,7 @@ struct Cli {
     #[arg(long, global = true, default_value = "lab.sqlite")]
     db: PathBuf,
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -331,7 +337,10 @@ struct TemporalDiffSummary {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let db_path = cli.db;
-    match cli.command {
+    let Some(command) = cli.command else {
+        return interactive_tui(&db_path);
+    };
+    match command {
         Commands::Onboard {
             check,
             gmail_client_secret,
@@ -533,6 +542,970 @@ fn main() -> Result<()> {
         Commands::Doctor { token_env } => doctor(&token_env)?,
     }
     Ok(())
+}
+
+fn interactive_tui(_db_path: &Path) -> Result<()> {
+    interactive_reconcile_actions()
+}
+
+fn interactive_reconcile_actions() -> Result<()> {
+    let theme = ColorfulTheme::default();
+    let mut year: i32 = 2026;
+    let mut review_score: u8 = 70;
+    let mut rows = build_invoice_table_rows(year, review_score)?;
+
+    loop {
+        match run_invoice_table_tui(&mut rows, &mut year, &mut review_score)? {
+            TuiResult::Commit => break,
+            TuiResult::Cancel => return Ok(()),
+            TuiResult::Doctor => {
+                eprintln!("  [LAB] diagnostyka...");
+                doctor("GMAIL_ACCESS_TOKEN")?;
+            }
+            TuiResult::Onboard => {
+                eprintln!("  [LAB] konfiguracja...");
+                onboard(&PathBuf::from("lab.sqlite"), false, None)?;
+            }
+            TuiResult::SaldeoAuth => {
+                eprintln!("  [LAB] odświeżanie sesji Saldeo...");
+                run_saldeo_auth_script()?;
+            }
+            _ => {}
+        }
+    }
+
+    let selected_upload_items = rows
+        .iter()
+        .filter(|row| row.action == InvoiceTableAction::Upload)
+        .filter_map(|row| row.upload_item.clone())
+        .collect::<Vec<_>>();
+    let selected_approve_ids = rows
+        .iter()
+        .filter(|row| row.action == InvoiceTableAction::ApproveKsef)
+        .filter_map(|row| row.ksef_document_id)
+        .collect::<Vec<_>>();
+    let selected_reject_ids = rows
+        .iter()
+        .filter(|row| row.action == InvoiceTableAction::RejectKsef)
+        .filter_map(|row| row.ksef_document_id)
+        .collect::<Vec<_>>();
+
+    eprintln!(
+        "  [LAB] wybrano: {} upload, {} zatwierdź KSeF, {} odrzuć KSeF",
+        selected_upload_items.len(),
+        selected_approve_ids.len(),
+        selected_reject_ids.len()
+    );
+    if selected_upload_items.is_empty()
+        && selected_approve_ids.is_empty()
+        && selected_reject_ids.is_empty()
+    {
+        eprintln!("  [LAB] nic nie wybrano — bez zmian");
+        return Ok(());
+    }
+    if !Confirm::with_theme(&theme)
+        .with_prompt("Wykonać wybrane operacje w Saldeo?")
+        .default(false)
+        .interact()?
+    {
+        eprintln!("  [LAB] anulowano — bez zmian");
+        return Ok(());
+    }
+
+    let session = read_saldeo_session(&default_saldeo_storage_state_path())?;
+    let mut result = serde_json::json!({
+        "year": year,
+        "uploaded": null,
+        "approved_ksef_document_ids": selected_approve_ids,
+        "rejected_ksef_document_ids": selected_reject_ids,
+    });
+    if !selected_upload_items.is_empty() {
+        let mut upload_plan = SaldeoSyncPlan {
+            generated_at: Utc::now(),
+            year,
+            confirm: true,
+            upload_url: Some(DEFAULT_SALDEO_UPLOAD_URL.to_string()),
+            summary: saldeo_sync_summary(&selected_upload_items),
+            items: selected_upload_items,
+        };
+        saldeo_upload_plan(
+            &mut upload_plan,
+            &default_saldeo_storage_state_path(),
+            DEFAULT_SALDEO_UPLOAD_URL,
+            "file",
+        )?;
+        result["uploaded"] = serde_json::to_value(&upload_plan)?;
+    }
+    if !selected_approve_ids.is_empty() {
+        result["approve_response"] =
+            saldeo_mark_ksef_documents(&session, &selected_approve_ids, true)?;
+    }
+    if !selected_reject_ids.is_empty() {
+        result["reject_response"] =
+            saldeo_mark_ksef_documents(&session, &selected_reject_ids, false)?;
+    }
+    write_json(&result, None)
+}
+
+enum TuiResult {
+    Commit,
+    Cancel,
+    Rebuild { year: i32, threshold: u8 },
+    Sync { year: i32 },
+    Llm { year: i32 },
+    Doctor,
+    Onboard,
+    SaldeoAuth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvoiceTableAction {
+    None,
+    Upload,
+    ApproveKsef,
+    RejectKsef,
+}
+
+#[derive(Debug, Clone)]
+struct InvoiceTableRow {
+    selected: bool,
+    sources: String,
+    record: InvoiceRecord,
+    upload_item: Option<SaldeoSyncItem>,
+    ksef_document_id: Option<i64>,
+    ksef_accounting: Option<bool>,
+    action: InvoiceTableAction,
+}
+
+impl InvoiceTableRow {
+    fn is_actionable(&self) -> bool {
+        self.upload_item.is_some() || self.ksef_document_id.is_some()
+    }
+
+    fn can_upload(&self) -> bool {
+        self.upload_item.is_some()
+    }
+
+    fn can_mark_ksef(&self) -> bool {
+        self.ksef_document_id.is_some()
+    }
+}
+
+fn build_invoice_table_rows(year: i32, review_score: u8) -> Result<Vec<InvoiceTableRow>> {
+    let mail = default_mail_candidates_path(year);
+    let ksef = configured_ksef_out_path(year);
+    let saldeo = default_saldeo_records_path(year);
+    let mail_records = load_records(SourceKind::Mail, &mail)?;
+    let ksef_records = load_records(SourceKind::Ksef, &ksef)?;
+    let saldeo_records = load_saldeo_records(&saldeo)?;
+    let report = tri_reconcile(
+        mail_records,
+        ksef_records,
+        saldeo_records.clone(),
+        review_score,
+    );
+
+    let ksef_ids = saldeo_ksef_accounting_candidates(&saldeo_records)
+        .into_iter()
+        .map(|candidate| candidate.document_id)
+        .collect::<Vec<_>>();
+    let ksef_statuses = if ksef_ids.is_empty() {
+        HashMap::new()
+    } else {
+        let session = read_saldeo_session(&default_saldeo_storage_state_path())?;
+        saldeo_fetch_ksef_accounting_statuses(&session, &ksef_ids)?
+    };
+
+    let rows = report
+        .rows
+        .iter()
+        .filter_map(|row| invoice_table_row_from_reconcile_row(row, &ksef_statuses))
+        .collect::<Vec<_>>();
+    Ok(rows)
+}
+
+fn invoice_table_row_from_reconcile_row(
+    row: &TriRow,
+    ksef_statuses: &HashMap<i64, Option<bool>>,
+) -> Option<InvoiceTableRow> {
+    let record = row
+        .mail
+        .as_ref()
+        .or(row.ksef.as_ref())
+        .or(row.saldeo.as_ref())?
+        .clone();
+    let upload_item = row.mail.as_ref().and_then(|mail| {
+        if row.saldeo.is_some() {
+            return None;
+        }
+        let related_sources = [("mail", row.mail.as_ref()), ("ksef", row.ksef.as_ref())]
+            .into_iter()
+            .filter_map(|(name, record)| record.map(|_| name.to_string()))
+            .collect::<Vec<_>>();
+        let item = saldeo_sync_item_from_record(&row.status, mail, related_sources);
+        item.can_upload.then_some(item)
+    });
+    let (ksef_document_id, ksef_accounting) = row
+        .saldeo
+        .as_ref()
+        .and_then(saldeo_document_id)
+        .map(|document_id| {
+            let accounting = ksef_statuses.get(&document_id).copied().flatten();
+            let actionable_id = if accounting.is_none() {
+                Some(document_id)
+            } else {
+                None
+            };
+            (actionable_id, accounting)
+        })
+        .unwrap_or((None, None));
+    Some(InvoiceTableRow {
+        selected: false,
+        sources: row_source_mask(row),
+        record,
+        upload_item,
+        ksef_document_id,
+        ksef_accounting,
+        action: InvoiceTableAction::None,
+    })
+}
+
+fn invoice_table_counts(rows: &[InvoiceTableRow]) -> (usize, usize, usize, usize) {
+    let mut u = 0;
+    let mut a = 0;
+    let mut r = 0;
+    let mut s = 0;
+    for row in rows {
+        if row.selected {
+            s += 1;
+        }
+        match row.action {
+            InvoiceTableAction::Upload => u += 1,
+            InvoiceTableAction::ApproveKsef => a += 1,
+            InvoiceTableAction::RejectKsef => r += 1,
+            InvoiceTableAction::None => {}
+        }
+    }
+    (u, a, r, s)
+}
+
+fn run_invoice_table_tui(
+    rows: &mut Vec<InvoiceTableRow>,
+    year: &mut i32,
+    review_score: &mut u8,
+) -> Result<TuiResult> {
+    let mut terminal = ratatui::init();
+    let mut table_sel = 0usize;
+    let mut menu_sel = 0usize;
+    let mut actionable_only = false;
+    let mut editing_year: Option<String> = None;
+    let mut editing_threshold: Option<String> = None;
+    let mut paint_mode: bool = false;
+    let mut menu_open: bool = false;
+    let mut spinner_frame: usize = 0;
+    let mut status_message: String = String::new();
+    let mut pending_action: Option<TuiResult> = None;
+    let mut loop_result: Result<TuiResult> = Ok(TuiResult::Cancel);
+
+    // Main menu
+    const MI_SYNC: usize = 0;
+    const MI_REFRESH: usize = 1;
+    const MI_RECONCILE: usize = 2;
+    const MI_LLM: usize = 3;
+    const MI_UPLOAD: usize = 4;
+    const MI_APPROVE: usize = 5;
+    const MI_REJECT: usize = 6;
+    const MI_CLEAR: usize = 7;
+    const MI_MENU: usize = 8;
+    const MAIN_COUNT: usize = 9;
+    // Submenu (when menu_open)
+    const SM_SALDEO: usize = 0;
+    const SM_YEAR: usize = 1;
+    const SM_THRESHOLD: usize = 2;
+    const SM_DOCTOR: usize = 3;
+    const SM_ONBOARD: usize = 4;
+    const SM_BACK: usize = 5;
+    const SUB_COUNT: usize = 6;
+
+    loop {
+        spinner_frame = spinner_frame.wrapping_add(1);
+
+        // Execute pending action if any
+        if let Some(action) = pending_action.take() {
+            match action {
+                TuiResult::Sync { year: y } => {
+                    status_message = format!("Sync Gmail dla roku {y}...");
+                    terminal
+                        .draw(|f| {
+                            f.render_widget(Paragraph::new(status_message.as_str()), f.area());
+                        })
+                        .ok();
+                    match (|| -> Result<Vec<InvoiceTableRow>> {
+                        let token_path = default_gmail_token_path();
+                        let token = gmail_access_token("GMAIL_ACCESS_TOKEN", &token_path, None)?;
+                        let mail_out = default_mail_out_path(y);
+                        gmail_fetch(
+                            &token,
+                            "me",
+                            &default_gmail_query(y),
+                            &mail_out,
+                            500,
+                            &["pdf".to_string()],
+                        )?;
+                        sync_mail_records(&mail_out, &[])?;
+                        build_invoice_table_rows(y, *review_score)
+                    })() {
+                        Ok(new_rows) => {
+                            *year = y;
+                            *rows = new_rows;
+                            status_message = format!("Sync zakończony: {} faktur", rows.len());
+                        }
+                        Err(e) => status_message = format!("Błąd sync: {e}"),
+                    }
+                }
+                TuiResult::Llm { year: y } => {
+                    status_message = format!("LLM wzbogacanie dla roku {y}...");
+                    terminal
+                        .draw(|f| {
+                            f.render_widget(Paragraph::new(status_message.as_str()), f.area());
+                        })
+                        .ok();
+                    match (|| -> Result<Vec<InvoiceTableRow>> {
+                        let mail_path = default_mail_candidates_path(y);
+                        if mail_path.exists() {
+                            let mut candidates = load_records(SourceKind::Mail, &mail_path)?;
+                            let cached = apply_cached_mail_candidates(y, &mut candidates)?;
+                            enrich_candidates_with_gemma(&mut candidates, &cached)?;
+                            write_records(
+                                &candidates,
+                                OutputFormat::Jsonl,
+                                Some(&default_mail_candidates_path(y)),
+                            )?;
+                        }
+                        build_invoice_table_rows(y, *review_score)
+                    })() {
+                        Ok(new_rows) => {
+                            *rows = new_rows;
+                            status_message = format!("LLM zakończony: {} faktur", rows.len());
+                        }
+                        Err(e) => status_message = format!("Błąd LLM: {e}"),
+                    }
+                }
+                TuiResult::Rebuild {
+                    year: y,
+                    threshold: t,
+                } => {
+                    status_message = format!("Przebudowa tabeli (rok {y}, próg {t})...");
+                    terminal
+                        .draw(|f| {
+                            f.render_widget(Paragraph::new(status_message.as_str()), f.area());
+                        })
+                        .ok();
+                    match build_invoice_table_rows(y, t) {
+                        Ok(new_rows) => {
+                            *year = y;
+                            *review_score = t;
+                            *rows = new_rows;
+                            status_message = format!("Tabela odświeżona: {} faktur", rows.len());
+                        }
+                        Err(e) => status_message = format!("Błąd: {e}"),
+                    }
+                }
+                _ => {}
+            }
+            table_sel = 0;
+        }
+
+        let visible = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, row)| (!actionable_only || row.is_actionable()).then_some(idx))
+            .collect::<Vec<_>>();
+        if visible.is_empty() {
+            table_sel = 0;
+        } else if table_sel >= visible.len() {
+            table_sel = visible.len().saturating_sub(1);
+        }
+        let menu_items = if menu_open { SUB_COUNT } else { MAIN_COUNT };
+        if menu_sel >= menu_items {
+            menu_sel = menu_items.saturating_sub(1);
+        }
+
+        if let Err(err) = terminal.draw(|frame| {
+            let area = frame.area();
+            let chunks = Layout::vertical([
+                Constraint::Min(5),
+                Constraint::Length(2),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+
+            // Table
+            let header = Row::new(vec![
+                Cell::from("sel"),
+                Cell::from("akcja / KSeF"),
+                Cell::from("G/K/S"),
+                Cell::from("faktura"),
+                Cell::from("kontrahent"),
+                Cell::from("data"),
+                Cell::from("brutto"),
+            ])
+            .style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            );
+            let table_rows = visible.iter().map(|vidx| {
+                let row = &rows[*vidx];
+                let sel_mark = if row.selected { "[*]" } else { "[ ]" };
+                let style = match row.action {
+                    InvoiceTableAction::Upload => Style::default().fg(Color::Cyan),
+                    InvoiceTableAction::ApproveKsef => Style::default().fg(Color::Green),
+                    InvoiceTableAction::RejectKsef => Style::default().fg(Color::Red),
+                    InvoiceTableAction::None if row.is_actionable() => {
+                        Style::default().fg(Color::White)
+                    }
+                    InvoiceTableAction::None => Style::default().fg(Color::DarkGray),
+                };
+                Row::new(vec![
+                    Cell::from(sel_mark),
+                    Cell::from(invoice_table_action_ksef_label(row)),
+                    Cell::from(row.sources.clone()),
+                    Cell::from(truncate(
+                        row.record.invoice_number.as_deref().unwrap_or("-"),
+                        24,
+                    )),
+                    Cell::from(truncate(&counterparty_name(Some(&row.record)), 26)),
+                    Cell::from(
+                        row.record
+                            .issue_date
+                            .map(|date| date.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                    ),
+                    Cell::from(
+                        row.record
+                            .gross_amount_minor
+                            .map(format_minor_money)
+                            .unwrap_or_else(|| "-".to_string()),
+                    ),
+                ])
+                .style(style)
+            });
+            let table = Table::new(
+                table_rows,
+                [
+                    Constraint::Percentage(4),
+                    Constraint::Percentage(14),
+                    Constraint::Percentage(7),
+                    Constraint::Percentage(22),
+                    Constraint::Percentage(23),
+                    Constraint::Percentage(10),
+                    Constraint::Percentage(20),
+                ],
+            )
+            .header(header)
+            .block(
+                Block::default()
+                    .title(format!(" LAB faktury {year} · próg {review_score} "))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            )
+            .row_highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            );
+            let mut table_state = TableState::default();
+            if !visible.is_empty() {
+                table_state.select(Some(table_sel));
+            }
+            frame.render_stateful_widget(table, chunks[0], &mut table_state);
+
+            // Menu bar
+            let (u, a, r, sel) = invoice_table_counts(rows);
+            let year_text = editing_year.clone().unwrap_or_else(|| year.to_string());
+            let threshold_text = editing_threshold
+                .clone()
+                .unwrap_or_else(|| review_score.to_string());
+            let mkbtn = |label: &str, idx: usize, editing: bool| {
+                let text = if editing {
+                    format!("[{}_]", label)
+                } else if idx == menu_sel {
+                    format!("[ {} ]", label)
+                } else {
+                    format!("  {}  ", label)
+                };
+                let style = if idx == menu_sel || editing {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                ratatui::text::Line::styled(text, style)
+            };
+            if menu_open {
+                let items = [
+                    mkbtn("Saldeo", SM_SALDEO, false),
+                    mkbtn(
+                        &format!("Rok:{}", year_text),
+                        SM_YEAR,
+                        editing_year.is_some(),
+                    ),
+                    mkbtn(
+                        &format!("Próg:{}", threshold_text),
+                        SM_THRESHOLD,
+                        editing_threshold.is_some(),
+                    ),
+                    mkbtn("Doctor", SM_DOCTOR, false),
+                    mkbtn("Onboard", SM_ONBOARD, false),
+                    mkbtn("◀ Wróć", SM_BACK, false),
+                ];
+                let menu_area = Layout::horizontal([
+                    Constraint::Fill(1),
+                    Constraint::Length(12),
+                    Constraint::Length(1),
+                    Constraint::Length(12),
+                    Constraint::Length(1),
+                    Constraint::Length(10),
+                    Constraint::Length(1),
+                    Constraint::Length(10),
+                    Constraint::Length(1),
+                    Constraint::Length(12),
+                    Constraint::Length(1),
+                    Constraint::Length(13),
+                ])
+                .split(chunks[1]);
+                for (i, line) in items.into_iter().enumerate() {
+                    frame.render_widget(Paragraph::new(line), menu_area[i * 2 + 1]);
+                }
+            } else {
+                let items = [
+                    mkbtn("Sync", MI_SYNC, false),
+                    mkbtn("Refresh", MI_REFRESH, false),
+                    mkbtn("Reconcile", MI_RECONCILE, false),
+                    mkbtn("LLM", MI_LLM, false),
+                    mkbtn("Upload", MI_UPLOAD, false),
+                    mkbtn("Zatwierdź", MI_APPROVE, false),
+                    mkbtn("Odrzuć", MI_REJECT, false),
+                    mkbtn("Wyczyść", MI_CLEAR, false),
+                    mkbtn("☰ Menu", MI_MENU, false),
+                ];
+                let menu_area = Layout::horizontal([
+                    Constraint::Length(11),
+                    Constraint::Length(1),
+                    Constraint::Length(13),
+                    Constraint::Length(1),
+                    Constraint::Length(14),
+                    Constraint::Length(1),
+                    Constraint::Length(10),
+                    Constraint::Length(1),
+                    Constraint::Length(12),
+                    Constraint::Length(1),
+                    Constraint::Length(14),
+                    Constraint::Length(1),
+                    Constraint::Length(12),
+                    Constraint::Length(1),
+                    Constraint::Length(12),
+                    Constraint::Fill(1),
+                    Constraint::Length(12),
+                ])
+                .split(chunks[1]);
+                for (i, line) in items.into_iter().enumerate() {
+                    frame.render_widget(Paragraph::new(line), menu_area[i * 2]);
+                }
+            }
+            // Status bar
+            if !status_message.is_empty() {
+                let spinner_chars = ['|', '/', '-', '\\'];
+                let spin = spinner_chars[spinner_frame % spinner_chars.len()];
+                let line = ratatui::text::Line::styled(
+                    format!(" {} {}", spin, status_message),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                );
+                frame.render_widget(Paragraph::new(line), chunks[2]);
+            }
+
+            // Stats bar — stats left, help right
+            let stats_text = format!(
+                "sel:{} | up:{} | zatw:{} | odrz:{} | {}/{}",
+                sel,
+                u,
+                a,
+                r,
+                visible.len(),
+                rows.len()
+            );
+            let filter = if actionable_only {
+                "[f] akcje"
+            } else {
+                "[f] wszystko"
+            };
+            let help = format!(
+                "{} | f=filtr  spc=toggle  ⏎=select  ⌘c=commit  q=wyjdź",
+                filter
+            );
+            let stats_span = ratatui::text::Span::styled(
+                stats_text,
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::ITALIC),
+            );
+            let help_span = ratatui::text::Span::styled(help, Style::default().fg(Color::DarkGray));
+            let stats_area = Layout::horizontal([
+                Constraint::Fill(1),
+                Constraint::Length(help_span.width() as u16),
+            ])
+            .split(chunks[3]);
+            frame.render_widget(
+                Paragraph::new(ratatui::text::Line::from(stats_span)),
+                stats_area[0],
+            );
+            frame.render_widget(
+                Paragraph::new(ratatui::text::Line::from(help_span)),
+                stats_area[1],
+            );
+        }) {
+            loop_result = Err(anyhow!("terminal draw: {err}"));
+            break;
+        }
+
+        let event = match event::read() {
+            Ok(event) => event,
+            Err(err) => {
+                loop_result = Err(anyhow!("terminal event: {err}"));
+                break;
+            }
+        };
+        let Event::Key(key) = event else { continue };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        let cmd = key
+            .modifiers
+            .intersects(crossterm::event::KeyModifiers::SUPER)
+            || key
+                .modifiers
+                .intersects(crossterm::event::KeyModifiers::META);
+        let shift = key
+            .modifiers
+            .intersects(crossterm::event::KeyModifiers::SHIFT);
+
+        // Handle field editing
+        let editing = editing_year.is_some() || editing_threshold.is_some();
+        if editing {
+            let field = if editing_year.is_some() {
+                editing_year.as_mut()
+            } else {
+                editing_threshold.as_mut()
+            };
+            match key.code {
+                KeyCode::Esc => {
+                    editing_year = None;
+                    editing_threshold = None;
+                }
+                KeyCode::Enter => {
+                    if let Some(val) = editing_year.take() {
+                        if let Ok(y) = val.parse::<i32>() {
+                            pending_action = Some(TuiResult::Rebuild {
+                                year: y,
+                                threshold: *review_score,
+                            });
+                        }
+                    } else if let Some(val) = editing_threshold.take()
+                        && let Ok(t) = val.parse::<u8>()
+                    {
+                        pending_action = Some(TuiResult::Rebuild {
+                            year: *year,
+                            threshold: t,
+                        });
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(s) = field {
+                        s.pop();
+                    }
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    if let Some(s) = field {
+                        s.push(c);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        match key.code {
+            KeyCode::Char('q') => break,
+            KeyCode::Esc => {
+                if menu_open {
+                    menu_open = false;
+                } else {
+                    break;
+                }
+            }
+            KeyCode::Char('c') if cmd => {
+                loop_result = Ok(TuiResult::Commit);
+                break;
+            }
+            KeyCode::Enter if cmd => {
+                loop_result = Ok(TuiResult::Commit);
+                break;
+            }
+            KeyCode::Enter => {
+                if menu_open {
+                    match menu_sel {
+                        SM_SALDEO => {
+                            loop_result = Ok(TuiResult::SaldeoAuth);
+                            break;
+                        }
+                        SM_YEAR => editing_year = Some(year.to_string()),
+                        SM_THRESHOLD => editing_threshold = Some(review_score.to_string()),
+                        SM_DOCTOR => {
+                            loop_result = Ok(TuiResult::Doctor);
+                            break;
+                        }
+                        SM_ONBOARD => {
+                            loop_result = Ok(TuiResult::Onboard);
+                            break;
+                        }
+                        SM_BACK => menu_open = false,
+                        _ => {}
+                    }
+                } else {
+                    match menu_sel {
+                        MI_SYNC => {
+                            pending_action = Some(TuiResult::Sync { year: *year });
+                        }
+                        MI_REFRESH => {
+                            pending_action = Some(TuiResult::Rebuild {
+                                year: *year,
+                                threshold: *review_score,
+                            });
+                        }
+                        MI_RECONCILE => {
+                            pending_action = Some(TuiResult::Rebuild {
+                                year: *year,
+                                threshold: *review_score,
+                            });
+                        }
+                        MI_LLM => {
+                            pending_action = Some(TuiResult::Llm { year: *year });
+                        }
+                        MI_UPLOAD => {
+                            for row in rows.iter_mut().filter(|r| r.selected) {
+                                if row.can_upload() {
+                                    row.action = InvoiceTableAction::Upload;
+                                }
+                            }
+                        }
+                        MI_APPROVE => {
+                            for row in rows.iter_mut().filter(|r| r.selected) {
+                                if row.can_mark_ksef() {
+                                    row.action = InvoiceTableAction::ApproveKsef;
+                                }
+                            }
+                        }
+                        MI_REJECT => {
+                            for row in rows.iter_mut().filter(|r| r.selected) {
+                                if row.can_mark_ksef() {
+                                    row.action = InvoiceTableAction::RejectKsef;
+                                }
+                            }
+                        }
+                        MI_CLEAR => {
+                            for row in rows.iter_mut().filter(|r| r.selected) {
+                                row.action = InvoiceTableAction::None;
+                                row.selected = false;
+                            }
+                        }
+                        MI_MENU => {
+                            menu_open = true;
+                            menu_sel = SM_BACK;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            KeyCode::Down => {
+                if table_sel + 1 < visible.len() {
+                    table_sel += 1;
+                    if (paint_mode || shift)
+                        && let Some(row_idx) = visible.get(table_sel).copied()
+                    {
+                        rows[row_idx].selected = !rows[row_idx].selected;
+                    }
+                }
+            }
+            KeyCode::Up => {
+                if table_sel > 0 {
+                    table_sel -= 1;
+                    if (paint_mode || shift)
+                        && let Some(row_idx) = visible.get(table_sel).copied()
+                    {
+                        rows[row_idx].selected = !rows[row_idx].selected;
+                    }
+                }
+            }
+            KeyCode::Right => {
+                let max = if menu_open { SUB_COUNT } else { MAIN_COUNT };
+                menu_sel = (menu_sel + 1).min(max.saturating_sub(1));
+            }
+            KeyCode::Left => {
+                menu_sel = menu_sel.saturating_sub(1);
+            }
+            KeyCode::Home => {
+                table_sel = 0;
+                if paint_mode && let Some(row_idx) = visible.get(table_sel).copied() {
+                    rows[row_idx].selected = !rows[row_idx].selected;
+                }
+            }
+            KeyCode::End => {
+                table_sel = visible.len().saturating_sub(1);
+                if paint_mode && let Some(row_idx) = visible.get(table_sel).copied() {
+                    rows[row_idx].selected = !rows[row_idx].selected;
+                }
+            }
+            KeyCode::Char('f') => {
+                actionable_only = !actionable_only;
+                table_sel = 0;
+            }
+            KeyCode::Char('v') => {
+                paint_mode = !paint_mode;
+            }
+            KeyCode::Char(' ') => {
+                if let Some(row_idx) = visible.get(table_sel).copied() {
+                    rows[row_idx].selected = !rows[row_idx].selected;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    ratatui::restore();
+    loop_result
+}
+
+fn invoice_table_action_ksef_label(row: &InvoiceTableRow) -> String {
+    match row.action {
+        InvoiceTableAction::Upload => "UPLOAD".to_string(),
+        InvoiceTableAction::ApproveKsef => "ZATWIERDŹ".to_string(),
+        InvoiceTableAction::RejectKsef => "ODRZUĆ".to_string(),
+        InvoiceTableAction::None => invoice_table_ksef_status(row),
+    }
+}
+
+fn invoice_table_ksef_status(row: &InvoiceTableRow) -> String {
+    match (row.ksef_document_id, row.ksef_accounting) {
+        (Some(_), None) => "nieozn.".to_string(),
+        (_, Some(true)) => "zatw.".to_string(),
+        (_, Some(false)) => "odrz.".to_string(),
+        _ => "—".to_string(),
+    }
+}
+
+fn row_source_mask(row: &TriRow) -> String {
+    format!(
+        "{}/{}/{}",
+        if row.mail.is_some() { "G" } else { "-" },
+        if row.ksef.is_some() { "K" } else { "-" },
+        if row.saldeo.is_some() { "S" } else { "-" }
+    )
+}
+
+#[derive(Debug, Clone)]
+struct SaldeoKsefAccountingCandidate {
+    document_id: i64,
+}
+
+fn saldeo_ksef_accounting_candidates(
+    records: &[InvoiceRecord],
+) -> Vec<SaldeoKsefAccountingCandidate> {
+    let mut seen = HashSet::new();
+    records
+        .iter()
+        .filter(|record| record.ksef_reference.is_some())
+        .filter_map(|record| {
+            let document_id = saldeo_document_id(record)?;
+            if !seen.insert(document_id) {
+                return None;
+            }
+            Some(SaldeoKsefAccountingCandidate { document_id })
+        })
+        .collect()
+}
+
+fn saldeo_document_id(record: &InvoiceRecord) -> Option<i64> {
+    record.content_hash.strip_prefix("saldeo:")?.parse().ok()
+}
+
+fn saldeo_fetch_ksef_accounting_statuses(
+    session: &SaldeoSession,
+    document_ids: &[i64],
+) -> Result<HashMap<i64, Option<bool>>> {
+    if document_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let client = Client::builder().build()?;
+    let body = serde_json::json!({"clientId": 0, "documentIds": document_ids});
+    let response: Value = client
+        .post("https://saldeo.brainshare.pl/rest/client/document/ksef/accounting")
+        .header("Cookie", &session.cookie_header)
+        .header("X-SALDEO-XSRF-H-TOKEN", &session.xsrf)
+        .header("saldeoApp", "angularApp")
+        .json(&body)
+        .send()?
+        .error_for_status()?
+        .json()?;
+    if response.get("status").and_then(|v| v.as_str()) != Some("SUCCESS") {
+        return Err(anyhow!("Saldeo KSeF accounting status failed: {response}"));
+    }
+    let mut out = HashMap::new();
+    for item in response
+        .get("data")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        if let Some(document_id) = item.get("documentId").and_then(|v| v.as_i64()) {
+            out.insert(
+                document_id,
+                item.get("accounting").and_then(|v| v.as_bool()),
+            );
+        }
+    }
+    Ok(out)
+}
+
+fn saldeo_mark_ksef_documents(
+    session: &SaldeoSession,
+    document_ids: &[i64],
+    mark_is_accounting: bool,
+) -> Result<Value> {
+    let client = Client::builder().build()?;
+    let body = serde_json::json!({
+        "ids": document_ids,
+        "markIsAccounting": mark_is_accounting,
+        "skipPreviousSetup": true,
+    });
+    let response: Value = client
+        .post("https://saldeo.brainshare.pl/rest/client/document/list/bulkupdate/markAccounting")
+        .header("Cookie", &session.cookie_header)
+        .header("X-SALDEO-XSRF-H-TOKEN", &session.xsrf)
+        .header("saldeoApp", "angularApp")
+        .json(&body)
+        .send()?
+        .error_for_status()?
+        .json()?;
+    if response.get("status").and_then(|v| v.as_str()) != Some("SUCCESS") {
+        return Err(anyhow!("Saldeo markAccounting failed: {response}"));
+    }
+    Ok(response)
 }
 
 fn write_records(
@@ -2989,14 +3962,14 @@ fn enrich_candidates_with_gemma(
                 consecutive_errors = 0;
                 record
                     .warnings
-                    .push("gemma-4-e2b enrichment applied".to_string());
+                    .push("gemma-4-e4b enrichment applied".to_string());
             }
             Ok(false) => {
                 consecutive_errors = 0;
             }
             Err(err) => {
                 consecutive_errors += 1;
-                record.warnings.push(format!("gemma-4-e2b: {err}"));
+                record.warnings.push(format!("gemma-4-e4b: {err}"));
                 eprintln!("  [Gmail/Gemma] błąd: {err}");
                 if consecutive_errors >= 2 {
                     eprintln!("  [Gmail/Gemma] pomijam dalsze wzbogacanie po 2 kolejnych błędach");
@@ -3014,7 +3987,7 @@ fn ppmlx_base_url() -> String {
 }
 
 fn llm_model() -> String {
-    std::env::var("LAB_LLM_MODEL").unwrap_or_else(|_| "gemma-4-e2b".to_string())
+    std::env::var("LAB_LLM_MODEL").unwrap_or_else(|_| "gemma-4-e4b".to_string())
 }
 
 fn llm_timeout() -> Duration {
@@ -3271,10 +4244,10 @@ fn json_object_candidates(content: &str) -> Vec<&str> {
             }
             '}' if depth > 0 => {
                 depth -= 1;
-                if depth == 0 {
-                    if let Some(start_idx) = start.take() {
-                        candidates.push(&content[start_idx..idx + ch.len_utf8()]);
-                    }
+                if depth == 0
+                    && let Some(start_idx) = start.take()
+                {
+                    candidates.push(&content[start_idx..idx + ch.len_utf8()]);
                 }
             }
             _ => {}
@@ -4925,7 +5898,7 @@ fn print_onboard_status(status: &OnboardStatus, db_path: &Path) {
         if status.python_ok {
             "✓"
         } else {
-            "✗ (zainstaluj ppmlx i model gemma-4-e2b)"
+            "✗ (zainstaluj ppmlx i model gemma-4-e4b)"
         }
     );
     eprintln!(
@@ -4993,7 +5966,7 @@ fn write_onboard_check_json(status: &OnboardStatus) -> Result<()> {
         steps.push("brew install poppler");
     }
     if !status.python_ok {
-        steps.push("Zainstaluj ppmlx i pobierz model: ppmlx pull gemma-4-e2b");
+        steps.push("Zainstaluj ppmlx i pobierz model: ppmlx pull gemma-4-e4b");
     }
     if !status.gmail_authed {
         steps.push("lab onboard --gmail-client-secret <ścieżka>");

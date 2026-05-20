@@ -53,7 +53,8 @@ async function waitForEnter() {
   const out = process.env.LAB_SALDEO_STORAGE_STATE;
   const url = process.env.SALDEO_URL || 'https://saldeo.brainshare.pl/';
   const executablePath = process.env.HELIUM_EXECUTABLE;
-  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lab-helium-profile-'));
+  const userDataDir = path.join(os.homedir(), '.config', 'lab', 'helium-profile');
+  fs.mkdirSync(userDataDir, { recursive: true });
   const context = await chromium.launchPersistentContext(userDataDir, {
     executablePath,
     headless: false,
@@ -64,7 +65,6 @@ async function waitForEnter() {
   await waitForEnter();
   await context.storageState({ path: out });
   await context.close();
-  fs.rmSync(userDataDir, { recursive: true, force: true });
 })().catch(err => {
   console.error(err && err.stack ? err.stack : err);
   process.exit(1);

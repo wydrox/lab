@@ -11,17 +11,17 @@ cargo build --release
 cp target/release/lab-cli ~/.local/bin/lab
 ```
 
-Wymagane: `pdftotext` (poppler) do lekkiego wyciągania tekstu z PDF. Dla przefiltrowanych kandydatów LAB opcjonalnie wzbogaca brakujące pola lokalnym modelem `gemma-4-e2b` przez `ppmlx`.
+Wymagane: `pdftotext` (poppler) do lekkiego wyciągania tekstu z PDF. Dla przefiltrowanych kandydatów LAB opcjonalnie wzbogaca brakujące pola lokalnym modelem `gemma-4-e4b` przez `ppmlx`.
 
 ```bash
 brew install poppler
-ppmlx pull gemma-4-e2b
+ppmlx pull gemma-4-e4b
 ```
 
 Opcjonalne ustawienia LLM:
 
 ```bash
-LAB_LLM_MODEL=gemma-4-e2b PPMLX_BASE_URL=http://127.0.0.1:6767 lab sync --mail
+LAB_LLM_MODEL=gemma-4-e4b PPMLX_BASE_URL=http://127.0.0.1:6767 lab sync --mail
 ```
 
 ## Pierwsze uruchomienie
@@ -53,6 +53,7 @@ Pobranie auth do Saldeo przez Playwright: wybierz `SALDEO_AUTH_SCRIPT` w `lab on
 ## Codzienne użycie
 
 ```bash
+lab                      # interaktywna tabela faktur: akcje upload / zatwierdź KSeF / odrzuć KSeF
 lab sync                 # synchronizuje wszystkie trzy źródła
 lab sync --ksef          # tylko KSeF
 lab sync --mail          # tylko Gmail/PDF (pobiera, parsuje, filtruje)
@@ -72,6 +73,8 @@ lab reconcile --status --year 2026   # ostatni raport z bazy
 lab upload                 # plan brakujących załączników Gmail → Saldeo
 lab upload --confirm       # faktyczny upload brakujących załączników
 ```
+
+Puste `lab` otwiera interaktywną tabelę faktur z tri-reconcile. Skróty: `j/k` lub strzałki — ruch, `u` — upload do Saldeo, `a` — zatwierdź KSeF, `r` — odrzuć KSeF, `n` — wyczyść, `f` — filtr pozycji z możliwymi akcjami, `c` — wykonaj, `q` — wyjdź. Zapis w Saldeo wymaga dodatkowego potwierdzenia po wyjściu z tabeli.
 
 ## Automatyzacja macOS
 
