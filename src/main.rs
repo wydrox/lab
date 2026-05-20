@@ -372,7 +372,7 @@ fn main() -> Result<()> {
                 synced.push(format!("ksef ({})", result.summary.records_count));
             }
             if mail || all {
-                eprintln!("  [Gmail] pobieranie załączników...");
+                eprintln!("  [Gmail] sprawdzanie wiadomości i cache załączników...");
                 let token_path = gmail_token_file
                     .clone()
                     .unwrap_or_else(default_gmail_token_path);
@@ -391,9 +391,14 @@ fn main() -> Result<()> {
                     &["pdf".to_string()],
                 )?;
                 eprintln!(
-                    "  [Gmail] pobrano {} plików, skanowanie nowych PDF...",
-                    gmail_result.files_saved
+                    "  [Gmail] wiadomości: {} znalezionych, {} z cache, {} pobranych z API; nowe pliki: {} metadane, {} załączniki",
+                    gmail_result.messages_seen,
+                    gmail_result.messages_cached,
+                    gmail_result.messages_fetched,
+                    gmail_result.metadata_saved,
+                    gmail_result.attachments_saved
                 );
+                eprintln!("  [Gmail] skanowanie nowych PDF...");
                 let (mail_records, parsed_count) =
                     sync_mail_records(&mail_out, &gmail_result.saved_files)?;
                 eprintln!("  [Gmail] sparsowano {} nowych PDF", parsed_count);
@@ -415,8 +420,8 @@ fn main() -> Result<()> {
                     candidates.len()
                 );
                 synced.push(format!(
-                    "mail ({} files, {} pdfs, {} candidates)",
-                    gmail_result.files_saved,
+                    "mail ({} new attachments, {} pdfs, {} candidates)",
+                    gmail_result.attachments_saved,
                     mail_records.len(),
                     candidates.len()
                 ));
@@ -2485,6 +2490,10 @@ fn refresh_gmail_token(
 struct GmailFetchResult {
     query: String,
     messages_seen: usize,
+    messages_cached: usize,
+    messages_fetched: usize,
+    metadata_saved: usize,
+    attachments_saved: usize,
     files_saved: usize,
     out_dir: String,
     saved_files: Vec<String>,
@@ -2538,12 +2547,18 @@ fn gmail_fetch(
     }
 
     let mut saved_files = Vec::new();
+    let mut messages_cached = 0usize;
+    let mut messages_fetched = 0usize;
+    let mut metadata_saved = 0usize;
+    let mut attachments_saved = 0usize;
     for id in &message_ids {
         let metadata_path = out_dir.join(format!("{}_message.json", sanitize_filename(id)));
         if gmail_message_cached(out_dir, id, &allowed_exts) {
+            messages_cached += 1;
             continue;
         }
 
+        messages_fetched += 1;
         let msg: Value = client
             .get(format!(
                 "https://gmail.googleapis.com/gmail/v1/users/{}/messages/{}",
@@ -2558,7 +2573,9 @@ fn gmail_fetch(
         let headers = gmail_headers(&msg);
         fs::write(&metadata_path, serde_json::to_vec_pretty(&msg)?)?;
         saved_files.push(metadata_path.display().to_string());
+        metadata_saved += 1;
 
+        let before_parts = saved_files.len();
         let mut part_index = 0usize;
         collect_gmail_parts(
             &client,
@@ -2572,11 +2589,16 @@ fn gmail_fetch(
             &mut part_index,
             &mut saved_files,
         )?;
+        attachments_saved += saved_files.len().saturating_sub(before_parts);
     }
 
     Ok(GmailFetchResult {
         query: query.to_string(),
         messages_seen: message_ids.len(),
+        messages_cached,
+        messages_fetched,
+        metadata_saved,
+        attachments_saved,
         files_saved: saved_files.len(),
         out_dir: out_dir.display().to_string(),
         saved_files,
@@ -3043,32 +3065,37 @@ fn gemma_extract_invoice_fields(record: &mut InvoiceRecord, path: &Path) -> Resu
         return Ok(false);
     }
     let prompt = format!(
-        r#"Wyciągnij dane faktury z tekstu PDF i zwróć WYŁĄCZNIE poprawny JSON bez markdown.
+        r#"Wyciągnij dane faktury z tekstu PDF.
 
-Wymagany template odpowiedzi:
+Zwróć dokładnie jeden poprawny obiekt JSON: bez markdown, bez komentarzy, bez analizy, bez <|channel>thought.
+Odpowiedź musi zaczynać się znakiem {{ i kończyć znakiem }}.
+
+Użyj dokładnie tych kluczy. Jeśli brak pewności, wpisz null:
 {{
-  "invoice_number": "FV/123/2026" | null,
-  "issue_date": "YYYY-MM-DD" | null,
-  "sale_date": "YYYY-MM-DD" | null,
-  "due_date": "YYYY-MM-DD" | null,
-  "gross_amount": "1234.56" | null,
-  "net_amount": "1003.71" | null,
-  "vat_amount": "230.85" | null,
-  "currency": "PLN" | "EUR" | "USD" | "GBP" | null,
-  "seller_tax_id": "10 cyfr NIP bez prefiksu PL i bez separatorów" | null,
-  "buyer_tax_id": "10 cyfr NIP bez prefiksu PL i bez separatorów" | null,
-  "seller_name": "pełna nazwa sprzedawcy" | null,
-  "buyer_name": "pełna nazwa nabywcy" | null
+  "invoice_number": null,
+  "issue_date": null,
+  "sale_date": null,
+  "due_date": null,
+  "gross_amount": null,
+  "net_amount": null,
+  "vat_amount": null,
+  "currency": null,
+  "seller_tax_id": null,
+  "buyer_tax_id": null,
+  "seller_name": null,
+  "buyer_name": null
 }}
 
-Zasady normalizacji:
-- Daty zawsze w ISO 8601: YYYY-MM-DD. Zamień formaty typu DD.MM.YYYY, DD/MM/YYYY, YYYY/MM/DD.
-- Kwoty zawsze jako string z kropką dziesiętną i 2 miejscami, bez spacji i symbolu waluty, np. "1234.56".
-- Waluta jako trzyliterowy kod ISO uppercase, np. PLN, EUR, USD, GBP. Jeśli tekst ma zł/PLN/zloty -> PLN.
-- NIP/VAT PL jako same cyfry: usuń PL, spacje, myślniki. Jeśli numer nie ma 10 cyfr, zwróć null.
-- Nie zgaduj. Jeśli pole nie występuje w tekście albo nie masz pewności, zwróć null.
+Formaty wartości:
+- Daty: string "YYYY-MM-DD" albo null.
+- Kwoty: string z kropką i 2 miejscami, bez spacji i waluty, np. "1234.56", albo null.
+- Waluta: "PLN", "EUR", "USD", "GBP" albo null. zł/PLN/zloty traktuj jako PLN.
+- NIP/VAT PL: string z samymi 10 cyframi, bez PL/spacji/myślników; inaczej null.
+- NIP/VAT widoczny w sekcji Bill to/Nabywca/Buyer przypisz do buyer_tax_id, nie do seller_tax_id.
+- seller_tax_id to tylko identyfikator sprzedawcy/vendor/seller, jeśli jasno występuje przy sprzedawcy.
+- Nazwy: pełna nazwa sprzedawcy/nabywcy z faktury albo null.
 - Dla faktur zakupowych Productmesh zwykle buyer_name/buyer_tax_id to Productmesh; sprzedawca to kontrahent.
-- Nie dodawaj komentarzy, nie używaj markdown, nie zwracaj tablicy.
+- Nie zgaduj i nie wyliczaj pól, jeśli nie wynikają jasno z tekstu.
 
 Tekst PDF:
 ---
@@ -3091,7 +3118,7 @@ fn ppmlx_extract_json(prompt: &str) -> Result<Value> {
         .json(&serde_json::json!({
             "model": model,
             "temperature": 0,
-            "max_tokens": 700,
+            "max_tokens": 1200,
             "messages": [
                 {"role": "system", "content": "Jesteś ekstraktorem danych z faktur. Odpowiadasz tylko poprawnym JSON."},
                 {"role": "user", "content": prompt}
@@ -3112,16 +3139,149 @@ fn ppmlx_extract_json(prompt: &str) -> Result<Value> {
 }
 
 fn parse_json_from_llm(content: &str) -> Result<Value> {
-    if let Ok(value) = serde_json::from_str(content.trim()) {
+    let sanitized = sanitize_llm_content(content);
+    let content = sanitized.trim();
+
+    if content.is_empty() {
+        return Err(anyhow!("LLM nie zwrócił JSON"));
+    }
+    if let Ok(value) = serde_json::from_str(content) {
         return Ok(value);
     }
-    let start = content
-        .find('{')
-        .ok_or_else(|| anyhow!("LLM nie zwrócił JSON"))?;
-    let end = content
-        .rfind('}')
-        .ok_or_else(|| anyhow!("LLM nie zwrócił JSON"))?;
-    serde_json::from_str(&content[start..=end]).context("niepoprawny JSON z LLM")
+
+    let candidates = json_object_candidates(content);
+    if candidates.is_empty() {
+        return Err(anyhow!("LLM nie zwrócił JSON"));
+    }
+
+    // After deterministic channel sanitization, prefer the last syntactically valid
+    // JSON object to tolerate markdown fences or short explanatory prefixes.
+    let mut last_err = None;
+    for candidate in candidates.iter().rev() {
+        match serde_json::from_str::<Value>(candidate) {
+            Ok(value) => return Ok(value),
+            Err(err) => last_err = Some(err),
+        }
+    }
+
+    Err(last_err
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow!("LLM nie zwrócił JSON")))
+    .context("niepoprawny JSON z LLM")
+}
+
+fn sanitize_llm_content(content: &str) -> String {
+    if let Some(final_payload) = channel_payload(content, "final") {
+        return strip_channel_tokens(final_payload).trim().to_string();
+    }
+
+    strip_channel_tokens(&remove_reasoning_channels(content))
+        .trim()
+        .to_string()
+}
+
+fn channel_payload<'a>(content: &'a str, channel: &str) -> Option<&'a str> {
+    let marker = format!("<|channel>{channel}");
+    let start = content.find(&marker)? + marker.len();
+    let end = content[start..]
+        .find("<|channel>")
+        .map(|idx| start + idx)
+        .unwrap_or(content.len());
+    Some(&content[start..end])
+}
+
+fn remove_reasoning_channels(content: &str) -> String {
+    let marker = "<|channel>";
+    let mut output = String::new();
+    let mut pos = 0usize;
+
+    while let Some(rel_start) = content[pos..].find(marker) {
+        let start = pos + rel_start;
+        output.push_str(&content[pos..start]);
+
+        let name_start = start + marker.len();
+        let name_len = content[name_start..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+            .map(char::len_utf8)
+            .sum::<usize>();
+        let name = &content[name_start..name_start + name_len];
+        let next = content[name_start + name_len..]
+            .find(marker)
+            .map(|idx| name_start + name_len + idx)
+            .unwrap_or(content.len());
+
+        if !matches!(name, "thought" | "analysis" | "reasoning") {
+            output.push_str(&content[start..next]);
+        }
+        pos = next;
+    }
+
+    output.push_str(&content[pos..]);
+    output
+}
+
+fn strip_channel_tokens(content: &str) -> String {
+    let marker = "<|channel>";
+    let mut output = String::new();
+    let mut pos = 0usize;
+
+    while let Some(rel_start) = content[pos..].find(marker) {
+        let start = pos + rel_start;
+        output.push_str(&content[pos..start]);
+        let name_start = start + marker.len();
+        let skip_len = content[name_start..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+            .map(char::len_utf8)
+            .sum::<usize>();
+        pos = name_start + skip_len;
+    }
+
+    output.push_str(&content[pos..]);
+    output
+}
+
+fn json_object_candidates(content: &str) -> Vec<&str> {
+    let mut candidates = Vec::new();
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (idx, ch) in content.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' if depth > 0 => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(idx);
+                }
+                depth += 1;
+            }
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(start_idx) = start.take() {
+                        candidates.push(&content[start_idx..idx + ch.len_utf8()]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    candidates
 }
 
 fn apply_extracted_invoice_json(record: &mut InvoiceRecord, value: &Value) {
@@ -3384,7 +3544,7 @@ fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<Value> {
                 synced.push(format!("ksef ({})", result.summary.records_count));
             }
             if json_bool(args, "mail", false) || all {
-                eprintln!("  [Gmail] pobieranie załączników...");
+                eprintln!("  [Gmail] sprawdzanie wiadomości i cache załączników...");
                 let token_path = json_path_arg(args, "gmail_token_file")
                     .unwrap_or_else(default_gmail_token_path);
                 let token = gmail_access_token(
@@ -3402,9 +3562,14 @@ fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<Value> {
                     &["pdf".to_string()],
                 )?;
                 eprintln!(
-                    "  [Gmail] pobrano {} plików, skanowanie nowych PDF...",
-                    gmail_result.files_saved
+                    "  [Gmail] wiadomości: {} znalezionych, {} z cache, {} pobranych z API; nowe pliki: {} metadane, {} załączniki",
+                    gmail_result.messages_seen,
+                    gmail_result.messages_cached,
+                    gmail_result.messages_fetched,
+                    gmail_result.metadata_saved,
+                    gmail_result.attachments_saved
                 );
+                eprintln!("  [Gmail] skanowanie nowych PDF...");
                 let (mail_records, parsed_count) =
                     sync_mail_records(&mail_out, &gmail_result.saved_files)?;
                 eprintln!("  [Gmail] sparsowano {} nowych PDF", parsed_count);
@@ -3428,8 +3593,8 @@ fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<Value> {
                     candidates.len()
                 );
                 synced.push(format!(
-                    "mail ({} files, {} pdfs, {} candidates)",
-                    gmail_result.files_saved,
+                    "mail ({} new attachments, {} pdfs, {} candidates)",
+                    gmail_result.attachments_saved,
                     mail_records.len(),
                     candidates.len()
                 ));
@@ -5374,6 +5539,50 @@ mod tests {
         assert_eq!(record.seller_tax_id.as_deref(), Some("5210000001"));
         assert_eq!(record.gross_amount_minor, Some(9990));
         assert_eq!(record.currency.as_deref(), Some("PLN"));
+    }
+
+    #[test]
+    fn parses_llm_json_from_markdown() {
+        let value = parse_json_from_llm("```json\n{\"ok\":true}\n```").unwrap();
+        assert_eq!(value["ok"], true);
+    }
+
+    #[test]
+    fn parses_llm_json_after_reasoning_and_invalid_template() {
+        let content = r#"
+<|channel>thought
+Template:
+{
+  "currency": "PLN" | "EUR" | null
+}
+<|channel>final
+{"invoice_number":"FV/1/2026","currency":"PLN"}
+"#;
+        let value = parse_json_from_llm(content).unwrap();
+        assert_eq!(value["invoice_number"], "FV/1/2026");
+        assert_eq!(value["currency"], "PLN");
+    }
+
+    #[test]
+    fn final_channel_wins_over_valid_json_in_thought() {
+        let content = r#"
+<|channel>thought
+{"invoice_number":"WRONG","currency":"EUR"}
+<|channel>final
+{"invoice_number":"RIGHT","currency":"PLN"}
+"#;
+        let value = parse_json_from_llm(content).unwrap();
+        assert_eq!(value["invoice_number"], "RIGHT");
+        assert_eq!(value["currency"], "PLN");
+    }
+
+    #[test]
+    fn rejects_thought_only_json() {
+        let content = r#"
+<|channel>thought
+{"invoice_number":"WRONG","currency":"EUR"}
+"#;
+        assert!(parse_json_from_llm(content).is_err());
     }
 
     #[test]
