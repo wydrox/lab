@@ -11,11 +11,17 @@ cargo build --release
 cp target/release/lab-cli ~/.local/bin/lab
 ```
 
-Wymagane: `pdftotext` (poppler) i `python3 -m pypdf` do parsowania PDF:
+Wymagane: `pdftotext` (poppler) do lekkiego wyciągania tekstu z PDF. Dla przefiltrowanych kandydatów LAB opcjonalnie wzbogaca brakujące pola lokalnym modelem `gemma-4-e2b` przez `ppmlx`.
 
 ```bash
 brew install poppler
-python3 -m pip install pypdf
+ppmlx pull gemma-4-e2b
+```
+
+Opcjonalne ustawienia LLM:
+
+```bash
+LAB_LLM_MODEL=gemma-4-e2b PPMLX_BASE_URL=http://127.0.0.1:6767 lab sync --mail
 ```
 
 ## Pierwsze uruchomienie
@@ -24,7 +30,7 @@ python3 -m pip install pypdf
 lab onboard
 ```
 
-Interaktywnie sprawdza środowisko i konfiguruje Gmail OAuth. Opcjonalnie można przekazać ścieżkę do client secret:
+Uruchamia interaktywne menu TUI z jednym widokiem wszystkich parametrów (Gmail, Saldeo, KSeF, katalog danych i DB). Opcjonalnie można przekazać ścieżkę do client secret:
 
 ```bash
 lab onboard --gmail-client-secret /path/to/google-oauth-client.json
@@ -36,6 +42,14 @@ Sam test (bez kreatora):
 lab onboard --check
 ```
 
+Pobranie auth do Saldeo przez Playwright: wybierz `SALDEO_AUTH_SCRIPT` w `lab onboard`, albo uruchom ręcznie. Używa Helium Browser (`/Applications/Helium.app/Contents/MacOS/Helium`); można nadpisać `HELIUM_EXECUTABLE=/ścieżka/do/Helium`.
+
+```bash
+./scripts/saldeo-auth.sh
+# opcjonalnie inna ścieżka storage state:
+./scripts/saldeo-auth.sh ~/.config/lab/saldeo-storage-state.json
+```
+
 ## Codzienne użycie
 
 ```bash
@@ -44,8 +58,9 @@ lab sync --ksef          # tylko KSeF
 lab sync --mail          # tylko Gmail/PDF (pobiera, parsuje, filtruje)
 lab sync --saldeo        # tylko Saldeo
 
+lab reconcile              # używa domyślnych wyników sync dla roku 2026
 lab reconcile \
-  --mail ./out/mail-candidates.jsonl \
+  --mail ./data/mail-all-pdf-2026-pdfs/records.jsonl \
   --ksef ./data/ksef-2026/records.jsonl \
   --saldeo ./data/saldeo-2026/records.jsonl \
   --output ./out/tri-reconcile-2026.json \
@@ -54,7 +69,26 @@ lab reconcile \
 
 lab reconcile --status --year 2026   # ostatni raport z bazy
 
-lab upload --tri-report ./out/tri-reconcile-2026.json
+lab upload                 # plan brakujących załączników Gmail → Saldeo
+lab upload --confirm       # faktyczny upload brakujących załączników
+```
+
+## Automatyzacja macOS
+
+Auto-sync/reconcile/upload przy logowaniu i cyklicznie przez launchd:
+
+```bash
+scripts/install-launchd.sh
+```
+
+Domyślnie uruchamia się przy logowaniu i co 4h, robiąc: `sync`, `reconcile --store`, `upload --confirm`, `sync --saldeo`, finalne `reconcile --store`.
+Logi: `~/Library/Logs/lab/automation.log`.
+
+Konfiguracja instalacji:
+
+```bash
+LAB_INTERVAL_SECONDS=86400 LAB_YEAR=2026 scripts/install-launchd.sh
+scripts/uninstall-launchd.sh
 ```
 
 Statusy raportu: `in_all_three`, `gmail_ksef_missing_saldeo`, `gmail_saldeo_missing_ksef`, `gmail_only`, `ksef_saldeo_missing_gmail`, `ksef_only`, `saldeo_only`.
@@ -97,6 +131,6 @@ lab reconcile --review-score 50 ...
 
 ## Uwagi
 
-- Tokeny/auth nie są zapisywane w repo (Gmail: `~/.config/lab/gmail_token.json`, Saldeo: `~/.config/lab/saldeo-storage-state.json`)
+- Tokeny/auth nie są zapisywane w repo. Na macOS LAB zapisuje Gmail token i Saldeo storage state w Keychain; pliki `~/.config/lab/gmail_token.json` / `~/.config/lab/saldeo-storage-state.json` są fallbackiem lub wejściem migracyjnym.
 - KSeF: lokalny eksport XML/JSON, domyślnie `data/ksef-<rok>/`
 - Upload do Saldeo: `generate-urls-for-upload` → `PUT` signed URL → `confirm`

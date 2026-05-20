@@ -1,8 +1,11 @@
 use anyhow::{Context, Result, anyhow};
-use base64::{Engine, engine::general_purpose::URL_SAFE, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD},
+};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
-use dialoguer::{Confirm, Input, Password};
+use dialoguer::{Confirm, Input, Password, Select, theme::ColorfulTheme};
 use regex::Regex;
 use reqwest::blocking::Client;
 use rusqlite::{Connection, params, types::Type};
@@ -14,8 +17,14 @@ use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread::sleep;
+use std::time::Duration;
 use walkdir::WalkDir;
+
+const KEYCHAIN_SERVICE: &str = "lab-cli";
+const KEYCHAIN_ACCOUNT_GMAIL_TOKEN: &str = "gmail_token";
+const KEYCHAIN_ACCOUNT_SALDEO_STORAGE_STATE: &str = "saldeo_storage_state";
 
 #[derive(Parser, Debug)]
 #[command(name = "lab-cli")]
@@ -91,6 +100,9 @@ enum Commands {
         /// Plik JSON z raportem.
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Wypisz pełny JSON zamiast czytelnego podsumowania.
+        #[arg(long)]
+        raw: bool,
         /// Opcjonalny CSV z raportem.
         #[arg(long)]
         csv: Option<PathBuf>,
@@ -127,6 +139,9 @@ enum Commands {
         /// Opcjonalny CSV z wynikiem.
         #[arg(long)]
         csv: Option<PathBuf>,
+        /// Wykonaj upload do Saldeo. Bez tej flagi zwraca tylko plan.
+        #[arg(long)]
+        confirm: bool,
     },
     /// Uruchamia prosty serwer MCP po stdio dla agentów.
     Mcp,
@@ -338,11 +353,17 @@ fn main() -> Result<()> {
             if all {
                 eprintln!("Sync: wszystkie źródła (KSeF + Gmail/PDF + Saldeo)");
             }
-            let conn = if store { Some(open_db(&db_path)?) } else { None };
+            let conn = if store {
+                Some(open_db(&db_path)?)
+            } else {
+                None
+            };
             let mut synced: Vec<String> = Vec::new();
             if ksef || all {
                 eprintln!("  [KSeF] synchronizacja...");
-                let input = ksef_input.clone().unwrap_or_else(|| default_ksef_out_path(year));
+                let input = ksef_input
+                    .clone()
+                    .unwrap_or_else(|| configured_ksef_out_path(year));
                 let result = ksef_sync(year, &input, None)?;
                 if let Some(ref conn) = conn {
                     store_records(conn, &result.records)?;
@@ -352,9 +373,14 @@ fn main() -> Result<()> {
             }
             if mail || all {
                 eprintln!("  [Gmail] pobieranie załączników...");
-                let token_path = gmail_token_file.clone().unwrap_or_else(default_gmail_token_path);
-                let token =
-                    gmail_access_token("GMAIL_ACCESS_TOKEN", &token_path, gmail_client_secret.as_deref())?;
+                let token_path = gmail_token_file
+                    .clone()
+                    .unwrap_or_else(default_gmail_token_path);
+                let token = gmail_access_token(
+                    "GMAIL_ACCESS_TOKEN",
+                    &token_path,
+                    gmail_client_secret.as_deref(),
+                )?;
                 let mail_out = default_mail_out_path(year);
                 let gmail_result = gmail_fetch(
                     &token,
@@ -364,14 +390,30 @@ fn main() -> Result<()> {
                     500,
                     &["pdf".to_string()],
                 )?;
-                eprintln!("  [Gmail] pobrano {} plików, skanowanie PDF...", gmail_result.files_saved);
-                let mail_records = scan_input(SourceKind::Mail, &mail_out)?;
-                let candidates =
+                eprintln!(
+                    "  [Gmail] pobrano {} plików, skanowanie nowych PDF...",
+                    gmail_result.files_saved
+                );
+                let (mail_records, parsed_count) =
+                    sync_mail_records(&mail_out, &gmail_result.saved_files)?;
+                eprintln!("  [Gmail] sparsowano {} nowych PDF", parsed_count);
+                let mut candidates =
                     productmesh_invoice_candidates(&mail_records, &productmesh_nip);
+                let cached_candidates = apply_cached_mail_candidates(year, &mut candidates)?;
+                enrich_candidates_with_gemma(&mut candidates, &cached_candidates)?;
+                write_records(
+                    &candidates,
+                    OutputFormat::Jsonl,
+                    Some(&default_mail_candidates_path(year)),
+                )?;
                 if let Some(ref conn) = conn {
                     store_records(conn, &candidates)?;
                 }
-                eprintln!("  [Gmail] gotowe: {} PDF, {} faktur", mail_records.len(), candidates.len());
+                eprintln!(
+                    "  [Gmail] gotowe: {} PDF, {} faktur",
+                    mail_records.len(),
+                    candidates.len()
+                );
                 synced.push(format!(
                     "mail ({} files, {} pdfs, {} candidates)",
                     gmail_result.files_saved,
@@ -381,12 +423,18 @@ fn main() -> Result<()> {
             }
             if saldeo || all {
                 eprintln!("  [Saldeo] pobieranie dokumentów...");
-                let result =
-                    saldeo_fetch(year, &default_saldeo_storage_state_path(), &default_saldeo_out_path(year))?;
+                let result = saldeo_fetch(
+                    year,
+                    &default_saldeo_storage_state_path(),
+                    &default_saldeo_out_path(year),
+                )?;
                 if let Some(ref conn) = conn {
                     store_records(conn, &result.records)?;
                 }
-                eprintln!("  [Saldeo] gotowe: {} dokumentów", result.summary.documents_count);
+                eprintln!(
+                    "  [Saldeo] gotowe: {} dokumentów",
+                    result.summary.documents_count
+                );
                 synced.push(format!("saldeo ({})", result.summary.documents_count));
             }
             write_json(
@@ -401,6 +449,7 @@ fn main() -> Result<()> {
             saldeo,
             review_score,
             output,
+            raw,
             csv,
             store,
             year,
@@ -408,19 +457,18 @@ fn main() -> Result<()> {
             if status {
                 let conn = open_db(&db_path)?;
                 let report = load_last_tri_report(&conn, year)?;
-                return write_json(&report, output.as_deref());
+                if raw || output.is_some() {
+                    return write_json(&report, output.as_deref());
+                }
+                return write_reconcile_human(&report, None);
             }
-            let mail_path =
-                mail.ok_or_else(|| anyhow!("podaj --mail (JSON/JSONL z rekordami Gmail/PDF)"))?;
-            let ksef_path =
-                ksef.ok_or_else(|| anyhow!("podaj --ksef (JSON/JSONL z rekordami KSeF)"))?;
-            let saldeo_path = saldeo
-                .ok_or_else(|| anyhow!("podaj --saldeo (JSON/JSONL z rekordami Saldeo)"))?;
+            let mail_path = mail.unwrap_or_else(|| default_mail_candidates_path(year));
+            let ksef_path = ksef.unwrap_or_else(|| configured_ksef_out_path(year));
+            let saldeo_path = saldeo.unwrap_or_else(|| default_saldeo_records_path(year));
             let mail_records = load_records(SourceKind::Mail, &mail_path)?;
             let ksef_records = load_records(SourceKind::Ksef, &ksef_path)?;
             let saldeo_records = load_saldeo_records(&saldeo_path)?;
-            let report =
-                tri_reconcile(mail_records, ksef_records, saldeo_records, review_score);
+            let report = tri_reconcile(mail_records, ksef_records, saldeo_records, review_score);
             let temporal_diff = if store {
                 let conn = open_db(&db_path)?;
                 Some(store_tri_reconcile_report(&conn, year, &report)?)
@@ -430,13 +478,19 @@ fn main() -> Result<()> {
             if let Some(csv_path) = csv {
                 write_tri_csv(&report, &csv_path)?;
             }
-            if temporal_diff.is_some() && output.is_none() {
-                write_json(
-                    &serde_json::json!({"report": report, "temporal_diff": temporal_diff}),
-                    None,
-                )?;
-            } else {
+            if output.is_some() {
                 write_json(&report, output.as_deref())?;
+            } else if raw {
+                if temporal_diff.is_some() {
+                    write_json(
+                        &serde_json::json!({"report": report, "temporal_diff": temporal_diff}),
+                        None,
+                    )?;
+                } else {
+                    write_json(&report, None)?;
+                }
+            } else {
+                write_reconcile_human(&report, temporal_diff.as_ref())?;
             }
         }
         Commands::Upload {
@@ -448,6 +502,7 @@ fn main() -> Result<()> {
             review_score,
             output,
             csv,
+            confirm,
         } => {
             let mut plan = saldeo_sync_plan(SaldeoSyncPlanConfig {
                 year,
@@ -456,16 +511,13 @@ fn main() -> Result<()> {
                 ksef: ksef.as_deref(),
                 saldeo: saldeo.as_deref(),
                 review_score,
-                confirm: true,
+                confirm,
                 upload_url: None,
             })?;
-            let storage_state = default_saldeo_storage_state_path();
-            saldeo_upload_plan(
-                &mut plan,
-                &storage_state,
-                DEFAULT_SALDEO_UPLOAD_URL,
-                "file",
-            )?;
+            if confirm {
+                let storage_state = default_saldeo_storage_state_path();
+                saldeo_upload_plan(&mut plan, &storage_state, DEFAULT_SALDEO_UPLOAD_URL, "file")?;
+            }
             if let Some(csv_path) = csv {
                 write_saldeo_sync_csv(&plan, &csv_path)?;
             }
@@ -519,6 +571,78 @@ fn write_bytes(bytes: &[u8], output: Option<&Path>) -> Result<()> {
             io::stdout().write_all(bytes)?;
             Ok(())
         }
+    }
+}
+
+fn keychain_get_secret(account: &str) -> Result<Option<String>> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("security")
+            .args([
+                "find-generic-password",
+                "-s",
+                KEYCHAIN_SERVICE,
+                "-a",
+                account,
+                "-w",
+            ])
+            .output()
+            .with_context(|| "uruchomienie macOS security find-generic-password")?;
+        if output.status.success() {
+            let raw = String::from_utf8_lossy(&output.stdout)
+                .trim_end_matches(['\r', '\n'])
+                .to_string();
+            Ok(Some(decode_keychain_secret(&raw).unwrap_or(raw)))
+        } else {
+            Ok(None)
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = account;
+        Ok(None)
+    }
+}
+
+fn decode_keychain_secret(raw: &str) -> Option<String> {
+    if let Some(encoded) = raw.strip_prefix("base64:") {
+        return STANDARD
+            .decode(encoded)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+    }
+
+    if raw.len().is_multiple_of(2) && raw.chars().all(|c| c.is_ascii_hexdigit()) {
+        return hex::decode(raw)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+    }
+
+    None
+}
+
+fn keychain_set_secret(account: &str, secret: &str) -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("security")
+            .args([
+                "add-generic-password",
+                "-s",
+                KEYCHAIN_SERVICE,
+                "-a",
+                account,
+                "-U",
+                "-w",
+                &format!("base64:{}", STANDARD.encode(secret)),
+            ])
+            .status()
+            .with_context(|| "uruchomienie macOS security add-generic-password")?;
+        Ok(status.success())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (account, secret);
+        Ok(false)
     }
 }
 
@@ -1018,16 +1142,15 @@ fn load_last_tri_report(conn: &Connection, year: i32) -> Result<TriReconcileRepo
     let rows = stmt.query_map(params![run_id], |row| {
         let status: String = row.get(0)?;
         let row_json: String = row.get(7)?;
-        let tri_row: TriRow =
-            serde_json::from_str(&row_json).unwrap_or_else(|_| TriRow {
-                status,
-                mail_score_to_ksef: None,
-                mail_score_to_saldeo: None,
-                ksef_score_to_saldeo: None,
-                mail: None,
-                ksef: None,
-                saldeo: None,
-            });
+        let tri_row: TriRow = serde_json::from_str(&row_json).unwrap_or(TriRow {
+            status,
+            mail_score_to_ksef: None,
+            mail_score_to_saldeo: None,
+            ksef_score_to_saldeo: None,
+            mail: None,
+            ksef: None,
+            saldeo: None,
+        });
         Ok(tri_row)
     })?;
     let mut tri_rows = Vec::new();
@@ -1098,6 +1221,17 @@ fn db_stats(conn: &Connection) -> Result<Value> {
 
 fn load_records(source: SourceKind, input: &Path) -> Result<Vec<InvoiceRecord>> {
     if input.is_dir() {
+        for file_name in [
+            "ksef_records.jsonl",
+            "records.jsonl",
+            "ksef_records.json",
+            "records.json",
+        ] {
+            let candidate = input.join(file_name);
+            if candidate.is_file() {
+                return load_records(source, &candidate);
+            }
+        }
         return scan_input(source, input);
     }
     if input.extension().and_then(|e| e.to_str()) == Some("jsonl") {
@@ -1162,6 +1296,75 @@ fn is_supported_file(path: &Path) -> bool {
     )
 }
 
+fn sync_mail_records(
+    mail_out: &Path,
+    saved_files: &[String],
+) -> Result<(Vec<InvoiceRecord>, usize)> {
+    let cache_path = mail_out.join("records.jsonl");
+    if !cache_path.exists() {
+        let records = scan_mail_input(mail_out)?;
+        let parsed_count = records.len();
+        write_records(&records, OutputFormat::Jsonl, Some(&cache_path))?;
+        return Ok((records, parsed_count));
+    }
+
+    let mut records = load_records(SourceKind::Mail, &cache_path)?;
+    let mut seen = records
+        .iter()
+        .map(|record| record.content_hash.clone())
+        .collect::<HashSet<_>>();
+    let mut parsed_count = 0usize;
+    for path in saved_files.iter().map(PathBuf::from) {
+        if !is_mail_candidate_file(&path) {
+            continue;
+        }
+        let record = parse_file(SourceKind::Mail, &path)?;
+        if seen.insert(record.content_hash.clone()) {
+            records.push(record);
+            parsed_count += 1;
+        }
+    }
+    if parsed_count > 0 {
+        write_records(&records, OutputFormat::Jsonl, Some(&cache_path))?;
+    }
+    Ok((records, parsed_count))
+}
+
+fn scan_mail_input(input: &Path) -> Result<Vec<InvoiceRecord>> {
+    let mut files = Vec::new();
+    if input.is_dir() {
+        for entry in WalkDir::new(input).into_iter().filter_map(Result::ok) {
+            let path = entry.path();
+            if entry.file_type().is_file() && is_mail_candidate_file(path) {
+                files.push(path.to_path_buf());
+            }
+        }
+    } else if input.is_file() && is_mail_candidate_file(input) {
+        files.push(input.to_path_buf());
+    } else {
+        return Err(anyhow!(
+            "input nie istnieje albo nie jest wspieranym plikiem mail: {}",
+            input.display()
+        ));
+    }
+
+    files.sort();
+    files
+        .iter()
+        .map(|path| parse_file(SourceKind::Mail, path))
+        .collect::<Result<Vec<_>>>()
+}
+
+fn is_mail_candidate_file(path: &Path) -> bool {
+    is_supported_file(path) && !is_gmail_metadata_path(path)
+}
+
+fn is_gmail_metadata_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.ends_with("_message.json") || name == "records.json")
+}
+
 fn parse_file(source: SourceKind, path: &Path) -> Result<InvoiceRecord> {
     let bytes = fs::read(path).with_context(|| format!("odczyt {}", path.display()))?;
     let hash = hex::encode(Sha256::digest(&bytes));
@@ -1214,6 +1417,35 @@ fn parse_file(source: SourceKind, path: &Path) -> Result<InvoiceRecord> {
         record.invoice_number = invoice_number_from_filename(path);
     }
     Ok(record)
+}
+
+fn record_missing_core_fields(record: &InvoiceRecord) -> bool {
+    record.invoice_number.is_none()
+        || record.issue_date.is_none()
+        || record.gross_amount_minor.is_none()
+        || record.currency.is_none()
+        || (record.seller_name.is_none() && record.buyer_name.is_none())
+}
+
+fn json_first_string(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value.get(*key).and_then(|v| match v {
+            Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
+    })
+}
+
+fn json_first_money_minor(value: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter().find_map(|key| {
+        let raw = value.get(*key)?;
+        match raw {
+            Value::Number(n) => parse_money_minor(&n.to_string()),
+            Value::String(s) => parse_money_minor(s),
+            _ => None,
+        }
+    })
 }
 
 fn empty_record(source: SourceKind) -> InvoiceRecord {
@@ -1869,33 +2101,9 @@ fn extract_pdf_text(path: &Path) -> Result<String> {
         Err(_) => {}
     }
 
-    extract_pdf_text_with_pypdf(path).context(
-        "ekstrakcja PDF nie powiodła się; zainstaluj poppler (`brew install poppler`) albo pypdf (`python3 -m pip install pypdf`)",
-    )
-}
-
-fn extract_pdf_text_with_pypdf(path: &Path) -> Result<String> {
-    let script = r#"
-import sys
-from pypdf import PdfReader
-reader = PdfReader(sys.argv[1])
-for page in reader.pages:
-    text = page.extract_text() or ""
-    if text:
-        print(text)
-"#;
-    let output = Command::new("python3")
-        .arg("-c")
-        .arg(script)
-        .arg(path)
-        .output()
-        .context("uruchomienie python3/pypdf")?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            String::from_utf8_lossy(&output.stderr).trim().to_string()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Err(anyhow!(
+        "ekstrakcja PDF nie powiodła się; zainstaluj poppler (`brew install poppler`)"
+    ))
 }
 
 fn score_pair(ksef: &InvoiceRecord, mail: &InvoiceRecord) -> (u8, Vec<String>) {
@@ -1910,12 +2118,15 @@ fn score_pair(ksef: &InvoiceRecord, mail: &InvoiceRecord) -> (u8, Vec<String>) {
     }
 
     if let (Some(a), Some(b)) = (&ksef.invoice_number, &mail.invoice_number) {
-        if comparable_invoice_number(a) == comparable_invoice_number(b) {
+        let comparable_a = comparable_invoice_number(a);
+        let comparable_b = comparable_invoice_number(b);
+        if comparable_a == comparable_b {
             score += 45;
             reasons.push("invoice_number exact".to_string());
-        } else if comparable_invoice_number(a).contains(&comparable_invoice_number(b))
-            || comparable_invoice_number(b).contains(&comparable_invoice_number(a))
-        {
+        } else if invoice_number_strong_contains(&comparable_a, &comparable_b) {
+            score += 45;
+            reasons.push("invoice_number embedded exact".to_string());
+        } else if comparable_a.contains(&comparable_b) || comparable_b.contains(&comparable_a) {
             score += 25;
             reasons.push("invoice_number partial".to_string());
         }
@@ -1978,6 +2189,11 @@ fn comparable_invoice_number(value: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric())
         .flat_map(|c| c.to_uppercase())
         .collect()
+}
+
+fn invoice_number_strong_contains(a: &str, b: &str) -> bool {
+    let min_len = a.len().min(b.len());
+    min_len >= 8 && (a.contains(b) || b.contains(a))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2164,19 +2380,46 @@ fn token_response_to_file(
 }
 
 fn save_gmail_token(path: &Path, token: &GmailTokenFile) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(token)?;
+    if uses_default_gmail_token_path(path)
+        && keychain_set_secret(
+            KEYCHAIN_ACCOUNT_GMAIL_TOKEN,
+            std::str::from_utf8(&bytes).context("token Gmail nie jest UTF-8")?,
+        )?
+    {
+        if path.exists() {
+            let _ = fs::remove_file(path);
+        }
+        return Ok(());
+    }
+
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
-    fs::write(path, serde_json::to_vec_pretty(token)?)
-        .with_context(|| format!("zapis tokenu Gmail {}", path.display()))?;
+    fs::write(path, bytes).with_context(|| format!("zapis tokenu Gmail {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
     Ok(())
 }
 
 fn read_gmail_token(path: &Path) -> Result<GmailTokenFile> {
+    if uses_default_gmail_token_path(path)
+        && let Some(text) = keychain_get_secret(KEYCHAIN_ACCOUNT_GMAIL_TOKEN)?
+    {
+        return serde_json::from_str(&text).context("niepoprawny token Gmail w macOS Keychain");
+    }
+
     let text = fs::read_to_string(path)
         .with_context(|| format!("odczyt tokenu Gmail {}", path.display()))?;
     serde_json::from_str(&text)
         .with_context(|| format!("niepoprawny token Gmail {}", path.display()))
+}
+
+fn uses_default_gmail_token_path(path: &Path) -> bool {
+    path == default_gmail_token_path().as_path()
 }
 
 fn gmail_access_token(
@@ -2206,8 +2449,8 @@ fn gmail_access_token(
 
     let client_secret_path = client_secret_path
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("GOOGLE_CLIENT_SECRET_PATH").map(PathBuf::from))
-        .ok_or_else(|| anyhow!("token Gmail wygasł; podaj --client-secret albo GOOGLE_CLIENT_SECRET_PATH, żeby go odświeżyć"))?;
+        .or_else(|| lab_config_var("GOOGLE_CLIENT_SECRET_PATH").map(PathBuf::from))
+        .ok_or_else(|| anyhow!("token Gmail wygasł; podaj --gmail-client-secret albo ustaw GOOGLE_CLIENT_SECRET_PATH w lab onboard, żeby go odświeżyć"))?;
     refresh_gmail_token(&client_secret_path, token_file, token)
 }
 
@@ -2296,6 +2539,11 @@ fn gmail_fetch(
 
     let mut saved_files = Vec::new();
     for id in &message_ids {
+        let metadata_path = out_dir.join(format!("{}_message.json", sanitize_filename(id)));
+        if gmail_message_cached(out_dir, id, &allowed_exts) {
+            continue;
+        }
+
         let msg: Value = client
             .get(format!(
                 "https://gmail.googleapis.com/gmail/v1/users/{}/messages/{}",
@@ -2308,7 +2556,6 @@ fn gmail_fetch(
             .json()?;
 
         let headers = gmail_headers(&msg);
-        let metadata_path = out_dir.join(format!("{}_message.json", sanitize_filename(id)));
         fs::write(&metadata_path, serde_json::to_vec_pretty(&msg)?)?;
         saved_files.push(metadata_path.display().to_string());
 
@@ -2333,6 +2580,30 @@ fn gmail_fetch(
         files_saved: saved_files.len(),
         out_dir: out_dir.display().to_string(),
         saved_files,
+    })
+}
+
+fn gmail_message_cached(out_dir: &Path, message_id: &str, allowed_exts: &HashSet<String>) -> bool {
+    let sanitized_id = sanitize_filename(message_id);
+    let metadata_path = out_dir.join(format!("{sanitized_id}_message.json"));
+    if !metadata_path.is_file() {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(out_dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let path = entry.path();
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        file_name.starts_with(&format!("{sanitized_id}_")) && allowed_exts.contains(&ext)
     })
 }
 
@@ -2388,30 +2659,6 @@ fn collect_gmail_parts(
     let filename = part.get("filename").and_then(|v| v.as_str()).unwrap_or("");
     let mime_type = part.get("mimeType").and_then(|v| v.as_str()).unwrap_or("");
     let body = &part["body"];
-    let data = if let Some(attachment_id) = body.get("attachmentId").and_then(|v| v.as_str()) {
-        let attachment: Value = client
-            .get(format!(
-                "https://gmail.googleapis.com/gmail/v1/users/{}/messages/{}/attachments/{}",
-                user, message_id, attachment_id
-            ))
-            .bearer_auth(token)
-            .send()?
-            .error_for_status()?
-            .json()?;
-        attachment
-            .get("data")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    } else {
-        body.get("data")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    };
-
-    let Some(data) = data else {
-        return Ok(());
-    };
-    let decoded = decode_gmail_base64(&data)?;
 
     let mut save_name = if !filename.is_empty() {
         filename.to_string()
@@ -2437,6 +2684,35 @@ fn collect_gmail_parts(
         sanitize_filename(&save_name)
     );
     let path = out_dir.join(save_name);
+    if path.exists() {
+        return Ok(());
+    }
+
+    let data = if let Some(attachment_id) = body.get("attachmentId").and_then(|v| v.as_str()) {
+        let attachment: Value = client
+            .get(format!(
+                "https://gmail.googleapis.com/gmail/v1/users/{}/messages/{}/attachments/{}",
+                user, message_id, attachment_id
+            ))
+            .bearer_auth(token)
+            .send()?
+            .error_for_status()?
+            .json()?;
+        attachment
+            .get("data")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    } else {
+        body.get("data")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+
+    let Some(data) = data else {
+        return Ok(());
+    };
+    let decoded = decode_gmail_base64(&data)?;
+
     if ext == "txt" && !headers.is_empty() {
         let mut with_headers = String::new();
         for key in ["message-id", "subject", "from", "date"] {
@@ -2489,7 +2765,7 @@ fn ksef_sync(year: i32, input: &Path, out_dir: Option<&Path>) -> Result<KsefSync
     let records = load_records(SourceKind::Ksef, input)?;
     let out_dir = out_dir
         .map(PathBuf::from)
-        .unwrap_or_else(|| default_ksef_out_path(year));
+        .unwrap_or_else(|| configured_ksef_out_path(year));
     fs::create_dir_all(&out_dir).with_context(|| format!("mkdir {}", out_dir.display()))?;
     let json_output = out_dir.join("records.json");
     let jsonl_output = out_dir.join("records.jsonl");
@@ -2518,29 +2794,46 @@ fn default_mail_out_path(year: i32) -> PathBuf {
     PathBuf::from(format!("data/mail-all-pdf-{year}-pdfs"))
 }
 
+fn default_mail_candidates_path(year: i32) -> PathBuf {
+    default_mail_out_path(year).join("candidates.jsonl")
+}
+
 fn default_saldeo_out_path(year: i32) -> PathBuf {
     PathBuf::from(format!("data/saldeo-{year}"))
+}
+
+fn default_saldeo_records_path(year: i32) -> PathBuf {
+    default_saldeo_out_path(year).join("records.jsonl")
 }
 
 fn default_ksef_out_path(year: i32) -> PathBuf {
     PathBuf::from(format!("data/ksef-{year}"))
 }
 
+fn configured_ksef_out_path(year: i32) -> PathBuf {
+    lab_config_var("KSEF_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_ksef_out_path(year))
+}
+
 fn productmesh_invoice_candidates(
     records: &[InvoiceRecord],
     productmesh_nip: &str,
 ) -> Vec<InvoiceRecord> {
+    let productmesh_nip =
+        normalize_tax_id(productmesh_nip).unwrap_or_else(|| productmesh_nip.to_string());
     let excluded = Regex::new(r"(?i)(receipt|statement|regulamin|warunki|informacje|upowa|oferta|umowa|order|label|bilet|dr_skan|wypowiedzenie|grafklient|cennik|polityka|pasek|wishlist|terms|portfolio|kosztorys|formularz|prawo_jazdy|zalacznik)").unwrap();
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
+    let mut by_invoice: HashMap<String, InvoiceRecord> = HashMap::new();
+    let mut fallback_seen = HashSet::new();
+    let mut fallback_out = Vec::new();
     for record in records {
         let names = format!(
             "{} {}",
             record.seller_name.clone().unwrap_or_default(),
             record.buyer_name.clone().unwrap_or_default()
         );
-        let related = record.seller_tax_id.as_deref() == Some(productmesh_nip)
-            || record.buyer_tax_id.as_deref() == Some(productmesh_nip)
+        let related = record.seller_tax_id.as_deref() == Some(productmesh_nip.as_str())
+            || record.buyer_tax_id.as_deref() == Some(productmesh_nip.as_str())
             || names.to_lowercase().contains("productmesh");
         if !related {
             continue;
@@ -2554,6 +2847,19 @@ fn productmesh_invoice_candidates(
                 continue;
             }
         }
+        if let Some(invoice_number) = &record.invoice_number {
+            let key = comparable_invoice_number(invoice_number);
+            if !key.is_empty() {
+                match by_invoice.get(&key) {
+                    Some(existing)
+                        if record_quality_score(existing) >= record_quality_score(record) => {}
+                    _ => {
+                        by_invoice.insert(key, record.clone());
+                    }
+                }
+                continue;
+            }
+        }
         let key = format!(
             "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
             record.invoice_number,
@@ -2564,11 +2870,305 @@ fn productmesh_invoice_candidates(
             record.seller_name,
             record.buyer_name
         );
-        if seen.insert(key) {
-            out.push(record.clone());
+        if fallback_seen.insert(key) {
+            fallback_out.push(record.clone());
         }
     }
+    let mut out = by_invoice.into_values().collect::<Vec<_>>();
+    out.extend(fallback_out);
+    out.sort_by(|a, b| a.source_path.cmp(&b.source_path));
     out
+}
+
+fn record_quality_score(record: &InvoiceRecord) -> usize {
+    [
+        record.invoice_number.is_some(),
+        record.issue_date.is_some(),
+        record.gross_amount_minor.is_some(),
+        record.currency.is_some(),
+        record.seller_tax_id.is_some(),
+        record.buyer_tax_id.is_some(),
+        record.seller_name.is_some(),
+        record.buyer_name.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count()
+}
+
+fn apply_cached_mail_candidates(
+    year: i32,
+    candidates: &mut [InvoiceRecord],
+) -> Result<HashSet<String>> {
+    let path = default_mail_candidates_path(year);
+    if !path.exists() {
+        return Ok(HashSet::new());
+    }
+    let cached = load_records(SourceKind::Mail, &path)?;
+    let by_hash = cached
+        .into_iter()
+        .map(|record| (record.content_hash.clone(), record))
+        .collect::<HashMap<_, _>>();
+    let mut cached_hashes = HashSet::new();
+    for candidate in candidates {
+        if let Some(cached) = by_hash.get(&candidate.content_hash) {
+            *candidate = cached.clone();
+            cached_hashes.insert(candidate.content_hash.clone());
+        }
+    }
+    Ok(cached_hashes)
+}
+
+fn enrich_candidates_with_gemma(
+    records: &mut [InvoiceRecord],
+    skip_hashes: &HashSet<String>,
+) -> Result<()> {
+    let todo = records
+        .iter()
+        .filter(|record| !skip_hashes.contains(&record.content_hash))
+        .filter(|record| record_missing_core_fields(record))
+        .filter(|record| {
+            record.source_path.as_ref().is_some_and(|path| {
+                Path::new(path).extension().and_then(|e| e.to_str()) == Some("pdf")
+            })
+        })
+        .count();
+    if todo == 0 {
+        return Ok(());
+    }
+    eprintln!(
+        "  [Gmail/Gemma] wzbogacanie {} kandydatów przez {}...",
+        todo,
+        llm_model()
+    );
+    ensure_ppmlx_server()?;
+    let mut processed = 0usize;
+    let mut consecutive_errors = 0usize;
+    for record in records.iter_mut() {
+        if skip_hashes.contains(&record.content_hash) || !record_missing_core_fields(record) {
+            continue;
+        }
+        let Some(source_path) = record.source_path.clone() else {
+            continue;
+        };
+        let path = Path::new(&source_path);
+        if path.extension().and_then(|e| e.to_str()) != Some("pdf") {
+            continue;
+        }
+        processed += 1;
+        eprintln!(
+            "  [Gmail/Gemma] {}/{} {}",
+            processed,
+            todo,
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("PDF")
+        );
+        match gemma_extract_invoice_fields(record, path) {
+            Ok(true) => {
+                consecutive_errors = 0;
+                record
+                    .warnings
+                    .push("gemma-4-e2b enrichment applied".to_string());
+            }
+            Ok(false) => {
+                consecutive_errors = 0;
+            }
+            Err(err) => {
+                consecutive_errors += 1;
+                record.warnings.push(format!("gemma-4-e2b: {err}"));
+                eprintln!("  [Gmail/Gemma] błąd: {err}");
+                if consecutive_errors >= 2 {
+                    eprintln!("  [Gmail/Gemma] pomijam dalsze wzbogacanie po 2 kolejnych błędach");
+                    break;
+                }
+            }
+        }
+    }
+    eprintln!("  [Gmail/Gemma] gotowe");
+    Ok(())
+}
+
+fn ppmlx_base_url() -> String {
+    std::env::var("PPMLX_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:6767".to_string())
+}
+
+fn llm_model() -> String {
+    std::env::var("LAB_LLM_MODEL").unwrap_or_else(|_| "gemma-4-e2b".to_string())
+}
+
+fn llm_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("LAB_LLM_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(45),
+    )
+}
+
+fn ensure_ppmlx_server() -> Result<()> {
+    let base = ppmlx_base_url();
+    let model = llm_model();
+    let client = Client::builder().timeout(Duration::from_secs(2)).build()?;
+    if client
+        .get(format!("{base}/v1/models"))
+        .send()
+        .is_ok_and(|r| r.status().is_success())
+    {
+        return Ok(());
+    }
+    if !(base.contains("127.0.0.1") || base.contains("localhost")) {
+        return Err(anyhow!("ppmlx server niedostępny: {base}"));
+    }
+    Command::new("ppmlx")
+        .args(["serve", "--model", &model])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("uruchomienie `ppmlx serve`")?;
+    for _ in 0..30 {
+        sleep(Duration::from_secs(1));
+        if client
+            .get(format!("{base}/v1/models"))
+            .send()
+            .is_ok_and(|r| r.status().is_success())
+        {
+            return Ok(());
+        }
+    }
+    Err(anyhow!("ppmlx server nie wystartował na {base}"))
+}
+
+fn gemma_extract_invoice_fields(record: &mut InvoiceRecord, path: &Path) -> Result<bool> {
+    let text = extract_pdf_text(path).unwrap_or_default();
+    if text.trim().is_empty() {
+        return Ok(false);
+    }
+    let prompt = format!(
+        r#"Wyciągnij dane faktury z tekstu PDF i zwróć WYŁĄCZNIE poprawny JSON bez markdown.
+
+Wymagany template odpowiedzi:
+{{
+  "invoice_number": "FV/123/2026" | null,
+  "issue_date": "YYYY-MM-DD" | null,
+  "sale_date": "YYYY-MM-DD" | null,
+  "due_date": "YYYY-MM-DD" | null,
+  "gross_amount": "1234.56" | null,
+  "net_amount": "1003.71" | null,
+  "vat_amount": "230.85" | null,
+  "currency": "PLN" | "EUR" | "USD" | "GBP" | null,
+  "seller_tax_id": "10 cyfr NIP bez prefiksu PL i bez separatorów" | null,
+  "buyer_tax_id": "10 cyfr NIP bez prefiksu PL i bez separatorów" | null,
+  "seller_name": "pełna nazwa sprzedawcy" | null,
+  "buyer_name": "pełna nazwa nabywcy" | null
+}}
+
+Zasady normalizacji:
+- Daty zawsze w ISO 8601: YYYY-MM-DD. Zamień formaty typu DD.MM.YYYY, DD/MM/YYYY, YYYY/MM/DD.
+- Kwoty zawsze jako string z kropką dziesiętną i 2 miejscami, bez spacji i symbolu waluty, np. "1234.56".
+- Waluta jako trzyliterowy kod ISO uppercase, np. PLN, EUR, USD, GBP. Jeśli tekst ma zł/PLN/zloty -> PLN.
+- NIP/VAT PL jako same cyfry: usuń PL, spacje, myślniki. Jeśli numer nie ma 10 cyfr, zwróć null.
+- Nie zgaduj. Jeśli pole nie występuje w tekście albo nie masz pewności, zwróć null.
+- Dla faktur zakupowych Productmesh zwykle buyer_name/buyer_tax_id to Productmesh; sprzedawca to kontrahent.
+- Nie dodawaj komentarzy, nie używaj markdown, nie zwracaj tablicy.
+
+Tekst PDF:
+---
+{}
+---"#,
+        text.chars().take(12000).collect::<String>()
+    );
+    let value = ppmlx_extract_json(&prompt)?;
+    let before = serde_json::to_string(record)?;
+    apply_extracted_invoice_json(record, &value);
+    Ok(serde_json::to_string(record)? != before)
+}
+
+fn ppmlx_extract_json(prompt: &str) -> Result<Value> {
+    let base = ppmlx_base_url();
+    let model = llm_model();
+    let client = Client::builder().timeout(llm_timeout()).build()?;
+    let response: Value = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": model,
+            "temperature": 0,
+            "max_tokens": 700,
+            "messages": [
+                {"role": "system", "content": "Jesteś ekstraktorem danych z faktur. Odpowiadasz tylko poprawnym JSON."},
+                {"role": "user", "content": prompt}
+            ]
+        }))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let content = response
+        .get("choices")
+        .and_then(|v| v.as_array())
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("ppmlx response bez choices[0].message.content"))?;
+    parse_json_from_llm(content)
+}
+
+fn parse_json_from_llm(content: &str) -> Result<Value> {
+    if let Ok(value) = serde_json::from_str(content.trim()) {
+        return Ok(value);
+    }
+    let start = content
+        .find('{')
+        .ok_or_else(|| anyhow!("LLM nie zwrócił JSON"))?;
+    let end = content
+        .rfind('}')
+        .ok_or_else(|| anyhow!("LLM nie zwrócił JSON"))?;
+    serde_json::from_str(&content[start..=end]).context("niepoprawny JSON z LLM")
+}
+
+fn apply_extracted_invoice_json(record: &mut InvoiceRecord, value: &Value) {
+    if record.invoice_number.is_none() {
+        record.invoice_number = json_first_string(value, &["invoice_number", "number"])
+            .map(|v| clean_invoice_number(&v));
+    }
+    if record.issue_date.is_none() {
+        record.issue_date =
+            json_first_string(value, &["issue_date", "date"]).and_then(|v| parse_date(&v));
+    }
+    if record.sale_date.is_none() {
+        record.sale_date = json_first_string(value, &["sale_date"]).and_then(|v| parse_date(&v));
+    }
+    if record.due_date.is_none() {
+        record.due_date =
+            json_first_string(value, &["due_date", "date_due"]).and_then(|v| parse_date(&v));
+    }
+    if record.gross_amount_minor.is_none() {
+        record.gross_amount_minor =
+            json_first_money_minor(value, &["gross_amount", "amount", "total"]);
+    }
+    if record.net_amount_minor.is_none() {
+        record.net_amount_minor = json_first_money_minor(value, &["net_amount", "amount_net"]);
+    }
+    if record.vat_amount_minor.is_none() {
+        record.vat_amount_minor = json_first_money_minor(value, &["vat_amount", "amount_vat"]);
+    }
+    if record.currency.is_none() {
+        record.currency =
+            json_first_string(value, &["currency"]).map(|v| v.trim().to_ascii_uppercase());
+    }
+    if record.seller_tax_id.is_none() {
+        record.seller_tax_id =
+            json_first_string(value, &["seller_tax_id"]).and_then(|v| normalize_tax_id(&v));
+    }
+    if record.buyer_tax_id.is_none() {
+        record.buyer_tax_id =
+            json_first_string(value, &["buyer_tax_id"]).and_then(|v| normalize_tax_id(&v));
+    }
+    if record.seller_name.is_none() {
+        record.seller_name =
+            json_first_string(value, &["seller_name"]).and_then(|v| clean_name(&v));
+    }
+    if record.buyer_name.is_none() {
+        record.buyer_name = json_first_string(value, &["buyer_name"]).and_then(|v| clean_name(&v));
+    }
 }
 
 fn read_tri_report(path: &Path) -> Result<TriReconcileReport> {
@@ -2576,17 +3176,6 @@ fn read_tri_report(path: &Path) -> Result<TriReconcileReport> {
     serde_json::from_str(&text)
         .with_context(|| format!("niepoprawny tri report {}", path.display()))
 }
-
-
-
-
-
-
-
-
-
-
-
 
 fn run_mcp_server(db_path: &Path) -> Result<()> {
     let stdin = io::stdin();
@@ -2785,7 +3374,7 @@ fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<Value> {
             if json_bool(args, "ksef", false) || all {
                 eprintln!("  [KSeF] synchronizacja...");
                 let input = json_path_arg(args, "ksef_input")
-                    .unwrap_or_else(|| default_ksef_out_path(year));
+                    .unwrap_or_else(|| configured_ksef_out_path(year));
                 let result = ksef_sync(year, &input, None)?;
                 records_count += result.summary.records_count;
                 if let Some(ref conn) = conn {
@@ -2812,16 +3401,32 @@ fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<Value> {
                     500,
                     &["pdf".to_string()],
                 )?;
-                eprintln!("  [Gmail] pobrano {} plików, skanowanie PDF...", gmail_result.files_saved);
-                let mail_records = scan_input(SourceKind::Mail, &mail_out)?;
+                eprintln!(
+                    "  [Gmail] pobrano {} plików, skanowanie nowych PDF...",
+                    gmail_result.files_saved
+                );
+                let (mail_records, parsed_count) =
+                    sync_mail_records(&mail_out, &gmail_result.saved_files)?;
+                eprintln!("  [Gmail] sparsowano {} nowych PDF", parsed_count);
                 let nip = json_string_arg(args, "productmesh_nip")
                     .unwrap_or_else(|| "5242920020".to_string());
-                let candidates = productmesh_invoice_candidates(&mail_records, &nip);
+                let mut candidates = productmesh_invoice_candidates(&mail_records, &nip);
+                let cached_candidates = apply_cached_mail_candidates(year, &mut candidates)?;
+                enrich_candidates_with_gemma(&mut candidates, &cached_candidates)?;
+                write_records(
+                    &candidates,
+                    OutputFormat::Jsonl,
+                    Some(&default_mail_candidates_path(year)),
+                )?;
                 records_count += candidates.len();
                 if let Some(ref conn) = conn {
                     store_records(conn, &candidates)?;
                 }
-                eprintln!("  [Gmail] gotowe: {} PDF, {} faktur", mail_records.len(), candidates.len());
+                eprintln!(
+                    "  [Gmail] gotowe: {} PDF, {} faktur",
+                    mail_records.len(),
+                    candidates.len()
+                );
                 synced.push(format!(
                     "mail ({} files, {} pdfs, {} candidates)",
                     gmail_result.files_saved,
@@ -2831,24 +3436,29 @@ fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<Value> {
             }
             if json_bool(args, "saldeo", false) || all {
                 eprintln!("  [Saldeo] pobieranie dokumentów...");
-                let result =
-                    saldeo_fetch(year, &default_saldeo_storage_state_path(), &default_saldeo_out_path(year))?;
+                let result = saldeo_fetch(
+                    year,
+                    &default_saldeo_storage_state_path(),
+                    &default_saldeo_out_path(year),
+                )?;
                 records_count += result.summary.records_count;
                 if let Some(ref conn) = conn {
                     store_records(conn, &result.records)?;
                 }
-                eprintln!("  [Saldeo] gotowe: {} dokumentów", result.summary.documents_count);
+                eprintln!(
+                    "  [Saldeo] gotowe: {} dokumentów",
+                    result.summary.documents_count
+                );
                 synced.push(format!("saldeo ({})", result.summary.documents_count));
             }
-            Ok(serde_json::json!({"synced": synced, "year": year, "records_count": records_count, "stored": conn.is_some()}))
+            Ok(
+                serde_json::json!({"synced": synced, "year": year, "records_count": records_count, "stored": conn.is_some()}),
+            )
         }
         "reconcile" => {
-            let mail = json_path_arg(args, "mail")
-                .ok_or_else(|| anyhow!("missing mail"))?;
-            let ksef = json_path_arg(args, "ksef")
-                .ok_or_else(|| anyhow!("missing ksef"))?;
-            let saldeo = json_path_arg(args, "saldeo")
-                .ok_or_else(|| anyhow!("missing saldeo"))?;
+            let mail = json_path_arg(args, "mail").ok_or_else(|| anyhow!("missing mail"))?;
+            let ksef = json_path_arg(args, "ksef").ok_or_else(|| anyhow!("missing ksef"))?;
+            let saldeo = json_path_arg(args, "saldeo").ok_or_else(|| anyhow!("missing saldeo"))?;
             let report = tri_reconcile(
                 load_records(SourceKind::Mail, &mail)?,
                 load_records(SourceKind::Ksef, &ksef)?,
@@ -2957,17 +3567,20 @@ fn saldeo_sync_plan(config: SaldeoSyncPlanConfig<'_>) -> Result<SaldeoSyncPlan> 
     } else {
         let mail = config
             .mail
-            .ok_or_else(|| anyhow!("podaj --tri-report albo komplet --mail --ksef --saldeo"))?;
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| default_mail_candidates_path(config.year));
         let ksef = config
             .ksef
-            .ok_or_else(|| anyhow!("podaj --tri-report albo komplet --mail --ksef --saldeo"))?;
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| configured_ksef_out_path(config.year));
         let saldeo = config
             .saldeo
-            .ok_or_else(|| anyhow!("podaj --tri-report albo komplet --mail --ksef --saldeo"))?;
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| default_saldeo_records_path(config.year));
         tri_reconcile(
-            load_records(SourceKind::Mail, mail)?,
-            load_records(SourceKind::Ksef, ksef)?,
-            load_saldeo_records(saldeo)?,
+            load_records(SourceKind::Mail, &mail)?,
+            load_records(SourceKind::Ksef, &ksef)?,
+            load_saldeo_records(&saldeo)?,
             config.review_score,
         )
     };
@@ -2977,27 +3590,26 @@ fn saldeo_sync_plan(config: SaldeoSyncPlanConfig<'_>) -> Result<SaldeoSyncPlan> 
         if row.saldeo.is_some() {
             continue;
         }
+        let Some(record) = row.mail.as_ref() else {
+            continue;
+        };
         let related_sources = [("mail", row.mail.as_ref()), ("ksef", row.ksef.as_ref())]
             .into_iter()
             .filter_map(|(name, record)| record.map(|_| name.to_string()))
             .collect::<Vec<_>>();
-        let selected = row.mail.as_ref().or(row.ksef.as_ref());
-        if let Some(record) = selected {
-            let key = record
-                .source_path
-                .clone()
-                .or_else(|| record.ksef_reference.clone())
-                .or_else(|| record.invoice_number.clone())
-                .unwrap_or_else(|| tri_row_key(row));
-            if !seen.insert(key) {
-                continue;
-            }
-            items.push(saldeo_sync_item_from_record(
-                &row.status,
-                record,
-                related_sources,
-            ));
+        let key = record
+            .source_path
+            .clone()
+            .or_else(|| record.invoice_number.clone())
+            .unwrap_or_else(|| tri_row_key(row));
+        if !seen.insert(key) {
+            continue;
         }
+        items.push(saldeo_sync_item_from_record(
+            &row.status,
+            record,
+            related_sources,
+        ));
     }
     let summary = saldeo_sync_summary(&items);
     Ok(SaldeoSyncPlan {
@@ -3113,10 +3725,7 @@ struct SaldeoSession {
 }
 
 fn read_saldeo_session(storage_state: &Path) -> Result<SaldeoSession> {
-    let storage: Value = serde_json::from_str(
-        &fs::read_to_string(storage_state)
-            .with_context(|| format!("odczyt sesji Saldeo {}", storage_state.display()))?,
-    )?;
+    let storage: Value = serde_json::from_str(&read_saldeo_storage_state(storage_state)?)?;
     let cookies = storage
         .get("cookies")
         .and_then(|v| v.as_array())
@@ -3340,10 +3949,7 @@ fn default_saldeo_storage_state_path() -> PathBuf {
 
 fn saldeo_fetch(year: i32, storage_state: &Path, out_dir: &Path) -> Result<SaldeoFetchResult> {
     fs::create_dir_all(out_dir).with_context(|| format!("mkdir {}", out_dir.display()))?;
-    let storage: Value = serde_json::from_str(
-        &fs::read_to_string(storage_state)
-            .with_context(|| format!("odczyt sesji Saldeo {}", storage_state.display()))?,
-    )?;
+    let storage: Value = serde_json::from_str(&read_saldeo_storage_state(storage_state)?)?;
     let cookies = storage
         .get("cookies")
         .and_then(|v| v.as_array())
@@ -3413,7 +4019,10 @@ fn saldeo_fetch(year: i32, storage_state: &Path, out_dir: &Path) -> Result<Salde
             .error_for_status()
             .map_err(|e| {
                 if e.status() == Some(reqwest::StatusCode::UNAUTHORIZED) {
-                    anyhow!("Saldeo session expired (401). Refresh Playwright storage state:\n  {}", default_saldeo_storage_state_path().display())
+                    anyhow!(
+                        "Saldeo session expired (401). Refresh Playwright storage state:\n  {}",
+                        default_saldeo_storage_state_path().display()
+                    )
                 } else {
                     anyhow!("Saldeo document/list/search month={month}: {e}")
                 }
@@ -3680,6 +4289,141 @@ fn tri_status(has_mail: bool, has_ksef: bool, has_saldeo: bool) -> &'static str 
     }
 }
 
+fn write_reconcile_human(
+    report: &TriReconcileReport,
+    temporal_diff: Option<&TemporalDiffSummary>,
+) -> Result<()> {
+    let mut out = String::new();
+    out.push_str("LAB reconcile\n");
+    out.push_str(&format!(
+        "generated: {} | review_score: {}\n\n",
+        report.generated_at, report.review_score
+    ));
+    out.push_str(&format!(
+        "Źródła: Gmail {} | KSeF {} | Saldeo {}\n",
+        report.summary.mail_count, report.summary.ksef_count, report.summary.saldeo_count
+    ));
+    out.push_str("Statusy:\n");
+    for (label, count) in reconcile_status_counts(&report.summary) {
+        out.push_str(&format!("  {:30} {}\n", label, count));
+    }
+    if let Some(diff) = temporal_diff {
+        out.push_str(&format!(
+            "\nDiff vs poprzedni run: +{} -{} ~{} (run #{})\n",
+            diff.added_count, diff.removed_count, diff.changed_count, diff.run_id
+        ));
+    }
+
+    let missing_rows = report
+        .rows
+        .iter()
+        .filter(|row| row.status != "in_all_three")
+        .collect::<Vec<_>>();
+    out.push_str(&format!(
+        "\nBraki / do sprawdzenia: {} pozycji",
+        missing_rows.len()
+    ));
+    if !missing_rows.is_empty() {
+        out.push('\n');
+        out.push_str(&format!(
+            "{:<30} {:<28} {:<30} {:<12} {:>12} {:<4} {:<18}\n",
+            "status", "faktura", "kontrahent", "data", "brutto", "wal", "źródła"
+        ));
+        out.push_str(&format!("{}\n", "-".repeat(142)));
+        for row in missing_rows {
+            let primary = row
+                .mail
+                .as_ref()
+                .or(row.ksef.as_ref())
+                .or(row.saldeo.as_ref());
+            out.push_str(&format!(
+                "{:<30} {:<28} {:<30} {:<12} {:>12} {:<4} {:<18}\n",
+                truncate(&row.status, 30),
+                truncate(
+                    &primary
+                        .and_then(|r| r.invoice_number.clone())
+                        .unwrap_or_else(|| "-".to_string()),
+                    28,
+                ),
+                truncate(&counterparty_name(primary), 30),
+                primary
+                    .and_then(|r| r.issue_date)
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                primary
+                    .and_then(|r| r.gross_amount_minor)
+                    .map(format_minor_money)
+                    .unwrap_or_else(|| "-".to_string()),
+                primary
+                    .and_then(|r| r.currency.clone())
+                    .unwrap_or_else(|| "-".to_string()),
+                row_sources(row),
+            ));
+        }
+    } else {
+        out.push('\n');
+    }
+    out.push_str("\nPełny JSON: lab reconcile --raw\n");
+    print!("{out}");
+    Ok(())
+}
+
+fn reconcile_status_counts(summary: &TriSummary) -> Vec<(&'static str, usize)> {
+    vec![
+        ("in_all_three", summary.in_all_three),
+        (
+            "gmail_ksef_missing_saldeo",
+            summary.gmail_ksef_missing_saldeo,
+        ),
+        (
+            "gmail_saldeo_missing_ksef",
+            summary.gmail_saldeo_missing_ksef,
+        ),
+        ("gmail_only", summary.gmail_only),
+        (
+            "ksef_saldeo_missing_gmail",
+            summary.ksef_saldeo_missing_gmail,
+        ),
+        ("ksef_only", summary.ksef_only),
+        ("saldeo_only", summary.saldeo_only),
+    ]
+}
+
+fn counterparty_name(record: Option<&InvoiceRecord>) -> String {
+    record
+        .and_then(|r| r.seller_name.clone().or_else(|| r.buyer_name.clone()))
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn row_sources(row: &TriRow) -> String {
+    [
+        ("G", row.mail.is_some()),
+        ("K", row.ksef.is_some()),
+        ("S", row.saldeo.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(label, present)| present.then_some(label))
+    .collect::<Vec<_>>()
+    .join("+")
+}
+
+fn format_minor_money(value: i64) -> String {
+    format!("{}.{:02}", value / 100, value.abs() % 100)
+}
+
+fn truncate(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut out = value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    out.push('…');
+    out
+}
+
 fn write_tri_csv(report: &TriReconcileReport, path: &Path) -> Result<()> {
     let mut writer =
         csv::Writer::from_path(path).with_context(|| format!("zapis CSV {}", path.display()))?;
@@ -3749,10 +4493,176 @@ fn write_tri_csv(report: &TriReconcileReport, path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct OnboardStatus {
+    db_exists: bool,
+    token_exists: bool,
+    gmail_authed: bool,
+    saldeo_exists: bool,
+    saldeo_valid: bool,
+    pdftotext_ok: bool,
+    python_ok: bool,
+    year: i32,
+    ksef_dir: PathBuf,
+    ksef_data_exists: bool,
+    ksef_cert: Option<String>,
+    ksef_cert_ok: bool,
+    ksef_key: Option<String>,
+    ksef_key_ok: bool,
+    ksef_password_ok: bool,
+    ksef_token_ok: bool,
+    ksef_api_ok: bool,
+}
+
 fn onboard(db_path: &Path, check: bool, gmail_client_secret: Option<&Path>) -> Result<()> {
+    let mut gmail_client_secret = gmail_client_secret.map(Path::to_path_buf);
+    let mut status = collect_onboard_status(db_path)?;
+
+    eprintln!("LAB — konfiguracja środowiska\n");
+    print_onboard_status(&status, db_path);
+
+    if check {
+        return write_onboard_check_json(&status);
+    }
+
+    let theme = ColorfulTheme::default();
+    loop {
+        let items = onboard_menu_items(&status, db_path, gmail_client_secret.as_deref());
+        let exit_index = items.len() - 1;
+        let selection = Select::with_theme(&theme)
+            .with_prompt("Wszystkie parametry LAB — wybierz pozycję do edycji")
+            .items(&items)
+            .default(exit_index)
+            .interact()?;
+
+        match selection {
+            0 => onboard_configure_gmail(&mut gmail_client_secret, status.gmail_authed)?,
+            1 => onboard_configure_gmail(&mut gmail_client_secret, status.gmail_authed)?,
+            2 => onboard_configure_saldeo()?,
+            3 => onboard_edit_env_path("KSEF_CERT_PATH")?,
+            4 => onboard_edit_env_path("KSEF_KEY_PATH")?,
+            5 => onboard_edit_env_secret("KSEF_CERT_PASSWORD")?,
+            6 => onboard_edit_env_secret("KSEF_TOKEN")?,
+            7 => onboard_configure_ksef_data(status.year)?,
+            8 => {
+                open_db(db_path)?;
+                eprintln!("✓ Baza gotowa: {}\n", db_path.display());
+            }
+            9 => run_saldeo_auth_script()?,
+            10 => {}
+            11 => break,
+            _ => unreachable!(),
+        }
+
+        status = collect_onboard_status(db_path)?;
+        eprintln!();
+        print_onboard_status(&status, db_path);
+    }
+
+    write_json(&serde_json::json!({"all_ok": status.all_ok()}), None)
+}
+
+impl OnboardStatus {
+    fn all_ok(&self) -> bool {
+        self.pdftotext_ok
+            && self.python_ok
+            && self.gmail_authed
+            && self.saldeo_valid
+            && self.ksef_api_ok
+            && self.ksef_data_exists
+    }
+}
+
+fn onboard_menu_items(
+    status: &OnboardStatus,
+    db_path: &Path,
+    gmail_client_secret: Option<&Path>,
+) -> Vec<String> {
+    vec![
+        format!(
+            "GOOGLE_CLIENT_SECRET_PATH — {}",
+            gmail_client_secret
+                .map(|p| p.display().to_string())
+                .or_else(|| lab_config_var("GOOGLE_CLIENT_SECRET_PATH"))
+                .unwrap_or_else(|| "(puste; potrzebne do auto-refresh Gmail)".to_string())
+        ),
+        format!(
+            "GMAIL_TOKEN_FILE — {} {}",
+            if status.gmail_authed { "✓" } else { "✗" },
+            default_gmail_token_path().display()
+        ),
+        format!(
+            "SALDEO_STORAGE_STATE — {} {}",
+            if status.saldeo_valid { "✓" } else { "✗" },
+            default_saldeo_storage_state_path().display()
+        ),
+        format!(
+            "KSEF_CERT_PATH — {}",
+            display_path_value(status.ksef_cert.as_deref(), status.ksef_cert_ok)
+        ),
+        format!(
+            "KSEF_KEY_PATH — {}",
+            display_path_value(status.ksef_key.as_deref(), status.ksef_key_ok)
+        ),
+        format!(
+            "KSEF_CERT_PASSWORD — {}",
+            display_secret_value(status.ksef_password_ok)
+        ),
+        format!(
+            "KSEF_TOKEN — {}",
+            display_secret_value(status.ksef_token_ok)
+        ),
+        format!(
+            "KSEF_DATA_DIR — {} {}",
+            if status.ksef_data_exists {
+                "✓"
+            } else {
+                "✗"
+            },
+            status.ksef_dir.display()
+        ),
+        format!(
+            "DB_PATH — {} {}",
+            if status.db_exists {
+                "✓"
+            } else {
+                "✓ (nowa)"
+            },
+            db_path.display()
+        ),
+        "SALDEO_AUTH_SCRIPT — uruchom pobieranie auth".to_string(),
+        "Odśwież status".to_string(),
+        if status.all_ok() {
+            "Zakończ — wszystko gotowe".to_string()
+        } else {
+            "Zakończ — wrócę później".to_string()
+        },
+    ]
+}
+
+fn display_path_value(value: Option<&str>, exists: bool) -> String {
+    match value {
+        Some(value) if exists => format!("✓ {value}"),
+        Some(value) => format!("✗ {value}"),
+        None => "✗ (puste)".to_string(),
+    }
+}
+
+fn display_secret_value(is_set: bool) -> &'static str {
+    if is_set {
+        "✓ ********"
+    } else {
+        "✗ (puste)"
+    }
+}
+
+fn collect_onboard_status(db_path: &Path) -> Result<OnboardStatus> {
     let token_file = default_gmail_token_path();
-    let token_exists = token_file.exists();
-    let token_valid = token_exists
+    let token_exists = token_file.exists()
+        || keychain_get_secret(KEYCHAIN_ACCOUNT_GMAIL_TOKEN)
+            .map(|v| v.is_some())
+            .unwrap_or(false);
+    let gmail_authed = token_exists
         && read_gmail_token(&token_file)
             .map(|t| {
                 t.expires_at
@@ -3762,15 +4672,17 @@ fn onboard(db_path: &Path, check: bool, gmail_client_secret: Option<&Path>) -> R
             .unwrap_or(false);
 
     let saldeo_state = default_saldeo_storage_state_path();
-    let saldeo_exists = saldeo_state.exists();
-    let saldeo_valid = if saldeo_exists {
-        saldeo_session_valid(&saldeo_state)
-    } else {
-        false
-    };
+    let saldeo_exists = saldeo_state.exists()
+        || keychain_get_secret(KEYCHAIN_ACCOUNT_SALDEO_STORAGE_STATE)
+            .map(|v| v.is_some())
+            .unwrap_or(false);
+    let saldeo_valid = saldeo_exists && saldeo_session_valid(&saldeo_state);
 
     let pdftotext_ok = Command::new("pdftotext").arg("-v").output().is_ok();
-    let python_ok = Command::new("python3").arg("-c").arg("from pypdf import PdfReader").output()
+    let python_ok = Command::new("python3")
+        .arg("-c")
+        .arg("import shutil, subprocess, sys; pp=shutil.which('ppmlx'); sys.exit(1 if not pp else 0)")
+        .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
 
@@ -3780,222 +4692,571 @@ fn onboard(db_path: &Path, check: bool, gmail_client_secret: Option<&Path>) -> R
     }
 
     let year = Utc::now().year();
-    let ksef_dir = default_ksef_out_path(year);
+    let ksef_dir = configured_ksef_out_path(year);
     let ksef_data_exists = ksef_dir.exists()
         && std::fs::read_dir(&ksef_dir)
             .map(|mut d| d.any(|e| e.is_ok()))
             .unwrap_or(false);
 
-    let ksef_cert = std::env::var("KSEF_CERT_PATH").ok();
-    let ksef_cert_ok = ksef_cert.as_ref().map(|p| Path::new(p).exists()).unwrap_or(false);
-    let ksef_key = std::env::var("KSEF_KEY_PATH").ok();
-    let ksef_key_ok = ksef_key.as_ref().map(|p| Path::new(p).exists()).unwrap_or(false);
-    let ksef_password_ok = std::env::var("KSEF_CERT_PASSWORD").ok().map(|v| !v.is_empty()).unwrap_or(false);
-    let ksef_token_ok = std::env::var("KSEF_TOKEN").ok().map(|v| !v.is_empty()).unwrap_or(false);
+    let ksef_cert = lab_config_var("KSEF_CERT_PATH");
+    let ksef_cert_ok = ksef_cert
+        .as_ref()
+        .map(|p| Path::new(p).exists())
+        .unwrap_or(false);
+    let ksef_key = lab_config_var("KSEF_KEY_PATH");
+    let ksef_key_ok = ksef_key
+        .as_ref()
+        .map(|p| Path::new(p).exists())
+        .unwrap_or(false);
+    let ksef_password_ok = lab_config_var("KSEF_CERT_PASSWORD")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    let ksef_token_ok = lab_config_var("KSEF_TOKEN")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
     let ksef_api_ok = ksef_cert_ok && ksef_key_ok && ksef_password_ok && ksef_token_ok;
 
-    let mut gmail_authed = token_valid;
-    let interactive = !check;
+    Ok(OnboardStatus {
+        db_exists,
+        token_exists,
+        gmail_authed,
+        saldeo_exists,
+        saldeo_valid,
+        pdftotext_ok,
+        python_ok,
+        year,
+        ksef_dir,
+        ksef_data_exists,
+        ksef_cert,
+        ksef_cert_ok,
+        ksef_key,
+        ksef_key_ok,
+        ksef_password_ok,
+        ksef_token_ok,
+        ksef_api_ok,
+    })
+}
 
-    eprintln!("LAB — konfiguracja środowiska\n");
-    eprintln!("  Baza danych:     {}", if db_exists { "✓" } else { "✓ (nowa)" });
-    eprintln!("  pdftotext:       {}", if pdftotext_ok { "✓" } else { "✗ (brew install poppler)" });
-    eprintln!("  python3/pypdf:   {}", if python_ok { "✓" } else { "✗ (pip install pypdf)" });
-    eprintln!("  Gmail:           {}", if gmail_authed { "✓" } else if token_exists { "✗ (token wygasł)" } else { "✗" });
-    eprintln!("  Saldeo:          {}", if saldeo_valid { "✓" } else if saldeo_exists { "✗ (sesja wygasła)" } else { "✗" });
-    eprintln!("  KSeF certyfikat: {}", if ksef_cert_ok { format!("✓ ({})", ksef_cert.as_deref().unwrap_or("")) } else { "✗".to_string() });
-    eprintln!("  KSeF klucz:      {}", if ksef_key_ok { format!("✓ ({})", ksef_key.as_deref().unwrap_or("")) } else { "✗".to_string() });
-    eprintln!("  KSeF hasło:      {}", if ksef_password_ok { "✓" } else { "✗" });
-    eprintln!("  KSeF token:      {}", if ksef_token_ok { "✓" } else { "✗" });
-    eprintln!("  KSeF dane:       {}", if ksef_data_exists { format!("✓ ({})", ksef_dir.display()) } else { format!("✗ ({})", ksef_dir.display()) });
-
-    if !interactive {
-        let mut steps: Vec<&str> = Vec::new();
-        if !pdftotext_ok { steps.push("brew install poppler"); }
-        if !python_ok { steps.push("python3 -m pip install pypdf"); }
-        if !gmail_authed { steps.push("lab onboard --gmail-client-secret <ścieżka>"); }
-        if !saldeo_valid { steps.push("Odśwież sesję Saldeo (~/.config/lab/saldeo-storage-state.json)"); }
-        if !ksef_api_ok { steps.push("Ustaw KSEF_CERT_PATH, KSEF_KEY_PATH, KSEF_CERT_PASSWORD, KSEF_TOKEN"); }
-        if !ksef_data_exists { steps.push("Umieść eksport KSeF w data/ksef-<rok>"); }
-        if steps.is_empty() { steps.push("Wszystko gotowe. Uruchom: lab sync"); }
-        let status = serde_json::json!({
-            "prerequisites": { "pdftotext": pdftotext_ok, "python3_pypdf": python_ok },
-            "gmail": { "token_valid": gmail_authed },
-            "saldeo": { "session_valid": saldeo_valid },
-            "ksef": { "api_ok": ksef_api_ok, "data_exists": ksef_data_exists },
-            "database": { "exists": db_exists },
-            "next_steps": steps
-        });
-        return write_json(&status, None);
-    }
-
-    // --- Interactive mode ---
-
-    // 1. Gmail
-    if !gmail_authed {
-        eprintln!("── Gmail ──");
-        eprintln!("Potrzebny plik Google OAuth Desktop Client JSON.");
-        eprintln!("Pobierz go z Google Cloud Console → APIs & Services → Credentials.\n");
-        let secret = if let Some(s) = gmail_client_secret {
-            Some(s.to_path_buf())
+fn print_onboard_status(status: &OnboardStatus, db_path: &Path) {
+    eprintln!(
+        "  Baza danych:     {} ({})",
+        if status.db_exists {
+            "✓"
         } else {
-            let path: String = Input::new()
-                .with_prompt("Ścieżka do client_secret JSON")
-                .allow_empty(true)
-                .interact_text()?;
-            if path.is_empty() {
-                eprintln!("⏭ Pominięto.\n");
-                None
-            } else {
-                let p = PathBuf::from(&path);
-                if p.exists() { Some(p) } else { eprintln!("✗ Plik nie istnieje.\n"); None }
-            }
-        };
-        if let Some(secret) = secret {
-            match gmail_auth(&secret, &token_file, false) {
-                Ok(result) => {
-                    eprintln!("✓ Gmail skonfigurowany. Token: {}\n", result.token_file);
-                    gmail_authed = true;
-                }
-                Err(err) => eprintln!("✗ Błąd autoryzacji: {err}\n"),
-            }
+            "✓ (nowa)"
+        },
+        db_path.display()
+    );
+    eprintln!(
+        "  pdftotext:       {}",
+        if status.pdftotext_ok {
+            "✓"
+        } else {
+            "✗ (brew install poppler)"
         }
-    } else {
-        eprintln!("── Gmail ──");
-        eprintln!("✓ już skonfigurowany");
-        if Confirm::new()
-            .with_prompt("Odświeżyć token?")
+    );
+    eprintln!(
+        "  ppmlx/gemma:     {}",
+        if status.python_ok {
+            "✓"
+        } else {
+            "✗ (zainstaluj ppmlx i model gemma-4-e2b)"
+        }
+    );
+    eprintln!(
+        "  Gmail:           {}",
+        if status.gmail_authed {
+            "✓"
+        } else if status.token_exists {
+            "✗ (token wygasł)"
+        } else {
+            "✗"
+        }
+    );
+    eprintln!(
+        "  Saldeo:          {}",
+        if status.saldeo_valid {
+            "✓"
+        } else if status.saldeo_exists {
+            "✗ (sesja wygasła)"
+        } else {
+            "✗"
+        }
+    );
+    eprintln!(
+        "  KSeF certyfikat: {}",
+        if status.ksef_cert_ok {
+            format!("✓ ({})", status.ksef_cert.as_deref().unwrap_or(""))
+        } else {
+            "✗".to_string()
+        }
+    );
+    eprintln!(
+        "  KSeF klucz:      {}",
+        if status.ksef_key_ok {
+            format!("✓ ({})", status.ksef_key.as_deref().unwrap_or(""))
+        } else {
+            "✗".to_string()
+        }
+    );
+    eprintln!(
+        "  KSeF hasło:      {}",
+        if status.ksef_password_ok {
+            "✓"
+        } else {
+            "✗"
+        }
+    );
+    eprintln!(
+        "  KSeF token:      {}",
+        if status.ksef_token_ok { "✓" } else { "✗" }
+    );
+    eprintln!(
+        "  KSeF dane:       {}",
+        if status.ksef_data_exists {
+            format!("✓ ({})", status.ksef_dir.display())
+        } else {
+            format!("✗ ({})", status.ksef_dir.display())
+        }
+    );
+    eprintln!();
+}
+
+fn write_onboard_check_json(status: &OnboardStatus) -> Result<()> {
+    let mut steps: Vec<&str> = Vec::new();
+    if !status.pdftotext_ok {
+        steps.push("brew install poppler");
+    }
+    if !status.python_ok {
+        steps.push("Zainstaluj ppmlx i pobierz model: ppmlx pull gemma-4-e2b");
+    }
+    if !status.gmail_authed {
+        steps.push("lab onboard --gmail-client-secret <ścieżka>");
+    }
+    if !status.saldeo_valid {
+        steps.push("Odśwież sesję Saldeo (~/.config/lab/saldeo-storage-state.json)");
+    }
+    if !status.ksef_api_ok {
+        steps.push("Ustaw KSEF_CERT_PATH, KSEF_KEY_PATH, KSEF_CERT_PASSWORD, KSEF_TOKEN");
+    }
+    if !status.ksef_data_exists {
+        steps.push("Umieść eksport KSeF w data/ksef-<rok>");
+    }
+    if steps.is_empty() {
+        steps.push("Wszystko gotowe. Uruchom: lab sync");
+    }
+    let status_json = serde_json::json!({
+        "prerequisites": { "pdftotext": status.pdftotext_ok, "ppmlx_gemma": status.python_ok },
+        "gmail": { "token_valid": status.gmail_authed },
+        "saldeo": { "session_valid": status.saldeo_valid },
+        "ksef": { "api_ok": status.ksef_api_ok, "data_exists": status.ksef_data_exists },
+        "database": { "exists": status.db_exists },
+        "next_steps": steps
+    });
+    write_json(&status_json, None)
+}
+
+fn onboard_configure_gmail(
+    gmail_client_secret: &mut Option<PathBuf>,
+    gmail_authed: bool,
+) -> Result<()> {
+    eprintln!("── Gmail ──");
+    if gmail_authed
+        && !Confirm::new()
+            .with_prompt("Token wygląda poprawnie. Odświeżyć/autoryzować ponownie?")
             .default(false)
             .interact()?
-        {
-            let secret = if let Some(s) = gmail_client_secret {
-                s.to_path_buf()
-            } else {
-                let path: String = Input::new()
-                    .with_prompt("Ścieżka do client_secret JSON")
-                    .allow_empty(true)
-                    .interact_text()?;
-                if path.is_empty() {
-                    eprintln!("⏭ Pominięto.");
-                    PathBuf::new()
-                } else {
-                    PathBuf::from(&path)
-                }
-            };
-            if secret.as_os_str().is_empty() {
-                // skip
-            } else if secret.exists() {
-                match gmail_auth(&secret, &token_file, false) {
-                    Ok(result) => eprintln!("✓ Token odświeżony: {}\n", result.token_file),
-                    Err(err) => eprintln!("✗ Błąd: {err}\n"),
-                }
-            } else {
-                eprintln!("✗ Plik nie istnieje.\n");
-            }
-        }
-        eprintln!();
+    {
+        eprintln!("⏭ Pominięto.\n");
+        return Ok(());
     }
 
-    // 2. Saldeo
+    eprintln!("Potrzebny plik Google OAuth Desktop Client JSON.");
+    eprintln!("Pobierz go z Google Cloud Console → APIs & Services → Credentials.\n");
+    let default = gmail_client_secret
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let path: String = Input::new()
+        .with_prompt("Ścieżka do client_secret JSON")
+        .default(default)
+        .allow_empty(true)
+        .interact_text()?;
+    if path.trim().is_empty() {
+        eprintln!("⏭ Pominięto.\n");
+        return Ok(());
+    }
+    let secret = PathBuf::from(path.trim());
+    if !secret.exists() {
+        eprintln!("✗ Plik nie istnieje: {}\n", secret.display());
+        return Ok(());
+    }
+
+    *gmail_client_secret = Some(secret.clone());
+    let mut vars = read_lab_env_file().unwrap_or_default();
+    vars.insert(
+        "GOOGLE_CLIENT_SECRET_PATH".to_string(),
+        secret.display().to_string(),
+    );
+    write_lab_env_file(&vars)?;
+    match gmail_auth(&secret, &default_gmail_token_path(), false) {
+        Ok(result) => eprintln!(
+            "✓ Gmail skonfigurowany. Token: {}\n✓ GOOGLE_CLIENT_SECRET_PATH zapisany w {}\n",
+            result.token_file,
+            lab_env_file_path().display()
+        ),
+        Err(err) => eprintln!("✗ Błąd autoryzacji: {err}\n"),
+    }
+    Ok(())
+}
+
+fn onboard_configure_saldeo() -> Result<()> {
     eprintln!("── Saldeo ──");
-    if saldeo_valid {
-        eprintln!("✓ sesja aktywna\n");
-    } else {
-        if saldeo_exists {
-            eprintln!("✗ Sesja wygasła (401).");
-        } else {
-            eprintln!("✗ Brak pliku sesji.");
+    let target = preferred_saldeo_storage_state_path();
+    eprintln!("Domyślny plik sesji: {}", target.display());
+    eprintln!("Podaj plik Playwright storage state; zostanie skopiowany do domyślnej lokalizacji.");
+    let path: String = Input::new()
+        .with_prompt("Ścieżka storage state JSON")
+        .default(target.display().to_string())
+        .allow_empty(true)
+        .interact_text()?;
+    if path.trim().is_empty() {
+        eprintln!("⏭ Pominięto.\n");
+        return Ok(());
+    }
+    let source = PathBuf::from(path.trim());
+    if !source.exists() {
+        eprintln!("✗ Plik nie istnieje: {}\n", source.display());
+        return Ok(());
+    }
+    if source != target {
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
         }
-        eprintln!("Plik sesji: {}", saldeo_state.display());
-        eprintln!("Uruchom przeglądarkę Playwright, zaloguj się do Saldeo i zapisz storage state.\n");
+        fs::copy(&source, &target)
+            .with_context(|| format!("kopiowanie {} → {}", source.display(), target.display()))?;
+    }
+    save_saldeo_storage_state_secret(&target)?;
+    eprintln!(
+        "✓ Saldeo storage state zapisany: {}\n✓ Saldeo storage state zapisany w macOS Keychain (jeśli dostępny)\n",
+        target.display()
+    );
+    Ok(())
+}
+
+fn onboard_edit_env_path(name: &str) -> Result<()> {
+    if let Some(value) = prompt_env_path(name, lab_config_var(name))? {
+        let mut vars = read_lab_env_file().unwrap_or_default();
+        vars.insert(name.to_string(), value);
+        write_lab_env_file(&vars)?;
+        eprintln!("✓ Zapisano {name} w {}\n", lab_env_file_path().display());
+    } else {
+        eprintln!("⏭ Bez zmian.\n");
+    }
+    Ok(())
+}
+
+fn onboard_edit_env_secret(name: &str) -> Result<()> {
+    let current = lab_config_var(name).is_some();
+    let prompt = if current {
+        format!("{name} (ustawione; puste = bez zmian)")
+    } else {
+        format!("{name} (puste = bez zmian)")
+    };
+    let value = Password::new()
+        .with_prompt(prompt)
+        .allow_empty_password(true)
+        .interact()?;
+    if value.is_empty() {
+        eprintln!("⏭ Bez zmian.\n");
+        return Ok(());
+    }
+    let mut vars = read_lab_env_file().unwrap_or_default();
+    vars.insert(name.to_string(), value);
+    write_lab_env_file(&vars)?;
+    eprintln!("✓ Zapisano {name} w {}\n", lab_env_file_path().display());
+    Ok(())
+}
+
+fn run_saldeo_auth_script() -> Result<()> {
+    eprintln!("── Saldeo auth ──");
+    let target = preferred_saldeo_storage_state_path();
+    if !Confirm::new()
+        .with_prompt(format!(
+            "Uruchomić Playwright i zapisać auth do {}?",
+            target.display()
+        ))
+        .default(true)
+        .interact()?
+    {
+        eprintln!("⏭ Pominięto.\n");
+        return Ok(());
     }
 
-    // 3. KSeF API
-    eprintln!("── KSeF API ──");
-    if ksef_api_ok {
-        eprintln!("✓ wszystkie env vars ustawione\n");
-    } else {
-        eprintln!("Brakujące zmienne środowiskowe:");
-        if !ksef_cert_ok { eprintln!("  KSEF_CERT_PATH — ścieżka do certyfikatu .pem"); }
-        if !ksef_key_ok { eprintln!("  KSEF_KEY_PATH — ścieżka do klucza .key"); }
-        if !ksef_password_ok { eprintln!("  KSEF_CERT_PASSWORD — hasło do certyfikatu"); }
-        if !ksef_token_ok { eprintln!("  KSEF_TOKEN — token API"); }
-        if Confirm::new()
-            .with_prompt("Ustawić teraz interaktywnie?")
+    if let Some(script) = find_saldeo_auth_script() {
+        let status = Command::new(&script)
+            .arg(&target)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .with_context(|| format!("uruchomienie {}", script.display()))?;
+        if !status.success() {
+            return Err(anyhow!("skrypt Saldeo auth zakończył się błędem: {status}"));
+        }
+        save_saldeo_storage_state_secret(&target)?;
+        return Ok(());
+    }
+
+    eprintln!(
+        "Nie znalazłem scripts/saldeo-auth.sh — uruchamiam fallback przez npx playwright + Helium."
+    );
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    let url =
+        std::env::var("SALDEO_URL").unwrap_or_else(|_| "https://saldeo.brainshare.pl/".to_string());
+    let helium = std::env::var("HELIUM_EXECUTABLE")
+        .unwrap_or_else(|_| "/Applications/Helium.app/Contents/MacOS/Helium".to_string());
+    if !Path::new(&helium).is_file() {
+        return Err(anyhow!("nie znalazłem Helium executable: {helium}"));
+    }
+    let node_script = r#"
+const { chromium } = require('playwright');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const readline = require('readline');
+(async () => {
+  const out = process.env.LAB_SALDEO_STORAGE_STATE;
+  const url = process.env.SALDEO_URL || 'https://saldeo.brainshare.pl/';
+  const executablePath = process.env.HELIUM_EXECUTABLE;
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lab-helium-profile-'));
+  const context = await chromium.launchPersistentContext(userDataDir, { executablePath, headless: false, viewport: { width: 1400, height: 1000 } });
+  const page = context.pages()[0] || await context.newPage();
+  await page.goto(url, { waitUntil: 'domcontentloaded' });
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  await new Promise(resolve => rl.question('\nPo zalogowaniu naciśnij Enter, żeby zapisać auth... ', resolve));
+  rl.close();
+  await context.storageState({ path: out });
+  await context.close();
+  fs.rmSync(userDataDir, { recursive: true, force: true });
+})().catch(err => { console.error(err && err.stack ? err.stack : err); process.exit(1); });
+"#;
+    let status = Command::new("npx")
+        .arg("--yes")
+        .arg("-p")
+        .arg("playwright")
+        .arg("node")
+        .arg("-e")
+        .arg(node_script)
+        .env("LAB_SALDEO_STORAGE_STATE", &target)
+        .env("SALDEO_URL", &url)
+        .env("HELIUM_EXECUTABLE", &helium)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("uruchomienie npx playwright + Helium")?;
+    if !status.success() {
+        return Err(anyhow!("Playwright auth zakończył się błędem: {status}"));
+    }
+    if !target.exists() {
+        return Err(anyhow!(
+            "storage state nie został zapisany: {}",
+            target.display()
+        ));
+    }
+    save_saldeo_storage_state_secret(&target)?;
+    eprintln!("✓ Zapisano Saldeo auth: {}\n", target.display());
+    Ok(())
+}
+
+fn find_saldeo_auth_script() -> Option<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.extend(cwd.ancestors().map(Path::to_path_buf));
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        roots.extend(parent.ancestors().map(Path::to_path_buf));
+    }
+
+    for root in roots {
+        let script = root.join("scripts").join("saldeo-auth.sh");
+        if script.is_file() {
+            return Some(script);
+        }
+    }
+    None
+}
+
+fn prompt_env_path(name: &str, current: Option<String>) -> Result<Option<String>> {
+    let default = current.unwrap_or_default();
+    let value: String = Input::new()
+        .with_prompt(name)
+        .default(default)
+        .allow_empty(true)
+        .interact_text()?;
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if !Path::new(&value).exists() {
+        eprintln!("⚠ Plik nie istnieje: {value}");
+        if !Confirm::new()
+            .with_prompt("Zapisać mimo to?")
             .default(false)
             .interact()?
         {
-            eprintln!("Dodaj do ~/.zshrc (lub uruchom przed lab):");
-            if !ksef_cert_ok {
-                let val: String = Input::new()
-                    .with_prompt("KSEF_CERT_PATH")
-                    .default(ksef_cert.as_deref().unwrap_or("").to_string())
-                    .interact_text()?;
-                if !val.is_empty() && Path::new(&val).exists() {
-                    eprintln!("  export KSEF_CERT_PATH={val}");
-                }
-            }
-            if !ksef_key_ok {
-                let val: String = Input::new()
-                    .with_prompt("KSEF_KEY_PATH")
-                    .default(ksef_key.as_deref().unwrap_or("").to_string())
-                    .interact_text()?;
-                if !val.is_empty() && Path::new(&val).exists() {
-                    eprintln!("  export KSEF_KEY_PATH={val}");
-                }
-            }
-            if !ksef_password_ok {
-                let val = Password::new()
-                    .with_prompt("KSEF_CERT_PASSWORD")
-                    .allow_empty_password(true)
-                    .interact()?;
-                if !val.is_empty() {
-                    eprintln!("  export KSEF_CERT_PASSWORD='***'  # wpisz prawdziwe hasło");
-                }
-            }
-            if !ksef_token_ok {
-                let val = Password::new()
-                    .with_prompt("KSEF_TOKEN")
-                    .allow_empty_password(true)
-                    .interact()?;
-                if !val.is_empty() {
-                    eprintln!("  export KSEF_TOKEN='***'  # wpisz prawdziwy token");
-                }
-            }
+            return Ok(None);
         }
-        eprintln!();
     }
+    Ok(Some(value))
+}
 
-    // 4. KSeF dane
+fn onboard_configure_ksef_data(current_year: i32) -> Result<()> {
     eprintln!("── KSeF dane ──");
-    if ksef_data_exists {
-        eprintln!("✓ {}\n", ksef_dir.display());
-    } else {
-        eprintln!("✗ Brak lokalnego eksportu: {}", ksef_dir.display());
-        eprintln!("Umieść tam pliki XML/JSON z KSeF i uruchom: lab sync --ksef\n");
+    let year_text: String = Input::new()
+        .with_prompt("Rok eksportu KSeF")
+        .default(current_year.to_string())
+        .interact_text()?;
+    let year = year_text.trim().parse::<i32>().unwrap_or(current_year);
+    let default_dir = configured_ksef_out_path(year);
+    let dir_text: String = Input::new()
+        .with_prompt("Katalog eksportu KSeF XML/JSON")
+        .default(default_dir.display().to_string())
+        .interact_text()?;
+    let dir = PathBuf::from(dir_text.trim());
+    if !dir.exists()
+        && Confirm::new()
+            .with_prompt("Katalog nie istnieje. Utworzyć?")
+            .default(true)
+            .interact()?
+    {
+        fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
+        eprintln!("✓ Utworzono: {}", dir.display());
     }
+    let mut vars = read_lab_env_file().unwrap_or_default();
+    vars.insert("KSEF_DATA_DIR".to_string(), dir.display().to_string());
+    write_lab_env_file(&vars)?;
+    eprintln!(
+        "✓ Zapisano KSEF_DATA_DIR w {}",
+        lab_env_file_path().display()
+    );
+    eprintln!("Umieść eksport KSeF w: {}", dir.display());
+    eprintln!(
+        "Synchronizacja: lab sync --ksef --year {year} --ksef-input {}\n",
+        dir.display()
+    );
+    Ok(())
+}
 
-    // 5. Podsumowanie
-    let all_ok = pdftotext_ok && python_ok && gmail_authed && saldeo_valid && ksef_api_ok && ksef_data_exists;
-    eprintln!("═══ Podsumowanie ═══");
-    if all_ok {
-        eprintln!("Wszystko gotowe. Uruchom: lab sync");
-    } else {
-        let mut missing = Vec::new();
-        if !pdftotext_ok { missing.push("pdftotext"); }
-        if !gmail_authed { missing.push("Gmail"); }
-        if !saldeo_valid { missing.push("Saldeo"); }
-        if !ksef_api_ok { missing.push("KSeF API"); }
-        if !ksef_data_exists { missing.push("KSeF dane"); }
-        eprintln!("Do skonfigurowania: {}", missing.join(", "));
-        eprintln!("Uruchom `lab onboard` ponownie, aby dokończyć.");
+fn lab_config_var(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| read_lab_env_file().ok()?.remove(name))
+}
+
+fn preferred_saldeo_storage_state_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config")
+        .join("lab")
+        .join("saldeo-storage-state.json")
+}
+
+fn lab_env_file_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config")
+        .join("lab")
+        .join("env")
+}
+
+fn read_lab_env_file() -> Result<HashMap<String, String>> {
+    let path = lab_env_file_path();
+    if !path.exists() {
+        return Ok(HashMap::new());
     }
+    let text = fs::read_to_string(&path).with_context(|| format!("odczyt {}", path.display()))?;
+    let mut vars = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        vars.insert(key.trim().to_string(), unquote_env_value(value.trim()));
+    }
+    Ok(vars)
+}
 
-    write_json(&serde_json::json!({"all_ok": all_ok}), None)
+fn write_lab_env_file(vars: &HashMap<String, String>) -> Result<()> {
+    let path = lab_env_file_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    let mut keys = vars.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    let mut out = String::from(
+        "# LAB local environment. Source it with: set -a; source ~/.config/lab/env; set +a\n",
+    );
+    for key in keys {
+        if let Some(value) = vars.get(&key) {
+            out.push_str(&format!("{}={}\n", key, quote_env_value(value)));
+        }
+    }
+    fs::write(&path, out).with_context(|| format!("zapis {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 600 {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn quote_env_value(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn unquote_env_value(value: &str) -> String {
+    if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+        value[1..value.len() - 1].replace("'\\''", "'")
+    } else if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        value[1..value.len() - 1].to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn save_saldeo_storage_state_secret(storage_state: &Path) -> Result<()> {
+    if let Ok(text) = fs::read_to_string(storage_state)
+        && keychain_set_secret(KEYCHAIN_ACCOUNT_SALDEO_STORAGE_STATE, &text)?
+    {
+        return Ok(());
+    }
+    Ok(())
+}
+
+fn read_saldeo_storage_state(storage_state: &Path) -> Result<String> {
+    if let Some(text) = keychain_get_secret(KEYCHAIN_ACCOUNT_SALDEO_STORAGE_STATE)? {
+        return Ok(text);
+    }
+    fs::read_to_string(storage_state)
+        .with_context(|| format!("odczyt sesji Saldeo {}", storage_state.display()))
 }
 
 fn saldeo_session_valid(storage_state: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(storage_state) else {
+    let Ok(text) = read_saldeo_storage_state(storage_state) else {
         return false;
     };
     let Ok(storage): Result<Value, _> = serde_json::from_str(&text) else {
@@ -4062,7 +5323,7 @@ fn doctor(token_env: &str) -> Result<()> {
         "pdftotext_present": pdftotext_ok,
         "notes": [
             "GmailFetch wymaga tokenu OAuth z zakresem gmail.readonly.",
-            "PDF-y są parsowane przez pdftotext; bez niego program nadal obsłuży XML/JSON/TXT/EML."
+            "PDF-y są parsowane przez pdftotext, potem PyMuPDF/pdfplumber/pypdf jako fallback."
         ]
     });
     write_json(&status, None)
@@ -4113,5 +5374,14 @@ mod tests {
         assert_eq!(record.seller_tax_id.as_deref(), Some("5210000001"));
         assert_eq!(record.gross_amount_minor, Some(9990));
         assert_eq!(record.currency.as_deref(), Some("PLN"));
+    }
+
+    #[test]
+    fn productmesh_filter_normalizes_input_nip() {
+        let mut record = empty_record(SourceKind::Mail);
+        record.invoice_number = Some("FV/1/2026".into());
+        record.buyer_tax_id = Some("5242920020".into());
+        let candidates = productmesh_invoice_candidates(&[record], "PL 524-292-00-20");
+        assert_eq!(candidates.len(), 1);
     }
 }
