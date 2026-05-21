@@ -118,7 +118,7 @@ Konfiguracja w `mcp/lab-mcp.example.json`.
 ## Pozostałe
 
 - `lab db` — init, stats, list, tri-runs
-- `lab doctor` — diagnostyka (pdftotext, GMAIL_ACCESS_TOKEN)
+- `lab doctor` — diagnostyka Gmail, Saldeo, KSeF online, DB i domyślnych źródeł reconcile
 
 ## Model dopasowania (max 100 pkt)
 
@@ -135,5 +135,5 @@ lab reconcile --review-score 50 ...
 ## Uwagi
 
 - Tokeny/auth nie są zapisywane w repo. Na macOS LAB zapisuje Gmail token i Saldeo storage state w Keychain; pliki `~/.config/lab/gmail_token.json` / `~/.config/lab/saldeo-storage-state.json` są fallbackiem lub wejściem migracyjnym.
-- KSeF: lokalny eksport XML/JSON, domyślnie `data/ksef-<rok>/`
+- KSeF: domyślnie online API v2 (`KSEF_TOKEN`, opcjonalnie `KSEF_CONTEXT_NIP`/`KSEF_ENV`/`KSEF_BASE_URL`); metadane są cache’owane w `data/ksef-<rok>/` albo `KSEF_DATA_DIR`.
 - Upload do Saldeo: `generate-urls-for-upload` → `PUT` signed URL → `confirm`
