@@ -987,6 +987,7 @@ dependencies = [
  "csv",
  "dialoguer",
  "hex",
+ "libc",
  "ratatui",
  "regex",
  "reqwest",

@@ -24,6 +24,7 @@ use std::io::{self, BufRead, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
 use walkdir::WalkDir;
@@ -31,6 +32,7 @@ use walkdir::WalkDir;
 const KEYCHAIN_SERVICE: &str = "lab-cli";
 const KEYCHAIN_ACCOUNT_GMAIL_TOKEN: &str = "gmail_token";
 const KEYCHAIN_ACCOUNT_SALDEO_STORAGE_STATE: &str = "saldeo_storage_state";
+const DEFAULT_PRODUCTMESH_NIP: &str = "5242920020";
 
 #[derive(Parser, Debug)]
 #[command(name = "lab-cli")]
@@ -79,7 +81,7 @@ enum Commands {
         #[arg(long)]
         gmail_token_file: Option<PathBuf>,
         /// NIP do filtrowania PDF-ów z Gmaila.
-        #[arg(long, default_value = "5242920020")]
+        #[arg(long, default_value = DEFAULT_PRODUCTMESH_NIP)]
         productmesh_nip: String,
         /// Zapisz rekordy do SQLite.
         #[arg(long)]
@@ -334,6 +336,137 @@ struct TemporalDiffSummary {
     changed_count: usize,
 }
 
+#[derive(Debug, Serialize)]
+struct SyncRunSummary {
+    synced: Vec<String>,
+    year: i32,
+    stored: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_sync_sources(
+    year: i32,
+    ksef: bool,
+    mail: bool,
+    saldeo: bool,
+    ksef_input: Option<&Path>,
+    gmail_client_secret: Option<&Path>,
+    gmail_token_file: Option<&Path>,
+    productmesh_nip: &str,
+    conn: Option<&Connection>,
+) -> Result<SyncRunSummary> {
+    let all = !ksef && !mail && !saldeo;
+    if all {
+        eprintln!("Sync: wszystkie źródła (KSeF + Gmail/PDF + Saldeo)");
+    }
+    let stored = conn.is_some();
+    let mut synced: Vec<String> = Vec::new();
+
+    if ksef || all {
+        eprintln!("  [KSeF] synchronizacja...");
+        let input = ksef_input
+            .map(PathBuf::from)
+            .unwrap_or_else(|| configured_ksef_out_path(year));
+        let result = ksef_sync(year, &input, None)?;
+        if let Some(conn) = conn {
+            store_records(conn, &result.records)?;
+        }
+        eprintln!("  [KSeF] gotowe: {} rekordów", result.summary.records_count);
+        synced.push(format!("ksef ({})", result.summary.records_count));
+    }
+
+    if mail || all {
+        eprintln!("  [Gmail] sprawdzanie wiadomości i cache załączników...");
+        let token_path = gmail_token_file
+            .map(PathBuf::from)
+            .unwrap_or_else(default_gmail_token_path);
+        let token = gmail_access_token("GMAIL_ACCESS_TOKEN", &token_path, gmail_client_secret)?;
+        let mail_out = default_mail_out_path(year);
+        let gmail_result = gmail_fetch(
+            &token,
+            "me",
+            &default_gmail_query(year),
+            &mail_out,
+            500,
+            &["pdf".to_string()],
+        )?;
+        eprintln!(
+            "  [Gmail] wiadomości: {} znalezionych, {} z cache, {} pobranych z API; nowe pliki: {} metadane, {} załączniki",
+            gmail_result.messages_seen,
+            gmail_result.messages_cached,
+            gmail_result.messages_fetched,
+            gmail_result.metadata_saved,
+            gmail_result.attachments_saved
+        );
+        eprintln!("  [Gmail] skanowanie nowych PDF...");
+        let (mail_records, parsed_count) = sync_mail_records(&mail_out, &gmail_result.saved_files)?;
+        eprintln!("  [Gmail] sparsowano {} nowych PDF", parsed_count);
+        let mut candidates = productmesh_invoice_candidates(&mail_records, productmesh_nip);
+        let cached_candidates = apply_cached_mail_candidates(year, &mut candidates)?;
+        enrich_candidates_with_gemma(&mut candidates, &cached_candidates, None)?;
+        write_records(
+            &candidates,
+            OutputFormat::Jsonl,
+            Some(&default_mail_candidates_path(year)),
+        )?;
+        if let Some(conn) = conn {
+            store_records(conn, &candidates)?;
+        }
+        eprintln!(
+            "  [Gmail] gotowe: {} PDF, {} faktur",
+            mail_records.len(),
+            candidates.len()
+        );
+        synced.push(format!(
+            "mail ({} new attachments, {} pdfs, {} candidates)",
+            gmail_result.attachments_saved,
+            mail_records.len(),
+            candidates.len()
+        ));
+    }
+
+    if saldeo || all {
+        eprintln!("  [Saldeo] pobieranie dokumentów...");
+        let result = saldeo_fetch(
+            year,
+            &default_saldeo_storage_state_path(),
+            &default_saldeo_out_path(year),
+        )?;
+        if let Some(conn) = conn {
+            store_records(conn, &result.records)?;
+        }
+        eprintln!(
+            "  [Saldeo] gotowe: {} dokumentów",
+            result.summary.documents_count
+        );
+        synced.push(format!("saldeo ({})", result.summary.documents_count));
+    }
+
+    Ok(SyncRunSummary {
+        synced,
+        year,
+        stored,
+    })
+}
+
+fn sync_reconcile_metadata(year: i32, ksef: bool, saldeo: bool) -> Result<()> {
+    if ksef {
+        eprintln!("  [KSeF] odświeżanie metadanych reconcile...");
+        let ksef_input = configured_ksef_out_path(year);
+        ksef_sync(year, &ksef_input, None)?;
+    }
+
+    if saldeo {
+        eprintln!("  [Saldeo] pobieranie metadanych reconcile...");
+        saldeo_fetch(
+            year,
+            &default_saldeo_storage_state_path(),
+            &default_saldeo_out_path(year),
+        )?;
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let db_path = cli.db;
@@ -358,103 +491,23 @@ fn main() -> Result<()> {
             productmesh_nip,
             store,
         } => {
-            let all = !ksef && !mail && !saldeo;
-            if all {
-                eprintln!("Sync: wszystkie źródła (KSeF + Gmail/PDF + Saldeo)");
-            }
             let conn = if store {
                 Some(open_db(&db_path)?)
             } else {
                 None
             };
-            let mut synced: Vec<String> = Vec::new();
-            if ksef || all {
-                eprintln!("  [KSeF] synchronizacja...");
-                let input = ksef_input
-                    .clone()
-                    .unwrap_or_else(|| configured_ksef_out_path(year));
-                let result = ksef_sync(year, &input, None)?;
-                if let Some(ref conn) = conn {
-                    store_records(conn, &result.records)?;
-                }
-                eprintln!("  [KSeF] gotowe: {} rekordów", result.summary.records_count);
-                synced.push(format!("ksef ({})", result.summary.records_count));
-            }
-            if mail || all {
-                eprintln!("  [Gmail] sprawdzanie wiadomości i cache załączników...");
-                let token_path = gmail_token_file
-                    .clone()
-                    .unwrap_or_else(default_gmail_token_path);
-                let token = gmail_access_token(
-                    "GMAIL_ACCESS_TOKEN",
-                    &token_path,
-                    gmail_client_secret.as_deref(),
-                )?;
-                let mail_out = default_mail_out_path(year);
-                let gmail_result = gmail_fetch(
-                    &token,
-                    "me",
-                    &default_gmail_query(year),
-                    &mail_out,
-                    500,
-                    &["pdf".to_string()],
-                )?;
-                eprintln!(
-                    "  [Gmail] wiadomości: {} znalezionych, {} z cache, {} pobranych z API; nowe pliki: {} metadane, {} załączniki",
-                    gmail_result.messages_seen,
-                    gmail_result.messages_cached,
-                    gmail_result.messages_fetched,
-                    gmail_result.metadata_saved,
-                    gmail_result.attachments_saved
-                );
-                eprintln!("  [Gmail] skanowanie nowych PDF...");
-                let (mail_records, parsed_count) =
-                    sync_mail_records(&mail_out, &gmail_result.saved_files)?;
-                eprintln!("  [Gmail] sparsowano {} nowych PDF", parsed_count);
-                let mut candidates =
-                    productmesh_invoice_candidates(&mail_records, &productmesh_nip);
-                let cached_candidates = apply_cached_mail_candidates(year, &mut candidates)?;
-                enrich_candidates_with_gemma(&mut candidates, &cached_candidates)?;
-                write_records(
-                    &candidates,
-                    OutputFormat::Jsonl,
-                    Some(&default_mail_candidates_path(year)),
-                )?;
-                if let Some(ref conn) = conn {
-                    store_records(conn, &candidates)?;
-                }
-                eprintln!(
-                    "  [Gmail] gotowe: {} PDF, {} faktur",
-                    mail_records.len(),
-                    candidates.len()
-                );
-                synced.push(format!(
-                    "mail ({} new attachments, {} pdfs, {} candidates)",
-                    gmail_result.attachments_saved,
-                    mail_records.len(),
-                    candidates.len()
-                ));
-            }
-            if saldeo || all {
-                eprintln!("  [Saldeo] pobieranie dokumentów...");
-                let result = saldeo_fetch(
-                    year,
-                    &default_saldeo_storage_state_path(),
-                    &default_saldeo_out_path(year),
-                )?;
-                if let Some(ref conn) = conn {
-                    store_records(conn, &result.records)?;
-                }
-                eprintln!(
-                    "  [Saldeo] gotowe: {} dokumentów",
-                    result.summary.documents_count
-                );
-                synced.push(format!("saldeo ({})", result.summary.documents_count));
-            }
-            write_json(
-                &serde_json::json!({"synced": synced, "year": year, "stored": store}),
-                None,
+            let summary = run_sync_sources(
+                year,
+                ksef,
+                mail,
+                saldeo,
+                ksef_input.as_deref(),
+                gmail_client_secret.as_deref(),
+                gmail_token_file.as_deref(),
+                &productmesh_nip,
+                conn.as_ref(),
             )?;
+            write_json(&summary, None)?;
         }
         Commands::Reconcile {
             status,
@@ -476,6 +529,9 @@ fn main() -> Result<()> {
                 }
                 return write_reconcile_human(&report, None);
             }
+            let refresh_ksef = ksef.is_none();
+            let refresh_saldeo = saldeo.is_none();
+            sync_reconcile_metadata(year, refresh_ksef, refresh_saldeo)?;
             let mail_path = mail.unwrap_or_else(|| default_mail_candidates_path(year));
             let ksef_path = ksef.unwrap_or_else(|| configured_ksef_out_path(year));
             let saldeo_path = saldeo.unwrap_or_else(|| default_saldeo_records_path(year));
@@ -539,16 +595,16 @@ fn main() -> Result<()> {
         }
         Commands::Mcp => run_mcp_server(&db_path)?,
         Commands::Db { command } => handle_db_command(&db_path, command)?,
-        Commands::Doctor { token_env } => doctor(&token_env)?,
+        Commands::Doctor { token_env } => doctor(&db_path, &token_env)?,
     }
     Ok(())
 }
 
-fn interactive_tui(_db_path: &Path) -> Result<()> {
-    interactive_reconcile_actions()
+fn interactive_tui(db_path: &Path) -> Result<()> {
+    interactive_reconcile_actions(db_path)
 }
 
-fn interactive_reconcile_actions() -> Result<()> {
+fn interactive_reconcile_actions(db_path: &Path) -> Result<()> {
     let theme = ColorfulTheme::default();
     let mut year: i32 = 2026;
     let mut review_score: u8 = 70;
@@ -560,17 +616,12 @@ fn interactive_reconcile_actions() -> Result<()> {
             TuiResult::Cancel => return Ok(()),
             TuiResult::Doctor => {
                 eprintln!("  [LAB] diagnostyka...");
-                doctor("GMAIL_ACCESS_TOKEN")?;
+                doctor(db_path, "GMAIL_ACCESS_TOKEN")?;
             }
             TuiResult::Onboard => {
                 eprintln!("  [LAB] konfiguracja...");
-                onboard(&PathBuf::from("lab.sqlite"), false, None)?;
+                onboard(db_path, false, None)?;
             }
-            TuiResult::SaldeoAuth => {
-                eprintln!("  [LAB] odświeżanie sesji Saldeo...");
-                run_saldeo_auth_script()?;
-            }
-            _ => {}
         }
     }
 
@@ -650,12 +701,8 @@ fn interactive_reconcile_actions() -> Result<()> {
 enum TuiResult {
     Commit,
     Cancel,
-    Rebuild { year: i32, threshold: u8 },
-    Sync { year: i32 },
-    Llm { year: i32 },
     Doctor,
     Onboard,
-    SaldeoAuth,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -728,12 +775,7 @@ fn invoice_table_row_from_reconcile_row(
     row: &TriRow,
     ksef_statuses: &HashMap<i64, Option<bool>>,
 ) -> Option<InvoiceTableRow> {
-    let record = row
-        .mail
-        .as_ref()
-        .or(row.ksef.as_ref())
-        .or(row.saldeo.as_ref())?
-        .clone();
+    let record = tri_row_display_record(row)?;
     let upload_item = row.mail.as_ref().and_then(|mail| {
         if row.saldeo.is_some() {
             return None;
@@ -789,6 +831,31 @@ fn invoice_table_counts(rows: &[InvoiceTableRow]) -> (usize, usize, usize, usize
     (u, a, r, s)
 }
 
+struct PendingAction {
+    receiver: std::sync::mpsc::Receiver<Result<Vec<InvoiceTableRow>>>,
+    description: String,
+    new_year: Option<i32>,
+    new_review_score: Option<u8>,
+    progress: Arc<Mutex<String>>,
+}
+
+/// Redirect stderr to a log file for the current thread.
+fn redirect_stderr_to_log() {
+    let log_path = std::env::var("LAB_LOG").unwrap_or_else(|_| "/tmp/lab.log".to_string());
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        use std::os::unix::io::IntoRawFd;
+        let fd = file.into_raw_fd();
+        unsafe {
+            libc::dup2(fd, libc::STDERR_FILENO);
+            libc::close(fd);
+        }
+    }
+}
+
 fn run_invoice_table_tui(
     rows: &mut Vec<InvoiceTableRow>,
     year: &mut i32,
@@ -804,116 +871,72 @@ fn run_invoice_table_tui(
     let mut menu_open: bool = false;
     let mut spinner_frame: usize = 0;
     let mut status_message: String = String::new();
-    let mut pending_action: Option<TuiResult> = None;
+    let mut pending_action: Option<PendingAction> = None;
     let mut loop_result: Result<TuiResult> = Ok(TuiResult::Cancel);
 
     // Main menu
     const MI_SYNC: usize = 0;
-    const MI_REFRESH: usize = 1;
-    const MI_RECONCILE: usize = 2;
-    const MI_LLM: usize = 3;
-    const MI_UPLOAD: usize = 4;
-    const MI_APPROVE: usize = 5;
-    const MI_REJECT: usize = 6;
-    const MI_CLEAR: usize = 7;
+    const MI_RECONCILE: usize = 1;
+    const MI_LLM: usize = 2;
+    const MI_UPLOAD: usize = 3;
+    const MI_APPROVE: usize = 4;
+    const MI_REJECT: usize = 5;
+    const MI_CLEAR: usize = 6;
+    const MI_COMMIT: usize = 7;
     const MI_MENU: usize = 8;
     const MAIN_COUNT: usize = 9;
     // Submenu (when menu_open)
-    const SM_SALDEO: usize = 0;
-    const SM_YEAR: usize = 1;
-    const SM_THRESHOLD: usize = 2;
-    const SM_DOCTOR: usize = 3;
-    const SM_ONBOARD: usize = 4;
+    const SM_DOCTOR: usize = 0;
+    const SM_ONBOARD: usize = 1;
+    const SM_YEAR: usize = 2;
+    const SM_THRESHOLD: usize = 3;
+    const SM_SALDEO: usize = 4;
     const SM_BACK: usize = 5;
     const SUB_COUNT: usize = 6;
 
-    loop {
-        spinner_frame = spinner_frame.wrapping_add(1);
+    let tick_rate = std::time::Duration::from_millis(100);
+    let mut last_tick = std::time::Instant::now();
 
-        // Execute pending action if any
-        if let Some(action) = pending_action.take() {
-            match action {
-                TuiResult::Sync { year: y } => {
-                    status_message = format!("Sync Gmail dla roku {y}...");
-                    terminal
-                        .draw(|f| {
-                            f.render_widget(Paragraph::new(status_message.as_str()), f.area());
-                        })
-                        .ok();
-                    match (|| -> Result<Vec<InvoiceTableRow>> {
-                        let token_path = default_gmail_token_path();
-                        let token = gmail_access_token("GMAIL_ACCESS_TOKEN", &token_path, None)?;
-                        let mail_out = default_mail_out_path(y);
-                        gmail_fetch(
-                            &token,
-                            "me",
-                            &default_gmail_query(y),
-                            &mail_out,
-                            500,
-                            &["pdf".to_string()],
-                        )?;
-                        sync_mail_records(&mail_out, &[])?;
-                        build_invoice_table_rows(y, *review_score)
-                    })() {
-                        Ok(new_rows) => {
-                            *year = y;
-                            *rows = new_rows;
-                            status_message = format!("Sync zakończony: {} faktur", rows.len());
-                        }
-                        Err(e) => status_message = format!("Błąd sync: {e}"),
+    loop {
+        // Check pending async action
+        if let Some(ref pending) = pending_action {
+            match pending.receiver.try_recv() {
+                Ok(Ok(new_rows)) => {
+                    if let Some(y) = pending.new_year {
+                        *year = y;
                     }
-                }
-                TuiResult::Llm { year: y } => {
-                    status_message = format!("LLM wzbogacanie dla roku {y}...");
-                    terminal
-                        .draw(|f| {
-                            f.render_widget(Paragraph::new(status_message.as_str()), f.area());
-                        })
-                        .ok();
-                    match (|| -> Result<Vec<InvoiceTableRow>> {
-                        let mail_path = default_mail_candidates_path(y);
-                        if mail_path.exists() {
-                            let mut candidates = load_records(SourceKind::Mail, &mail_path)?;
-                            let cached = apply_cached_mail_candidates(y, &mut candidates)?;
-                            enrich_candidates_with_gemma(&mut candidates, &cached)?;
-                            write_records(
-                                &candidates,
-                                OutputFormat::Jsonl,
-                                Some(&default_mail_candidates_path(y)),
-                            )?;
-                        }
-                        build_invoice_table_rows(y, *review_score)
-                    })() {
-                        Ok(new_rows) => {
-                            *rows = new_rows;
-                            status_message = format!("LLM zakończony: {} faktur", rows.len());
-                        }
-                        Err(e) => status_message = format!("Błąd LLM: {e}"),
+                    if let Some(t) = pending.new_review_score {
+                        *review_score = t;
                     }
+                    *rows = new_rows;
+                    status_message = format!(
+                        "✓ {} zakończone: {} faktur",
+                        pending.description,
+                        rows.len()
+                    );
+                    pending_action = None;
+                    table_sel = 0;
                 }
-                TuiResult::Rebuild {
-                    year: y,
-                    threshold: t,
-                } => {
-                    status_message = format!("Przebudowa tabeli (rok {y}, próg {t})...");
-                    terminal
-                        .draw(|f| {
-                            f.render_widget(Paragraph::new(status_message.as_str()), f.area());
-                        })
-                        .ok();
-                    match build_invoice_table_rows(y, t) {
-                        Ok(new_rows) => {
-                            *year = y;
-                            *review_score = t;
-                            *rows = new_rows;
-                            status_message = format!("Tabela odświeżona: {} faktur", rows.len());
-                        }
-                        Err(e) => status_message = format!("Błąd: {e}"),
-                    }
+                Ok(Err(e)) => {
+                    status_message = format!("✗ Błąd {}: {e}", pending.description);
+                    pending_action = None;
+                    table_sel = 0;
                 }
-                _ => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Still running
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    status_message = format!("✗ Błąd {}: wątek przerwany", pending.description);
+                    pending_action = None;
+                    table_sel = 0;
+                }
             }
-            table_sel = 0;
+        }
+
+        // Tick spinner every 100ms
+        if last_tick.elapsed() >= tick_rate {
+            spinner_frame = spinner_frame.wrapping_add(1);
+            last_tick = std::time::Instant::now();
         }
 
         let visible = rows
@@ -958,7 +981,15 @@ fn run_invoice_table_tui(
             );
             let table_rows = visible.iter().map(|vidx| {
                 let row = &rows[*vidx];
-                let sel_mark = if row.selected { "[*]" } else { "[ ]" };
+                let sel_mark = if pending_action.is_some() && row.selected {
+                    let spinner_chars = ['◐', '◓', '◑', '◒'];
+                    let spin = spinner_chars[spinner_frame % spinner_chars.len()];
+                    format!("[{}]", spin)
+                } else if row.selected {
+                    "[*]".to_string()
+                } else {
+                    "[ ]".to_string()
+                };
                 let style = match row.action {
                     InvoiceTableAction::Upload => Style::default().fg(Color::Cyan),
                     InvoiceTableAction::ApproveKsef => Style::default().fg(Color::Green),
@@ -1030,11 +1061,9 @@ fn run_invoice_table_tui(
                 .unwrap_or_else(|| review_score.to_string());
             let mkbtn = |label: &str, idx: usize, editing: bool| {
                 let text = if editing {
-                    format!("[{}_]", label)
-                } else if idx == menu_sel {
-                    format!("[ {} ]", label)
+                    format!("[ {}_ ]", label)
                 } else {
-                    format!("  {}  ", label)
+                    format!("[ {} ]", label)
                 };
                 let style = if idx == menu_sel || editing {
                     Style::default()
@@ -1042,13 +1071,16 @@ fn run_invoice_table_tui(
                         .bg(Color::White)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::White)
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM)
                 };
                 ratatui::text::Line::styled(text, style)
             };
             if menu_open {
                 let items = [
-                    mkbtn("Saldeo", SM_SALDEO, false),
+                    mkbtn("Doctor", SM_DOCTOR, false),
+                    mkbtn("Onboard", SM_ONBOARD, false),
                     mkbtn(
                         &format!("Rok:{}", year_text),
                         SM_YEAR,
@@ -1059,73 +1091,94 @@ fn run_invoice_table_tui(
                         SM_THRESHOLD,
                         editing_threshold.is_some(),
                     ),
-                    mkbtn("Doctor", SM_DOCTOR, false),
-                    mkbtn("Onboard", SM_ONBOARD, false),
+                    mkbtn("Saldeo", SM_SALDEO, false),
                     mkbtn("◀ Wróć", SM_BACK, false),
                 ];
-                let menu_area = Layout::horizontal([
-                    Constraint::Fill(1),
-                    Constraint::Length(12),
-                    Constraint::Length(1),
-                    Constraint::Length(12),
-                    Constraint::Length(1),
-                    Constraint::Length(10),
-                    Constraint::Length(1),
-                    Constraint::Length(10),
-                    Constraint::Length(1),
-                    Constraint::Length(12),
-                    Constraint::Length(1),
-                    Constraint::Length(13),
-                ])
-                .split(chunks[1]);
+                let mut sub_constraints = vec![Constraint::Fill(1)];
+                for (i, line) in items.clone().iter().enumerate() {
+                    let width = line.width() as u16;
+                    sub_constraints.push(Constraint::Length(width));
+                    if i < items.len() - 1 {
+                        sub_constraints.push(Constraint::Length(1));
+                    }
+                }
+                let menu_area = Layout::horizontal(sub_constraints).split(chunks[1]);
                 for (i, line) in items.into_iter().enumerate() {
                     frame.render_widget(Paragraph::new(line), menu_area[i * 2 + 1]);
                 }
             } else {
                 let items = [
                     mkbtn("Sync", MI_SYNC, false),
-                    mkbtn("Refresh", MI_REFRESH, false),
                     mkbtn("Reconcile", MI_RECONCILE, false),
                     mkbtn("LLM", MI_LLM, false),
                     mkbtn("Upload", MI_UPLOAD, false),
                     mkbtn("Zatwierdź", MI_APPROVE, false),
                     mkbtn("Odrzuć", MI_REJECT, false),
                     mkbtn("Wyczyść", MI_CLEAR, false),
+                    mkbtn("Akceptuj", MI_COMMIT, false),
                     mkbtn("☰ Menu", MI_MENU, false),
                 ];
-                let menu_area = Layout::horizontal([
-                    Constraint::Length(11),
-                    Constraint::Length(1),
-                    Constraint::Length(13),
-                    Constraint::Length(1),
-                    Constraint::Length(14),
-                    Constraint::Length(1),
-                    Constraint::Length(10),
-                    Constraint::Length(1),
-                    Constraint::Length(12),
-                    Constraint::Length(1),
-                    Constraint::Length(14),
-                    Constraint::Length(1),
-                    Constraint::Length(12),
-                    Constraint::Length(1),
-                    Constraint::Length(12),
-                    Constraint::Fill(1),
-                    Constraint::Length(12),
-                ])
-                .split(chunks[1]);
+                let mut main_constraints = vec![];
+                for (i, line) in items.clone().iter().enumerate() {
+                    let width = line.width() as u16;
+                    main_constraints.push(Constraint::Length(width));
+                    if i < items.len() - 2 {
+                        main_constraints.push(Constraint::Length(1));
+                    } else if i == items.len() - 2 {
+                        // Gap before Menu is Fill to push it right
+                        main_constraints.push(Constraint::Fill(1));
+                    }
+                }
+                let menu_area = Layout::horizontal(main_constraints).split(chunks[1]);
+                let item_count = items.len();
                 for (i, line) in items.into_iter().enumerate() {
-                    frame.render_widget(Paragraph::new(line), menu_area[i * 2]);
+                    let area_idx = if i == item_count - 1 {
+                        menu_area.len() - 1
+                    } else {
+                        i * 2
+                    };
+                    frame.render_widget(Paragraph::new(line), menu_area[area_idx]);
                 }
             }
             // Status bar
-            if !status_message.is_empty() {
-                let spinner_chars = ['|', '/', '-', '\\'];
-                let spin = spinner_chars[spinner_frame % spinner_chars.len()];
+            let active_msg = if let Some(ref pending) = pending_action {
+                let progress = pending.progress.lock().unwrap();
+                if progress.is_empty() {
+                    status_message.clone()
+                } else {
+                    progress.clone()
+                }
+            } else if !status_message.is_empty() {
+                status_message.clone()
+            } else {
+                String::new()
+            };
+            if !active_msg.is_empty() {
+                let (prefix, color) = if active_msg.starts_with("✓") {
+                    ("".to_string(), Color::Green)
+                } else if active_msg.starts_with("✗") {
+                    ("".to_string(), Color::Red)
+                } else if pending_action.is_some() {
+                    let spinner_chars = ['◐', '◓', '◑', '◒'];
+                    let spin = spinner_chars[spinner_frame % spinner_chars.len()];
+                    (spin.to_string(), Color::Yellow)
+                } else {
+                    ("".to_string(), Color::Yellow)
+                };
+                let full_text = if prefix.is_empty() {
+                    format!(" {}", active_msg)
+                } else {
+                    format!(" {} {}", prefix, active_msg)
+                };
+                let max_width = chunks[2].width as usize;
+                let display_text = if full_text.chars().count() > max_width {
+                    format!("{}...", &full_text[..max_width.saturating_sub(3)])
+                } else {
+                    full_text
+                };
                 let line = ratatui::text::Line::styled(
-                    format!(" {} {}", spin, status_message),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
+                    display_text,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
                 );
                 frame.render_widget(Paragraph::new(line), chunks[2]);
             }
@@ -1140,15 +1193,7 @@ fn run_invoice_table_tui(
                 visible.len(),
                 rows.len()
             );
-            let filter = if actionable_only {
-                "[f] akcje"
-            } else {
-                "[f] wszystko"
-            };
-            let help = format!(
-                "{} | f=filtr  spc=toggle  ⏎=select  ⌘c=commit  q=wyjdź",
-                filter
-            );
+            let help = "f=filtr  spc=toggle  ⏎=select  ⌘c=commit  q=wyjdź".to_string();
             let stats_span = ratatui::text::Span::styled(
                 stats_text,
                 Style::default()
@@ -1174,216 +1219,438 @@ fn run_invoice_table_tui(
             break;
         }
 
-        let event = match event::read() {
-            Ok(event) => event,
-            Err(err) => {
-                loop_result = Err(anyhow!("terminal event: {err}"));
-                break;
-            }
-        };
-        let Event::Key(key) = event else { continue };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-        let cmd = key
-            .modifiers
-            .intersects(crossterm::event::KeyModifiers::SUPER)
-            || key
-                .modifiers
-                .intersects(crossterm::event::KeyModifiers::META);
-        let shift = key
-            .modifiers
-            .intersects(crossterm::event::KeyModifiers::SHIFT);
-
-        // Handle field editing
-        let editing = editing_year.is_some() || editing_threshold.is_some();
-        if editing {
-            let field = if editing_year.is_some() {
-                editing_year.as_mut()
-            } else {
-                editing_threshold.as_mut()
+        let timeout = tick_rate
+            .checked_sub(last_tick.elapsed())
+            .unwrap_or_else(|| std::time::Duration::from_secs(0));
+        if event::poll(timeout)? {
+            let Event::Key(key) = event::read()? else {
+                continue;
             };
-            match key.code {
-                KeyCode::Esc => {
-                    editing_year = None;
-                    editing_threshold = None;
-                }
-                KeyCode::Enter => {
-                    if let Some(val) = editing_year.take() {
-                        if let Ok(y) = val.parse::<i32>() {
-                            pending_action = Some(TuiResult::Rebuild {
-                                year: y,
-                                threshold: *review_score,
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            let cmd = key
+                .modifiers
+                .intersects(crossterm::event::KeyModifiers::SUPER)
+                || key
+                    .modifiers
+                    .intersects(crossterm::event::KeyModifiers::META);
+            let shift = key
+                .modifiers
+                .intersects(crossterm::event::KeyModifiers::SHIFT);
+
+            // Handle field editing
+            let editing = editing_year.is_some() || editing_threshold.is_some();
+            if editing {
+                let field = if editing_year.is_some() {
+                    editing_year.as_mut()
+                } else {
+                    editing_threshold.as_mut()
+                };
+                match key.code {
+                    KeyCode::Esc => {
+                        editing_year = None;
+                        editing_threshold = None;
+                    }
+                    KeyCode::Enter => {
+                        if let Some(val) = editing_year.take() {
+                            if let Ok(y) = val.parse::<i32>() {
+                                let score = *review_score;
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                let progress =
+                                    Arc::new(Mutex::new(format!("Przebudowa (rok {y})...")));
+                                std::thread::spawn(move || {
+                                    redirect_stderr_to_log();
+                                    let _ = tx.send(build_invoice_table_rows(y, score));
+                                });
+                                pending_action = Some(PendingAction {
+                                    receiver: rx,
+                                    description: "Rebuild".to_string(),
+                                    new_year: Some(y),
+                                    new_review_score: Some(score),
+                                    progress,
+                                });
+                            }
+                        } else if let Some(val) = editing_threshold.take()
+                            && let Ok(t) = val.parse::<u8>()
+                        {
+                            let y = *year;
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            let progress =
+                                Arc::new(Mutex::new(format!("Przebudowa (próg {t})...")));
+                            std::thread::spawn(move || {
+                                redirect_stderr_to_log();
+                                let _ = tx.send(build_invoice_table_rows(y, t));
+                            });
+                            pending_action = Some(PendingAction {
+                                receiver: rx,
+                                description: "Rebuild".to_string(),
+                                new_year: Some(y),
+                                new_review_score: Some(t),
+                                progress,
                             });
                         }
-                    } else if let Some(val) = editing_threshold.take()
-                        && let Ok(t) = val.parse::<u8>()
-                    {
-                        pending_action = Some(TuiResult::Rebuild {
-                            year: *year,
-                            threshold: t,
-                        });
+                    }
+                    KeyCode::Backspace => {
+                        if let Some(s) = field {
+                            s.pop();
+                        }
+                    }
+                    KeyCode::Char(c) if c.is_ascii_digit() => {
+                        if let Some(s) = field {
+                            s.push(c);
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            match key.code {
+                KeyCode::Char('q') => break,
+                KeyCode::Esc => {
+                    if menu_open {
+                        menu_open = false;
+                    } else {
+                        break;
                     }
                 }
-                KeyCode::Backspace => {
-                    if let Some(s) = field {
-                        s.pop();
+                KeyCode::Char('c') if cmd => {
+                    loop_result = Ok(TuiResult::Commit);
+                    break;
+                }
+                KeyCode::Enter if cmd => {
+                    loop_result = Ok(TuiResult::Commit);
+                    break;
+                }
+                KeyCode::Enter => {
+                    if menu_open {
+                        match menu_sel {
+                            SM_DOCTOR => {
+                                loop_result = Ok(TuiResult::Doctor);
+                                break;
+                            }
+                            SM_ONBOARD => {
+                                loop_result = Ok(TuiResult::Onboard);
+                                break;
+                            }
+                            SM_YEAR => editing_year = Some(year.to_string()),
+                            SM_THRESHOLD => editing_threshold = Some(review_score.to_string()),
+                            SM_SALDEO => {
+                                let y = *year;
+                                let score = *review_score;
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                let progress =
+                                    Arc::new(Mutex::new("Saldeo: otwieram Helium...".to_string()));
+                                let progress_clone = progress.clone();
+                                std::thread::spawn(move || {
+                                    redirect_stderr_to_log();
+                                    let result = (|| -> Result<Vec<InvoiceTableRow>> {
+                                        saldeo_auth_noninteractive()?;
+                                        *progress_clone.lock().unwrap() =
+                                            "Saldeo: odświeżanie danych...".to_string();
+                                        build_invoice_table_rows(y, score)
+                                    })();
+                                    let _ = tx.send(result);
+                                });
+                                pending_action = Some(PendingAction {
+                                    receiver: rx,
+                                    description: "Saldeo auth".to_string(),
+                                    new_year: Some(y),
+                                    new_review_score: Some(score),
+                                    progress,
+                                });
+                            }
+                            SM_BACK => {
+                                menu_open = false;
+                                menu_sel = MI_MENU;
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        match menu_sel {
+                            MI_SYNC => {
+                                let y = *year;
+                                let score = *review_score;
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                let progress = Arc::new(Mutex::new(format!(
+                                    "Pełny sync dla roku {y} (KSeF + Gmail/PDF + Saldeo)..."
+                                )));
+                                let progress_clone = progress.clone();
+                                std::thread::spawn(move || {
+                                    redirect_stderr_to_log();
+                                    let result = (|| -> Result<Vec<InvoiceTableRow>> {
+                                        *progress_clone.lock().unwrap() = format!(
+                                            "Sync: KSeF + Gmail/PDF + Saldeo dla roku {y}..."
+                                        );
+                                        run_sync_sources(
+                                            y,
+                                            false,
+                                            false,
+                                            false,
+                                            None,
+                                            None,
+                                            None,
+                                            DEFAULT_PRODUCTMESH_NIP,
+                                            None,
+                                        )?;
+                                        *progress_clone.lock().unwrap() =
+                                            "Sync: budowanie tabeli...".to_string();
+                                        build_invoice_table_rows(y, score)
+                                    })();
+                                    let _ = tx.send(result);
+                                });
+                                pending_action = Some(PendingAction {
+                                    receiver: rx,
+                                    description: "Sync".to_string(),
+                                    new_year: Some(y),
+                                    new_review_score: Some(score),
+                                    progress,
+                                });
+                            }
+                            MI_RECONCILE => {
+                                let y = *year;
+                                let t = *review_score;
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                let progress = Arc::new(Mutex::new(format!(
+                                    "Reconcile: metadane KSeF/Saldeo dla roku {y}..."
+                                )));
+                                let progress_clone = progress.clone();
+                                std::thread::spawn(move || {
+                                    redirect_stderr_to_log();
+                                    let result = (|| -> Result<Vec<InvoiceTableRow>> {
+                                        *progress_clone.lock().unwrap() =
+                                            "Reconcile: odświeżanie metadanych KSeF/Saldeo..."
+                                                .to_string();
+                                        sync_reconcile_metadata(y, true, true)?;
+                                        *progress_clone.lock().unwrap() =
+                                            "Reconcile: budowanie tabeli...".to_string();
+                                        build_invoice_table_rows(y, t)
+                                    })();
+                                    let _ = tx.send(result);
+                                });
+                                pending_action = Some(PendingAction {
+                                    receiver: rx,
+                                    description: "Reconcile".to_string(),
+                                    new_year: Some(y),
+                                    new_review_score: Some(t),
+                                    progress,
+                                });
+                            }
+                            MI_LLM => {
+                                let y = *year;
+                                let score = *review_score;
+                                let selected_hashes: Vec<String> = rows
+                                    .iter()
+                                    .filter(|r| r.selected && r.sources.contains('G'))
+                                    .map(|r| r.record.content_hash.clone())
+                                    .collect();
+                                let has_selection = !selected_hashes.is_empty();
+                                let selected_hashes_clone = selected_hashes.clone();
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                let progress = Arc::new(Mutex::new(if has_selection {
+                                    format!(
+                                        "LLM: przygotowanie {} faktur...",
+                                        selected_hashes.len()
+                                    )
+                                } else {
+                                    format!("LLM: wczytywanie faktur dla roku {y}...")
+                                }));
+                                let progress_clone = progress.clone();
+                                std::thread::spawn(move || {
+                                    redirect_stderr_to_log();
+                                    let result = (|| -> Result<Vec<InvoiceTableRow>> {
+                                        let mail_path = default_mail_candidates_path(y);
+                                        if mail_path.exists() {
+                                            *progress_clone.lock().unwrap() =
+                                                "LLM: wczytywanie faktur...".to_string();
+                                            let mut candidates =
+                                                load_records(SourceKind::Mail, &mail_path)?;
+                                            if has_selection {
+                                                let mut to_enrich: Vec<InvoiceRecord> = candidates
+                                                    .iter()
+                                                    .filter(|c| {
+                                                        selected_hashes_clone
+                                                            .contains(&c.content_hash)
+                                                    })
+                                                    .cloned()
+                                                    .collect();
+                                                // Wyczyść pola aby wymusić ponowne parsowanie
+                                                for r in &mut to_enrich {
+                                                    r.issue_date = None;
+                                                    r.gross_amount_minor = None;
+                                                    r.net_amount_minor = None;
+                                                    r.vat_amount_minor = None;
+                                                    r.currency = None;
+                                                    r.seller_name = None;
+                                                    r.buyer_name = None;
+                                                    r.seller_tax_id = None;
+                                                    r.buyer_tax_id = None;
+                                                    r.sale_date = None;
+                                                    r.due_date = None;
+                                                    r.warnings.clear();
+                                                }
+                                                if !to_enrich.is_empty() {
+                                                    *progress_clone.lock().unwrap() = format!(
+                                                        "LLM: parsowanie {} faktur...",
+                                                        to_enrich.len()
+                                                    );
+                                                    let empty_skip =
+                                                        std::collections::HashSet::new();
+                                                    enrich_candidates_with_gemma(
+                                                        &mut to_enrich,
+                                                        &empty_skip,
+                                                        Some(progress_clone.clone()),
+                                                    )?;
+                                                    *progress_clone.lock().unwrap() =
+                                                        "LLM: zapisywanie wyników...".to_string();
+                                                    for enriched in to_enrich {
+                                                        if let Some(pos) =
+                                                            candidates.iter().position(|c| {
+                                                                c.content_hash
+                                                                    == enriched.content_hash
+                                                            })
+                                                        {
+                                                            candidates[pos] = enriched;
+                                                        }
+                                                    }
+                                                    write_records(
+                                                        &candidates,
+                                                        OutputFormat::Jsonl,
+                                                        Some(&default_mail_candidates_path(y)),
+                                                    )?;
+                                                }
+                                            } else {
+                                                let cached = apply_cached_mail_candidates(
+                                                    y,
+                                                    &mut candidates,
+                                                )?;
+                                                *progress_clone.lock().unwrap() =
+                                                    "LLM: parsowanie faktur...".to_string();
+                                                enrich_candidates_with_gemma(
+                                                    &mut candidates,
+                                                    &cached,
+                                                    Some(progress_clone.clone()),
+                                                )?;
+                                                *progress_clone.lock().unwrap() =
+                                                    "LLM: zapisywanie wyników...".to_string();
+                                                write_records(
+                                                    &candidates,
+                                                    OutputFormat::Jsonl,
+                                                    Some(&default_mail_candidates_path(y)),
+                                                )?;
+                                            }
+                                        }
+                                        *progress_clone.lock().unwrap() =
+                                            "LLM: budowanie tabeli...".to_string();
+                                        build_invoice_table_rows(y, score)
+                                    })();
+                                    let _ = tx.send(result);
+                                });
+                                pending_action = Some(PendingAction {
+                                    receiver: rx,
+                                    description: if has_selection {
+                                        "LLM (wybrane)".to_string()
+                                    } else {
+                                        "LLM".to_string()
+                                    },
+                                    new_year: Some(y),
+                                    new_review_score: None,
+                                    progress,
+                                });
+                            }
+                            MI_UPLOAD => {
+                                for row in rows.iter_mut().filter(|r| r.selected) {
+                                    if row.can_upload() {
+                                        row.action = InvoiceTableAction::Upload;
+                                    }
+                                }
+                            }
+                            MI_APPROVE => {
+                                for row in rows.iter_mut().filter(|r| r.selected) {
+                                    if row.can_mark_ksef() {
+                                        row.action = InvoiceTableAction::ApproveKsef;
+                                    }
+                                }
+                            }
+                            MI_REJECT => {
+                                for row in rows.iter_mut().filter(|r| r.selected) {
+                                    if row.can_mark_ksef() {
+                                        row.action = InvoiceTableAction::RejectKsef;
+                                    }
+                                }
+                            }
+                            MI_CLEAR => {
+                                for row in rows.iter_mut().filter(|r| r.selected) {
+                                    row.action = InvoiceTableAction::None;
+                                    row.selected = false;
+                                }
+                            }
+                            MI_COMMIT => {
+                                loop_result = Ok(TuiResult::Commit);
+                                break;
+                            }
+                            MI_MENU => {
+                                menu_open = true;
+                                menu_sel = SM_BACK;
+                            }
+                            _ => {}
+                        }
                     }
                 }
-                KeyCode::Char(c) if c.is_ascii_digit() => {
-                    if let Some(s) = field {
-                        s.push(c);
+                KeyCode::Down => {
+                    if table_sel + 1 < visible.len() {
+                        table_sel += 1;
+                        if (paint_mode || shift)
+                            && let Some(row_idx) = visible.get(table_sel).copied()
+                        {
+                            rows[row_idx].selected = !rows[row_idx].selected;
+                        }
+                    }
+                }
+                KeyCode::Up => {
+                    if table_sel > 0 {
+                        table_sel -= 1;
+                        if (paint_mode || shift)
+                            && let Some(row_idx) = visible.get(table_sel).copied()
+                        {
+                            rows[row_idx].selected = !rows[row_idx].selected;
+                        }
+                    }
+                }
+                KeyCode::Right => {
+                    let max = if menu_open { SUB_COUNT } else { MAIN_COUNT };
+                    menu_sel = (menu_sel + 1).min(max.saturating_sub(1));
+                }
+                KeyCode::Left => {
+                    menu_sel = menu_sel.saturating_sub(1);
+                }
+                KeyCode::Home => {
+                    table_sel = 0;
+                    if paint_mode && let Some(row_idx) = visible.get(table_sel).copied() {
+                        rows[row_idx].selected = !rows[row_idx].selected;
+                    }
+                }
+                KeyCode::End => {
+                    table_sel = visible.len().saturating_sub(1);
+                    if paint_mode && let Some(row_idx) = visible.get(table_sel).copied() {
+                        rows[row_idx].selected = !rows[row_idx].selected;
+                    }
+                }
+                KeyCode::Char('f') => {
+                    actionable_only = !actionable_only;
+                    table_sel = 0;
+                }
+                KeyCode::Char('v') => {
+                    paint_mode = !paint_mode;
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(row_idx) = visible.get(table_sel).copied() {
+                        rows[row_idx].selected = !rows[row_idx].selected;
                     }
                 }
                 _ => {}
             }
-            continue;
-        }
-
-        match key.code {
-            KeyCode::Char('q') => break,
-            KeyCode::Esc => {
-                if menu_open {
-                    menu_open = false;
-                } else {
-                    break;
-                }
-            }
-            KeyCode::Char('c') if cmd => {
-                loop_result = Ok(TuiResult::Commit);
-                break;
-            }
-            KeyCode::Enter if cmd => {
-                loop_result = Ok(TuiResult::Commit);
-                break;
-            }
-            KeyCode::Enter => {
-                if menu_open {
-                    match menu_sel {
-                        SM_SALDEO => {
-                            loop_result = Ok(TuiResult::SaldeoAuth);
-                            break;
-                        }
-                        SM_YEAR => editing_year = Some(year.to_string()),
-                        SM_THRESHOLD => editing_threshold = Some(review_score.to_string()),
-                        SM_DOCTOR => {
-                            loop_result = Ok(TuiResult::Doctor);
-                            break;
-                        }
-                        SM_ONBOARD => {
-                            loop_result = Ok(TuiResult::Onboard);
-                            break;
-                        }
-                        SM_BACK => menu_open = false,
-                        _ => {}
-                    }
-                } else {
-                    match menu_sel {
-                        MI_SYNC => {
-                            pending_action = Some(TuiResult::Sync { year: *year });
-                        }
-                        MI_REFRESH => {
-                            pending_action = Some(TuiResult::Rebuild {
-                                year: *year,
-                                threshold: *review_score,
-                            });
-                        }
-                        MI_RECONCILE => {
-                            pending_action = Some(TuiResult::Rebuild {
-                                year: *year,
-                                threshold: *review_score,
-                            });
-                        }
-                        MI_LLM => {
-                            pending_action = Some(TuiResult::Llm { year: *year });
-                        }
-                        MI_UPLOAD => {
-                            for row in rows.iter_mut().filter(|r| r.selected) {
-                                if row.can_upload() {
-                                    row.action = InvoiceTableAction::Upload;
-                                }
-                            }
-                        }
-                        MI_APPROVE => {
-                            for row in rows.iter_mut().filter(|r| r.selected) {
-                                if row.can_mark_ksef() {
-                                    row.action = InvoiceTableAction::ApproveKsef;
-                                }
-                            }
-                        }
-                        MI_REJECT => {
-                            for row in rows.iter_mut().filter(|r| r.selected) {
-                                if row.can_mark_ksef() {
-                                    row.action = InvoiceTableAction::RejectKsef;
-                                }
-                            }
-                        }
-                        MI_CLEAR => {
-                            for row in rows.iter_mut().filter(|r| r.selected) {
-                                row.action = InvoiceTableAction::None;
-                                row.selected = false;
-                            }
-                        }
-                        MI_MENU => {
-                            menu_open = true;
-                            menu_sel = SM_BACK;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            KeyCode::Down => {
-                if table_sel + 1 < visible.len() {
-                    table_sel += 1;
-                    if (paint_mode || shift)
-                        && let Some(row_idx) = visible.get(table_sel).copied()
-                    {
-                        rows[row_idx].selected = !rows[row_idx].selected;
-                    }
-                }
-            }
-            KeyCode::Up => {
-                if table_sel > 0 {
-                    table_sel -= 1;
-                    if (paint_mode || shift)
-                        && let Some(row_idx) = visible.get(table_sel).copied()
-                    {
-                        rows[row_idx].selected = !rows[row_idx].selected;
-                    }
-                }
-            }
-            KeyCode::Right => {
-                let max = if menu_open { SUB_COUNT } else { MAIN_COUNT };
-                menu_sel = (menu_sel + 1).min(max.saturating_sub(1));
-            }
-            KeyCode::Left => {
-                menu_sel = menu_sel.saturating_sub(1);
-            }
-            KeyCode::Home => {
-                table_sel = 0;
-                if paint_mode && let Some(row_idx) = visible.get(table_sel).copied() {
-                    rows[row_idx].selected = !rows[row_idx].selected;
-                }
-            }
-            KeyCode::End => {
-                table_sel = visible.len().saturating_sub(1);
-                if paint_mode && let Some(row_idx) = visible.get(table_sel).copied() {
-                    rows[row_idx].selected = !rows[row_idx].selected;
-                }
-            }
-            KeyCode::Char('f') => {
-                actionable_only = !actionable_only;
-                table_sel = 0;
-            }
-            KeyCode::Char('v') => {
-                paint_mode = !paint_mode;
-            }
-            KeyCode::Char(' ') => {
-                if let Some(row_idx) = visible.get(table_sel).copied() {
-                    rows[row_idx].selected = !rows[row_idx].selected;
-                }
-            }
-            _ => {}
         }
     }
 
@@ -1967,11 +2234,8 @@ fn store_tri_reconcile_report(
         let row_key = tri_row_key(row);
         let row_json = serde_json::to_string(row)?;
         let row_hash = hex::encode(Sha256::digest(row_json.as_bytes()));
-        let primary = row
-            .mail
-            .as_ref()
-            .or(row.ksef.as_ref())
-            .or(row.saldeo.as_ref());
+        let primary = tri_row_display_record(row);
+        let primary = primary.as_ref();
         conn.execute(
             r#"
             INSERT INTO tri_reconcile_rows (
@@ -2036,12 +2300,8 @@ fn tri_row_key(row: &TriRow) -> String {
             return format!("ksef:{reference}");
         }
     }
-    let primary = row
-        .mail
-        .as_ref()
-        .or(row.ksef.as_ref())
-        .or(row.saldeo.as_ref());
-    if let Some(record) = primary {
+    let primary = tri_row_display_record(row);
+    if let Some(record) = primary.as_ref() {
         return format!(
             "inv:{}|date:{}|gross:{}|cur:{}",
             record.invoice_number.clone().unwrap_or_default(),
@@ -3917,6 +4177,7 @@ fn apply_cached_mail_candidates(
 fn enrich_candidates_with_gemma(
     records: &mut [InvoiceRecord],
     skip_hashes: &HashSet<String>,
+    progress: Option<Arc<Mutex<String>>>,
 ) -> Result<()> {
     let todo = records
         .iter()
@@ -3951,12 +4212,12 @@ fn enrich_candidates_with_gemma(
             continue;
         }
         processed += 1;
-        eprintln!(
-            "  [Gmail/Gemma] {}/{} {}",
-            processed,
-            todo,
-            path.file_name().and_then(|n| n.to_str()).unwrap_or("PDF")
-        );
+        let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("PDF");
+        let status = format!("LLM: {}/{} {}", processed, todo, fname);
+        eprintln!("  [Gmail/Gemma] {}", status);
+        if let Some(ref p) = progress {
+            *p.lock().unwrap() = status;
+        }
         match gemma_extract_invoice_fields(record, path) {
             Ok(true) => {
                 consecutive_errors = 0;
@@ -3987,7 +4248,7 @@ fn ppmlx_base_url() -> String {
 }
 
 fn llm_model() -> String {
-    std::env::var("LAB_LLM_MODEL").unwrap_or_else(|_| "gemma-4-e4b".to_string())
+    std::env::var("LAB_LLM_MODEL").unwrap_or_else(|_| "gemma-4-e4b-it-optiq".to_string())
 }
 
 fn llm_timeout() -> Duration {
@@ -4086,29 +4347,61 @@ fn ppmlx_extract_json(prompt: &str) -> Result<Value> {
     let base = ppmlx_base_url();
     let model = llm_model();
     let client = Client::builder().timeout(llm_timeout()).build()?;
-    let response: Value = client
-        .post(format!("{base}/v1/chat/completions"))
-        .json(&serde_json::json!({
-            "model": model,
-            "temperature": 0,
-            "max_tokens": 1200,
-            "messages": [
-                {"role": "system", "content": "Jesteś ekstraktorem danych z faktur. Odpowiadasz tylko poprawnym JSON."},
-                {"role": "user", "content": prompt}
-            ]
-        }))
-        .send()?
-        .error_for_status()?
-        .json()?;
-    let content = response
-        .get("choices")
-        .and_then(|v| v.as_array())
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("message"))
-        .and_then(|message| message.get("content"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("ppmlx response bez choices[0].message.content"))?;
-    parse_json_from_llm(content)
+    let body = serde_json::json!({
+        "model": model,
+        "temperature": 0,
+        "max_tokens": 4000,
+        "messages": [
+            {"role": "system", "content": "Jesteś ekstraktorem danych z faktur. Odpowiadasz tylko poprawnym JSON."},
+            {"role": "user", "content": prompt}
+        ]
+    });
+
+    let mut last_err = None;
+    for attempt in 0..5 {
+        match client
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&body)
+            .send()
+        {
+            Ok(resp) if resp.status().is_success() => {
+                let response: Value = resp.json()?;
+                let content = response
+                    .get("choices")
+                    .and_then(|v| v.as_array())
+                    .and_then(|choices| choices.first())
+                    .and_then(|choice| choice.get("message"))
+                    .and_then(|message| message.get("content"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("ppmlx response bez choices[0].message.content"))?;
+                return parse_json_from_llm(content);
+            }
+            Ok(resp) if resp.status().as_u16() == 503 => {
+                let delay = std::time::Duration::from_secs(2u64.pow(attempt));
+                eprintln!(
+                    "  [Gmail/Gemma] serwer zajęty (503), czekam {}s...",
+                    delay.as_secs()
+                );
+                std::thread::sleep(delay);
+                continue;
+            }
+            Ok(resp) => {
+                return Err(anyhow!(
+                    "ppmlx HTTP {}: {}",
+                    resp.status(),
+                    resp.text().unwrap_or_default()
+                ));
+            }
+            Err(err) => {
+                last_err = Some(err);
+                let delay = std::time::Duration::from_secs(2u64.pow(attempt));
+                std::thread::sleep(delay);
+            }
+        }
+    }
+    Err(last_err.map(anyhow::Error::from).unwrap_or_else(|| {
+        anyhow!("ppmlx nie odpowiedział po 5 próbach (503 Service Unavailable)")
+    }))
 }
 
 fn parse_json_from_llm(content: &str) -> Result<Value> {
@@ -4443,11 +4736,11 @@ fn mcp_tools() -> Value {
         },
         {
             "name": "reconcile",
-            "description": "Compare Gmail/PDF, KSeF, and Saldeo records (tri-reconcile).",
-            "inputSchema": {"type":"object","required":["mail","ksef","saldeo"],"properties":{
-                "mail":{"type":"string","description":"Path to Gmail/PDF records JSON/JSONL"},
-                "ksef":{"type":"string","description":"Path to KSeF records JSON/JSONL"},
-                "saldeo":{"type":"string","description":"Path to Saldeo records JSON/JSONL or raw documents.json"},
+            "description": "Compare Gmail/PDF, KSeF, and Saldeo records (tri-reconcile). Defaults refresh KSeF/Saldeo metadata before comparing.",
+            "inputSchema": {"type":"object","properties":{
+                "mail":{"type":"string","description":"Path to Gmail/PDF records JSON/JSONL; defaults to cached mail candidates for year"},
+                "ksef":{"type":"string","description":"Path to KSeF records JSON/JSONL; defaults to configured KSeF data and refreshes it first"},
+                "saldeo":{"type":"string","description":"Path to Saldeo records JSON/JSONL or raw documents.json; defaults to fetched Saldeo records and refreshes them first"},
                 "review_score":{"type":"integer","default":45,"description":"Minimum match score"},
                 "store":{"type":"boolean","default":false,"description":"Store temporal snapshot in SQLite"},
                 "year":{"type":"integer","default":2026}
@@ -4550,7 +4843,7 @@ fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<Value> {
                     .unwrap_or_else(|| "5242920020".to_string());
                 let mut candidates = productmesh_invoice_candidates(&mail_records, &nip);
                 let cached_candidates = apply_cached_mail_candidates(year, &mut candidates)?;
-                enrich_candidates_with_gemma(&mut candidates, &cached_candidates)?;
+                enrich_candidates_with_gemma(&mut candidates, &cached_candidates, None)?;
                 write_records(
                     &candidates,
                     OutputFormat::Jsonl,
@@ -4594,9 +4887,14 @@ fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<Value> {
             )
         }
         "reconcile" => {
-            let mail = json_path_arg(args, "mail").ok_or_else(|| anyhow!("missing mail"))?;
-            let ksef = json_path_arg(args, "ksef").ok_or_else(|| anyhow!("missing ksef"))?;
-            let saldeo = json_path_arg(args, "saldeo").ok_or_else(|| anyhow!("missing saldeo"))?;
+            let year = json_i32(args, "year", 2026);
+            let mail =
+                json_path_arg(args, "mail").unwrap_or_else(|| default_mail_candidates_path(year));
+            let ksef_arg = json_path_arg(args, "ksef");
+            let saldeo_arg = json_path_arg(args, "saldeo");
+            sync_reconcile_metadata(year, ksef_arg.is_none(), saldeo_arg.is_none())?;
+            let ksef = ksef_arg.unwrap_or_else(|| configured_ksef_out_path(year));
+            let saldeo = saldeo_arg.unwrap_or_else(|| default_saldeo_records_path(year));
             let report = tri_reconcile(
                 load_records(SourceKind::Mail, &mail)?,
                 load_records(SourceKind::Ksef, &ksef)?,
@@ -4605,8 +4903,7 @@ fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<Value> {
             );
             if json_bool(args, "store", false) {
                 let conn = open_db(db_path)?;
-                let diff =
-                    store_tri_reconcile_report(&conn, json_i32(args, "year", 2026), &report)?;
+                let diff = store_tri_reconcile_report(&conn, year, &report)?;
                 return Ok(serde_json::json!({"report": report, "temporal_diff": diff}));
             }
             Ok(serde_json::to_value(report)?)
@@ -5158,7 +5455,7 @@ fn saldeo_fetch(year: i32, storage_state: &Path, out_dir: &Path) -> Result<Salde
             .map_err(|e| {
                 if e.status() == Some(reqwest::StatusCode::UNAUTHORIZED) {
                     anyhow!(
-                        "Saldeo session expired (401). Refresh Playwright storage state:\n  {}",
+                        "Sesja Saldeo wygasła (401). Odśwież Playwright storage state:\n  {}",
                         default_saldeo_storage_state_path().display()
                     )
                 } else {
@@ -5427,6 +5724,98 @@ fn tri_status(has_mail: bool, has_ksef: bool, has_saldeo: bool) -> &'static str 
     }
 }
 
+fn tri_row_primary_record(row: &TriRow) -> Option<&InvoiceRecord> {
+    row.mail
+        .as_ref()
+        .or(row.ksef.as_ref())
+        .or(row.saldeo.as_ref())
+}
+
+fn tri_row_display_record(row: &TriRow) -> Option<InvoiceRecord> {
+    let mut record = tri_row_primary_record(row)?.clone();
+    let metadata_sources = [row.ksef.as_ref(), row.saldeo.as_ref(), row.mail.as_ref()];
+
+    if record.invoice_number.is_none() {
+        record.invoice_number = metadata_sources
+            .iter()
+            .find_map(|source| source.and_then(|r| r.invoice_number.clone()));
+    }
+    if record.ksef_reference.is_none() {
+        record.ksef_reference = metadata_sources
+            .iter()
+            .find_map(|source| source.and_then(|r| r.ksef_reference.clone()));
+    }
+
+    if let Some(value) = metadata_sources
+        .iter()
+        .find_map(|source| source.and_then(|r| r.seller_name.clone()))
+    {
+        record.seller_name = Some(value);
+    }
+    if let Some(value) = metadata_sources
+        .iter()
+        .find_map(|source| source.and_then(|r| r.buyer_name.clone()))
+    {
+        record.buyer_name = Some(value);
+    }
+    if let Some(value) = metadata_sources
+        .iter()
+        .find_map(|source| source.and_then(|r| r.seller_tax_id.clone()))
+    {
+        record.seller_tax_id = Some(value);
+    }
+    if let Some(value) = metadata_sources
+        .iter()
+        .find_map(|source| source.and_then(|r| r.buyer_tax_id.clone()))
+    {
+        record.buyer_tax_id = Some(value);
+    }
+    if let Some(value) = metadata_sources
+        .iter()
+        .find_map(|source| source.and_then(|r| r.issue_date))
+    {
+        record.issue_date = Some(value);
+    }
+    if let Some(value) = metadata_sources
+        .iter()
+        .find_map(|source| source.and_then(|r| r.sale_date))
+    {
+        record.sale_date = Some(value);
+    }
+    if let Some(value) = metadata_sources
+        .iter()
+        .find_map(|source| source.and_then(|r| r.due_date))
+    {
+        record.due_date = Some(value);
+    }
+    if let Some(value) = metadata_sources
+        .iter()
+        .find_map(|source| source.and_then(|r| r.gross_amount_minor))
+    {
+        record.gross_amount_minor = Some(value);
+    }
+    if let Some(value) = metadata_sources
+        .iter()
+        .find_map(|source| source.and_then(|r| r.net_amount_minor))
+    {
+        record.net_amount_minor = Some(value);
+    }
+    if let Some(value) = metadata_sources
+        .iter()
+        .find_map(|source| source.and_then(|r| r.vat_amount_minor))
+    {
+        record.vat_amount_minor = Some(value);
+    }
+    if let Some(value) = metadata_sources
+        .iter()
+        .find_map(|source| source.and_then(|r| r.currency.clone()))
+    {
+        record.currency = Some(value);
+    }
+
+    Some(record)
+}
+
 fn write_reconcile_human(
     report: &TriReconcileReport,
     temporal_diff: Option<&TemporalDiffSummary>,
@@ -5469,11 +5858,8 @@ fn write_reconcile_human(
         ));
         out.push_str(&format!("{}\n", "-".repeat(142)));
         for row in missing_rows {
-            let primary = row
-                .mail
-                .as_ref()
-                .or(row.ksef.as_ref())
-                .or(row.saldeo.as_ref());
+            let primary = tri_row_display_record(row);
+            let primary = primary.as_ref();
             out.push_str(&format!(
                 "{:<30} {:<28} {:<30} {:<12} {:>12} {:<4} {:<18}\n",
                 truncate(&row.status, 30),
@@ -5580,11 +5966,8 @@ fn write_tri_csv(report: &TriReconcileReport, path: &Path) -> Result<()> {
         "ksef_score_to_saldeo",
     ])?;
     for row in &report.rows {
-        let primary = row
-            .mail
-            .as_ref()
-            .or(row.ksef.as_ref())
-            .or(row.saldeo.as_ref());
+        let primary = tri_row_display_record(row);
+        let primary = primary.as_ref();
         writer.write_record([
             row.status.clone(),
             row.mail
@@ -5960,7 +6343,7 @@ fn print_onboard_status(status: &OnboardStatus, db_path: &Path) {
     eprintln!();
 }
 
-fn write_onboard_check_json(status: &OnboardStatus) -> Result<()> {
+fn onboard_next_steps(status: &OnboardStatus, gmail_ok: bool) -> Vec<&'static str> {
     let mut steps: Vec<&str> = Vec::new();
     if !status.pdftotext_ok {
         steps.push("brew install poppler");
@@ -5968,7 +6351,7 @@ fn write_onboard_check_json(status: &OnboardStatus) -> Result<()> {
     if !status.python_ok {
         steps.push("Zainstaluj ppmlx i pobierz model: ppmlx pull gemma-4-e4b");
     }
-    if !status.gmail_authed {
+    if !gmail_ok {
         steps.push("lab onboard --gmail-client-secret <ścieżka>");
     }
     if !status.saldeo_valid {
@@ -5978,11 +6361,16 @@ fn write_onboard_check_json(status: &OnboardStatus) -> Result<()> {
         steps.push("Ustaw KSEF_CERT_PATH, KSEF_KEY_PATH, KSEF_CERT_PASSWORD, KSEF_TOKEN");
     }
     if !status.ksef_data_exists {
-        steps.push("Umieść eksport KSeF w data/ksef-<rok>");
+        steps.push("Umieść eksport KSeF w data/ksef-<rok> albo ustaw KSEF_DATA_DIR");
     }
     if steps.is_empty() {
         steps.push("Wszystko gotowe. Uruchom: lab sync");
     }
+    steps
+}
+
+fn write_onboard_check_json(status: &OnboardStatus) -> Result<()> {
+    let steps = onboard_next_steps(status, status.gmail_authed);
     let status_json = serde_json::json!({
         "prerequisites": { "pdftotext": status.pdftotext_ok, "ppmlx_gemma": status.python_ok },
         "gmail": { "token_valid": status.gmail_authed },
@@ -6113,6 +6501,81 @@ fn onboard_edit_env_secret(name: &str) -> Result<()> {
     vars.insert(name.to_string(), value);
     write_lab_env_file(&vars)?;
     eprintln!("✓ Zapisano {name} w {}\n", lab_env_file_path().display());
+    Ok(())
+}
+
+fn saldeo_auth_noninteractive() -> Result<()> {
+    let target = preferred_saldeo_storage_state_path();
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    let url =
+        std::env::var("SALDEO_URL").unwrap_or_else(|_| "https://saldeo.brainshare.pl/".to_string());
+    let helium = std::env::var("HELIUM_EXECUTABLE")
+        .unwrap_or_else(|_| "/Applications/Helium.app/Contents/MacOS/Helium".to_string());
+    if !Path::new(&helium).is_file() {
+        return Err(anyhow!("nie znalazłem Helium executable: {helium}"));
+    }
+    let node_script = r#"
+const { chromium } = require('playwright');
+const fs = require('fs');
+const path = require('path');
+(async () => {
+  const out = process.env.LAB_SALDEO_STORAGE_STATE;
+  const url = process.env.SALDEO_URL || 'https://saldeo.brainshare.pl/';
+  const executablePath = process.env.HELIUM_EXECUTABLE;
+  const userDataDir = path.join(require('os').homedir(), '.config', 'lab', 'helium-profile');
+  fs.mkdirSync(userDataDir, { recursive: true });
+  const context = await chromium.launchPersistentContext(userDataDir, {
+    executablePath,
+    headless: false,
+    viewport: { width: 1400, height: 1000 },
+  });
+  const page = context.pages()[0] || await context.newPage();
+  await page.goto(url, { waitUntil: 'domcontentloaded' });
+  await Promise.race([
+    new Promise(resolve => context.once('close', resolve)),
+    new Promise(resolve => setTimeout(resolve, 120000)),
+  ]);
+  try {
+    await context.storageState({ path: out });
+    await context.close().catch(() => {});
+  } catch (e) {
+    console.error('storageState error:', e.message);
+    process.exit(1);
+  }
+})().catch(err => { console.error(err && err.stack ? err.stack : err); process.exit(1); });
+"#;
+    let output = Command::new("npx")
+        .arg("--yes")
+        .arg("-p")
+        .arg("playwright")
+        .arg("node")
+        .arg("-e")
+        .arg(node_script)
+        .env("LAB_SALDEO_STORAGE_STATE", &target)
+        .env("SALDEO_URL", &url)
+        .env("HELIUM_EXECUTABLE", &helium)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .context("uruchomienie npx playwright + Helium (noninteractive)")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "Playwright auth zakończył się błędem: {} (stderr: {})",
+            output.status,
+            stderr.trim()
+        ));
+    }
+    if !target.exists() {
+        return Err(anyhow!(
+            "storage state nie został zapisany: {}",
+            target.display()
+        ));
+    }
+    save_saldeo_storage_state_secret(&target)?;
     Ok(())
 }
 
@@ -6450,21 +6913,79 @@ fn saldeo_session_valid(storage_state: &Path) -> bool {
     }
 }
 
-fn doctor(token_env: &str) -> Result<()> {
-    let token_ok = std::env::var(token_env)
+fn doctor(db_path: &Path, token_env: &str) -> Result<()> {
+    let gmail_env_present = std::env::var(token_env)
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
-    let pdftotext_ok = Command::new("pdftotext").arg("-v").output().is_ok();
-    let status = serde_json::json!({
-        "gmail_token_env": token_env,
-        "gmail_token_present": token_ok,
-        "pdftotext_present": pdftotext_ok,
+    let status = collect_onboard_status(db_path)?;
+    let gmail_usable = gmail_env_present || status.gmail_authed;
+    let all_ok = status.pdftotext_ok
+        && status.python_ok
+        && gmail_usable
+        && status.saldeo_valid
+        && status.ksef_api_ok
+        && status.ksef_data_exists;
+    let year = status.year;
+    let mail_candidates = default_mail_candidates_path(year);
+    let ksef_records = configured_ksef_out_path(year);
+    let saldeo_records = default_saldeo_records_path(year);
+    let status_json = serde_json::json!({
+        "ok": all_ok,
+        "year": year,
+        "prerequisites": {
+            "pdftotext_present": status.pdftotext_ok,
+            "ppmlx_present": status.python_ok
+        },
+        "gmail": {
+            "token_env": token_env,
+            "token_env_present": gmail_env_present,
+            "token_file": default_gmail_token_path().display().to_string(),
+            "token_file_or_keychain_present": status.token_exists,
+            "token_file_valid": status.gmail_authed,
+            "usable": gmail_usable,
+            "client_secret_path": lab_config_var("GOOGLE_CLIENT_SECRET_PATH")
+        },
+        "saldeo": {
+            "storage_state": default_saldeo_storage_state_path().display().to_string(),
+            "storage_state_present": status.saldeo_exists,
+            "session_valid": status.saldeo_valid,
+            "default_records": saldeo_records.display().to_string(),
+            "default_records_present": saldeo_records.exists()
+        },
+        "ksef": {
+            "data_dir": status.ksef_dir.display().to_string(),
+            "data_exists": status.ksef_data_exists,
+            "default_records": ksef_records.display().to_string(),
+            "default_records_present": ksef_records.exists(),
+            "cert_path": status.ksef_cert.clone(),
+            "cert_ok": status.ksef_cert_ok,
+            "key_path": status.ksef_key.clone(),
+            "key_ok": status.ksef_key_ok,
+            "password_present": status.ksef_password_ok,
+            "token_present": status.ksef_token_ok,
+            "api_config_ok": status.ksef_api_ok
+        },
+        "reconcile_defaults": {
+            "mail_candidates": mail_candidates.display().to_string(),
+            "mail_candidates_present": mail_candidates.exists(),
+            "ksef": ksef_records.display().to_string(),
+            "ksef_present": ksef_records.exists(),
+            "saldeo": saldeo_records.display().to_string(),
+            "saldeo_present": saldeo_records.exists()
+        },
+        "database": {
+            "path": db_path.display().to_string(),
+            "exists": status.db_exists
+        },
         "notes": [
             "GmailFetch wymaga tokenu OAuth z zakresem gmail.readonly.",
-            "PDF-y są parsowane przez pdftotext, potem PyMuPDF/pdfplumber/pypdf jako fallback."
-        ]
+            "PDF-y są parsowane przez pdftotext, potem PyMuPDF/pdfplumber/pypdf jako fallback.",
+            "lab reconcile bez własnych --ksef/--saldeo odświeża domyślne metadane KSeF/Saldeo przed porównaniem.",
+            "KSeF w tej wersji korzysta z lokalnego eksportu XML/JSON/JSONL wskazanego przez KSEF_DATA_DIR albo data/ksef-<rok>."
+        ],
+        "next_steps": onboard_next_steps(&status, gmail_usable)
     });
-    write_json(&status, None)
+    write_json(&status_json, None)
 }
 
 #[cfg(test)]

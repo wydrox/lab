@@ -59,7 +59,7 @@ lab sync --ksef          # tylko KSeF
 lab sync --mail          # tylko Gmail/PDF (pobiera, parsuje, filtruje)
 lab sync --saldeo        # tylko Saldeo
 
-lab reconcile              # używa domyślnych wyników sync dla roku 2026
+lab reconcile              # odświeża KSeF/Saldeo i porównuje domyślne wyniki dla roku 2026
 lab reconcile \
   --mail ./data/mail-all-pdf-2026-pdfs/records.jsonl \
   --ksef ./data/ksef-2026/records.jsonl \
