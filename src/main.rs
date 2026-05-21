@@ -501,7 +501,9 @@ fn main() -> Result<()> {
             productmesh_nip,
             store,
         } => {
-            let conn = if store {
+            let auto_store_online_ksef =
+                ksef_input.is_none() && (ksef || (!ksef && !mail && !saldeo));
+            let conn = if store || auto_store_online_ksef {
                 Some(open_db(&db_path)?)
             } else {
                 None
@@ -615,14 +617,12 @@ fn interactive_tui(db_path: &Path) -> Result<()> {
 }
 
 fn interactive_reconcile_actions(db_path: &Path) -> Result<()> {
-    let theme = ColorfulTheme::default();
     let mut year: i32 = 2026;
     let mut review_score: u8 = 70;
     let mut rows = build_invoice_table_rows(year, review_score)?;
 
     loop {
         match run_invoice_table_tui(&mut rows, &mut year, &mut review_score, db_path)? {
-            TuiResult::Commit => break,
             TuiResult::Cancel => return Ok(()),
             TuiResult::Doctor => {
                 eprintln!("  [LAB] diagnostyka...");
@@ -634,82 +634,9 @@ fn interactive_reconcile_actions(db_path: &Path) -> Result<()> {
             }
         }
     }
-
-    let selected_upload_items = rows
-        .iter()
-        .filter(|row| row.action == InvoiceTableAction::Upload)
-        .filter_map(|row| row.upload_item.clone())
-        .collect::<Vec<_>>();
-    let selected_approve_ids = rows
-        .iter()
-        .filter(|row| row.action == InvoiceTableAction::ApproveKsef)
-        .filter_map(|row| row.ksef_document_id)
-        .collect::<Vec<_>>();
-    let selected_reject_ids = rows
-        .iter()
-        .filter(|row| row.action == InvoiceTableAction::RejectKsef)
-        .filter_map(|row| row.ksef_document_id)
-        .collect::<Vec<_>>();
-
-    eprintln!(
-        "  [LAB] wybrano: {} upload, {} zatwierdź KSeF, {} odrzuć KSeF",
-        selected_upload_items.len(),
-        selected_approve_ids.len(),
-        selected_reject_ids.len()
-    );
-    if selected_upload_items.is_empty()
-        && selected_approve_ids.is_empty()
-        && selected_reject_ids.is_empty()
-    {
-        eprintln!("  [LAB] nic nie wybrano — bez zmian");
-        return Ok(());
-    }
-    if !Confirm::with_theme(&theme)
-        .with_prompt("Wykonać wybrane operacje w Saldeo?")
-        .default(false)
-        .interact()?
-    {
-        eprintln!("  [LAB] anulowano — bez zmian");
-        return Ok(());
-    }
-
-    let session = read_saldeo_session(&default_saldeo_storage_state_path())?;
-    let mut result = serde_json::json!({
-        "year": year,
-        "uploaded": null,
-        "approved_ksef_document_ids": selected_approve_ids,
-        "rejected_ksef_document_ids": selected_reject_ids,
-    });
-    if !selected_upload_items.is_empty() {
-        let mut upload_plan = SaldeoSyncPlan {
-            generated_at: Utc::now(),
-            year,
-            confirm: true,
-            upload_url: Some(DEFAULT_SALDEO_UPLOAD_URL.to_string()),
-            summary: saldeo_sync_summary(&selected_upload_items),
-            items: selected_upload_items,
-        };
-        saldeo_upload_plan(
-            &mut upload_plan,
-            &default_saldeo_storage_state_path(),
-            DEFAULT_SALDEO_UPLOAD_URL,
-            "file",
-        )?;
-        result["uploaded"] = serde_json::to_value(&upload_plan)?;
-    }
-    if !selected_approve_ids.is_empty() {
-        result["approve_response"] =
-            saldeo_mark_ksef_documents(&session, &selected_approve_ids, true)?;
-    }
-    if !selected_reject_ids.is_empty() {
-        result["reject_response"] =
-            saldeo_mark_ksef_documents(&session, &selected_reject_ids, false)?;
-    }
-    write_json(&result, None)
 }
 
 enum TuiResult {
-    Commit,
     Cancel,
     Doctor,
     Onboard,
@@ -841,12 +768,176 @@ fn invoice_table_counts(rows: &[InvoiceTableRow]) -> (usize, usize, usize, usize
     (u, a, r, s)
 }
 
+fn collect_invoice_table_actions(
+    rows: &[InvoiceTableRow],
+) -> (Vec<SaldeoSyncItem>, Vec<i64>, Vec<i64>) {
+    let selected_upload_items = rows
+        .iter()
+        .filter(|row| row.action == InvoiceTableAction::Upload)
+        .filter_map(|row| row.upload_item.clone())
+        .collect::<Vec<_>>();
+    let selected_approve_ids = rows
+        .iter()
+        .filter(|row| row.action == InvoiceTableAction::ApproveKsef)
+        .filter_map(|row| row.ksef_document_id)
+        .collect::<Vec<_>>();
+    let selected_reject_ids = rows
+        .iter()
+        .filter(|row| row.action == InvoiceTableAction::RejectKsef)
+        .filter_map(|row| row.ksef_document_id)
+        .collect::<Vec<_>>();
+    (
+        selected_upload_items,
+        selected_approve_ids,
+        selected_reject_ids,
+    )
+}
+
 struct PendingAction {
     receiver: std::sync::mpsc::Receiver<Result<Vec<InvoiceTableRow>>>,
     description: String,
     new_year: Option<i32>,
     new_review_score: Option<u8>,
     progress: Arc<Mutex<String>>,
+}
+
+enum PendingActionStart {
+    Started(PendingAction),
+    Noop(String),
+}
+
+fn set_progress(progress: &Arc<Mutex<String>>, message: impl Into<String>) {
+    *progress.lock().unwrap() = message.into();
+}
+
+fn begin_invoice_table_commit(
+    rows: &[InvoiceTableRow],
+    year: i32,
+    review_score: u8,
+) -> PendingActionStart {
+    let (upload_items, approve_ids, reject_ids) = collect_invoice_table_actions(rows);
+    if upload_items.is_empty() && approve_ids.is_empty() && reject_ids.is_empty() {
+        return PendingActionStart::Noop(
+            "Akceptuj: nic do wykonania (najpierw wybierz Upload/Zatwierdź/Odrzuć)".to_string(),
+        );
+    }
+
+    let description = format!(
+        "Akceptuj (upload {}, zatw. {}, odrz. {})",
+        upload_items.len(),
+        approve_ids.len(),
+        reject_ids.len()
+    );
+    let rows_snapshot = rows.to_vec();
+    let progress = Arc::new(Mutex::new(format!(
+        "{}: przygotowanie operacji...",
+        description
+    )));
+    let progress_clone = progress.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        redirect_stderr_to_log();
+        let result =
+            execute_invoice_table_actions(year, review_score, rows_snapshot, progress_clone);
+        let _ = tx.send(result);
+    });
+
+    PendingActionStart::Started(PendingAction {
+        receiver: rx,
+        description,
+        new_year: Some(year),
+        new_review_score: Some(review_score),
+        progress,
+    })
+}
+
+fn execute_invoice_table_actions(
+    year: i32,
+    review_score: u8,
+    rows: Vec<InvoiceTableRow>,
+    progress: Arc<Mutex<String>>,
+) -> Result<Vec<InvoiceTableRow>> {
+    let (selected_upload_items, selected_approve_ids, selected_reject_ids) =
+        collect_invoice_table_actions(&rows);
+    let storage_state = default_saldeo_storage_state_path();
+
+    if !selected_upload_items.is_empty() {
+        set_progress(
+            &progress,
+            format!(
+                "Akceptuj: upload do Saldeo ({} plików)...",
+                selected_upload_items.len()
+            ),
+        );
+        let mut upload_plan = SaldeoSyncPlan {
+            generated_at: Utc::now(),
+            year,
+            confirm: true,
+            upload_url: Some(DEFAULT_SALDEO_UPLOAD_URL.to_string()),
+            summary: saldeo_sync_summary(&selected_upload_items),
+            items: selected_upload_items,
+        };
+        saldeo_upload_plan_with_progress(
+            &mut upload_plan,
+            &storage_state,
+            DEFAULT_SALDEO_UPLOAD_URL,
+            "file",
+            Some(progress.clone()),
+        )?;
+        if upload_plan.summary.failed_count > 0 {
+            let errors = upload_plan
+                .items
+                .iter()
+                .filter(|item| item.upload_status == "failed")
+                .filter_map(|item| {
+                    let name = item
+                        .source_path
+                        .as_deref()
+                        .and_then(|path| Path::new(path).file_name())
+                        .and_then(|name| name.to_str())
+                        .or(item.invoice_number.as_deref())
+                        .unwrap_or("plik");
+                    item.error.as_ref().map(|error| format!("{name}: {error}"))
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            return Err(anyhow!(
+                "upload Saldeo nie powiódł się ({}/{} błędów): {}",
+                upload_plan.summary.failed_count,
+                upload_plan.summary.uploadable_count,
+                errors
+            ));
+        }
+    }
+
+    if !selected_approve_ids.is_empty() || !selected_reject_ids.is_empty() {
+        let session = read_saldeo_session(&storage_state)?;
+        if !selected_approve_ids.is_empty() {
+            set_progress(
+                &progress,
+                format!(
+                    "Akceptuj: zatwierdzam KSeF w Saldeo ({} dokumentów)...",
+                    selected_approve_ids.len()
+                ),
+            );
+            saldeo_mark_ksef_documents(&session, &selected_approve_ids, true)?;
+        }
+        if !selected_reject_ids.is_empty() {
+            set_progress(
+                &progress,
+                format!(
+                    "Akceptuj: odrzucam KSeF w Saldeo ({} dokumentów)...",
+                    selected_reject_ids.len()
+                ),
+            );
+            saldeo_mark_ksef_documents(&session, &selected_reject_ids, false)?;
+        }
+    }
+
+    set_progress(&progress, "Akceptuj: odświeżam Saldeo po zmianach...");
+    saldeo_fetch(year, &storage_state, &default_saldeo_out_path(year))?;
+    set_progress(&progress, "Akceptuj: przebudowuję tabelę...");
+    build_invoice_table_rows(year, review_score)
 }
 
 /// Redirect stderr to a log file for the current thread.
@@ -984,6 +1075,7 @@ fn run_invoice_table_tui(
                 Cell::from("kontrahent"),
                 Cell::from("data"),
                 Cell::from("brutto"),
+                Cell::from("wal"),
             ])
             .style(
                 Style::default()
@@ -1031,6 +1123,7 @@ fn run_invoice_table_tui(
                             .map(format_minor_money)
                             .unwrap_or_else(|| "-".to_string()),
                     ),
+                    Cell::from(row.record.currency.as_deref().unwrap_or("-")),
                 ])
                 .style(style)
             });
@@ -1040,10 +1133,11 @@ fn run_invoice_table_tui(
                     Constraint::Percentage(4),
                     Constraint::Percentage(14),
                     Constraint::Percentage(7),
-                    Constraint::Percentage(22),
-                    Constraint::Percentage(23),
-                    Constraint::Percentage(10),
                     Constraint::Percentage(20),
+                    Constraint::Percentage(22),
+                    Constraint::Percentage(10),
+                    Constraint::Percentage(16),
+                    Constraint::Percentage(7),
                 ],
             )
             .header(header)
@@ -1327,14 +1421,30 @@ fn run_invoice_table_tui(
                     }
                 }
                 KeyCode::Char('c') if cmd => {
-                    loop_result = Ok(TuiResult::Commit);
-                    break;
+                    if pending_action.is_some() {
+                        status_message = "Trwa operacja — poczekaj na zakończenie".to_string();
+                    } else {
+                        match begin_invoice_table_commit(rows, *year, *review_score) {
+                            PendingActionStart::Started(action) => pending_action = Some(action),
+                            PendingActionStart::Noop(message) => status_message = message,
+                        }
+                    }
                 }
                 KeyCode::Enter if cmd => {
-                    loop_result = Ok(TuiResult::Commit);
-                    break;
+                    if pending_action.is_some() {
+                        status_message = "Trwa operacja — poczekaj na zakończenie".to_string();
+                    } else {
+                        match begin_invoice_table_commit(rows, *year, *review_score) {
+                            PendingActionStart::Started(action) => pending_action = Some(action),
+                            PendingActionStart::Noop(message) => status_message = message,
+                        }
+                    }
                 }
                 KeyCode::Enter => {
+                    if pending_action.is_some() {
+                        status_message = "Trwa operacja — poczekaj na zakończenie".to_string();
+                        continue;
+                    }
                     if menu_open {
                         match menu_sel {
                             SM_DOCTOR => {
@@ -1350,23 +1460,34 @@ fn run_invoice_table_tui(
                             SM_SALDEO => {
                                 let y = *year;
                                 let score = *review_score;
+                                let db = db_path.to_path_buf();
                                 let (tx, rx) = std::sync::mpsc::channel();
-                                let progress =
-                                    Arc::new(Mutex::new("Saldeo: otwieram Helium...".to_string()));
+                                let progress = Arc::new(Mutex::new(
+                                    "Saldeo: sprawdzam zapisaną sesję...".to_string(),
+                                ));
                                 let progress_clone = progress.clone();
                                 std::thread::spawn(move || {
                                     redirect_stderr_to_log();
                                     let result = (|| -> Result<Vec<InvoiceTableRow>> {
-                                        saldeo_auth_noninteractive()?;
-                                        *progress_clone.lock().unwrap() =
-                                            "Saldeo: odświeżanie danych...".to_string();
+                                        ensure_saldeo_session_or_auth(Some(
+                                            progress_clone.clone(),
+                                        ))?;
+                                        set_progress(
+                                            &progress_clone,
+                                            "Saldeo: odświeżanie danych...",
+                                        );
+                                        sync_reconcile_metadata(y, false, true, &db)?;
+                                        set_progress(
+                                            &progress_clone,
+                                            "Saldeo: budowanie tabeli...",
+                                        );
                                         build_invoice_table_rows(y, score)
                                     })();
                                     let _ = tx.send(result);
                                 });
                                 pending_action = Some(PendingAction {
                                     receiver: rx,
-                                    description: "Saldeo auth".to_string(),
+                                    description: "Saldeo".to_string(),
                                     new_year: Some(y),
                                     new_review_score: Some(score),
                                     progress,
@@ -1601,8 +1722,12 @@ fn run_invoice_table_tui(
                                 }
                             }
                             MI_COMMIT => {
-                                loop_result = Ok(TuiResult::Commit);
-                                break;
+                                match begin_invoice_table_commit(rows, *year, *review_score) {
+                                    PendingActionStart::Started(action) => {
+                                        pending_action = Some(action)
+                                    }
+                                    PendingActionStart::Noop(message) => status_message = message,
+                                }
                             }
                             MI_MENU => {
                                 menu_open = true;
@@ -2763,7 +2888,7 @@ fn parse_xml_invoice(source: SourceKind, text: &str) -> InvoiceRecord {
         first_xml_text(text, &["P_14_1", "VatAmount", "vatAmount", "totalVat"])
             .and_then(|v| parse_money_minor(&v));
     record.currency = first_xml_text(text, &["KodWaluty", "Currency", "currency"])
-        .map(|v| v.trim().to_ascii_uppercase());
+        .and_then(|v| normalize_currency(&v));
     record.ksef_reference = first_xml_text(
         text,
         &["NrKSeF", "KsefNumber", "KSeFNumber", "ReferenceNumber"],
@@ -2856,7 +2981,7 @@ fn parse_json_invoice(source: SourceKind, text: &str) -> Result<InvoiceRecord> {
         get(&["net_amount", "netAmount", "totalNet", "p_13_1"]).and_then(|v| parse_money_minor(&v));
     record.vat_amount_minor =
         get(&["vat_amount", "vatAmount", "totalVat", "p_14_1"]).and_then(|v| parse_money_minor(&v));
-    record.currency = get(&["currency", "kodWaluty"]).map(|v| v.trim().to_ascii_uppercase());
+    record.currency = get(&["currency", "kodWaluty"]).and_then(|v| normalize_currency(&v));
     record.ksef_reference = get(&["ksef_reference", "nrKSeF", "ksefNumber", "referenceNumber"]);
     record.email_message_id = get(&["email_message_id", "messageId", "id"]);
     record.email_subject = get(&["email_subject", "subject"]);
@@ -2933,15 +3058,20 @@ fn parse_text_invoice(source: SourceKind, text: &str) -> InvoiceRecord {
             "termin płatności",
             "termin platnosci",
             "due date",
+            "date due",
             "payment due",
         ],
     );
     let tax_ids = tax_ids_from_text(text);
-    record.seller_tax_id = tax_ids.first().cloned();
-    record.buyer_tax_id = tax_ids.get(1).cloned();
     let (seller_name, buyer_name) = counterparty_names_from_text(text);
     record.seller_name = seller_name;
     record.buyer_name = buyer_name;
+    if tax_ids.len() == 1 && sole_tax_id_looks_like_buyer(text) {
+        record.buyer_tax_id = tax_ids.first().cloned();
+    } else {
+        record.seller_tax_id = tax_ids.first().cloned();
+        record.buyer_tax_id = tax_ids.get(1).cloned();
+    }
     record.gross_amount_minor = amount_from_text(
         text,
         &[
@@ -2960,7 +3090,16 @@ fn parse_text_invoice(source: SourceKind, text: &str) -> InvoiceRecord {
         ],
     );
     record.net_amount_minor = amount_from_text(text, &["kwota netto", "netto", "total net", "net"]);
-    record.vat_amount_minor = amount_from_text(text, &["kwota vat", "vat", "podatek"]);
+    record.vat_amount_minor = amount_from_text(
+        text,
+        &[
+            "kwota vat",
+            "podatek vat",
+            "vat amount",
+            "tax amount",
+            "podatek",
+        ],
+    );
     record.currency = currency_from_text(text);
     record.ksef_reference = ksef_reference_from_text(text);
     record.email_message_id = header_value(text, "Message-ID");
@@ -3013,25 +3152,30 @@ fn strip_xml(value: &str) -> String {
 
 fn invoice_number_from_text(text: &str) -> Option<String> {
     let patterns = [
+        r"(?im)^\s*invoice[ \t]*(?:no\.?|number)[ \t:#\-]*([A-Z0-9][A-Z0-9/_.\-]{2,})\s*$",
         r"(?i)(?:obraz\s+)?faktur(?:a|y)?\s*(?:vat)?\s*(?:nr|numer)?[\s:#\-\n]*([A-Z0-9][A-Z0-9/_.\-]{2,})",
         r"(?i)(?:nr\s*faktury|invoice\s*(?:no\.?|number)?|numer)[\s:#\-\n]*([A-Z0-9][A-Z0-9/_.\-]{2,})",
         r"(?i)\bFV[\s:#\-]*([A-Z0-9][A-Z0-9/_.\-]{2,})",
     ];
     for pattern in patterns {
         let re = Regex::new(pattern).unwrap();
-        if let Some(caps) = re.captures(text)
-            && let Some(value) = caps.get(1)
-        {
-            let cleaned = clean_invoice_number(value.as_str());
-            if !matches!(
-                cleaned.as_str(),
-                "ZOSTA" | "ZOSTAŁA" | "VAT" | "FOR" | "INVOICE"
-            ) {
-                return Some(cleaned);
+        for caps in re.captures_iter(text) {
+            if let Some(value) = caps.get(1) {
+                let cleaned = clean_invoice_number(value.as_str());
+                if is_valid_invoice_number_candidate(&cleaned) {
+                    return Some(cleaned);
+                }
             }
         }
     }
     None
+}
+
+fn is_valid_invoice_number_candidate(value: &str) -> bool {
+    !matches!(
+        value,
+        "ZOSTA" | "ZOSTAŁA" | "VAT" | "FOR" | "INVOICE" | "NUMBER" | "DATE" | "DUE"
+    )
 }
 
 fn invoice_number_from_filename(path: &Path) -> Option<String> {
@@ -3062,19 +3206,38 @@ fn clean_invoice_number(value: &str) -> String {
 }
 
 fn tax_ids_from_text(text: &str) -> Vec<String> {
-    let re = Regex::new(r"(?i)(?:NIP|VAT\s*ID|Tax\s*ID)?\s*(?:PL)?\s*([0-9][0-9\-\s]{8,}[0-9])")
-        .unwrap();
+    let patterns = [
+        r"(?i)\b(?:NIP|VAT\s*ID|Tax\s*ID|PL\s*VAT|VAT)\b[^0-9]{0,16}(?:PL)?\s*([0-9][0-9\-\s]{8,}[0-9])",
+        r"(?i)\bPL\s*([0-9]{10})\b",
+    ];
     let mut seen = HashSet::new();
     let mut ids = Vec::new();
-    for caps in re.captures_iter(text) {
-        if let Some(id) = caps.get(1).and_then(|m| normalize_tax_id(m.as_str()))
-            && id.len() >= 10
-            && seen.insert(id.clone())
-        {
-            ids.push(id);
+    for pattern in patterns {
+        let re = Regex::new(pattern).unwrap();
+        for caps in re.captures_iter(text) {
+            if let Some(id) = caps.get(1).and_then(|m| normalize_tax_id(m.as_str()))
+                && seen.insert(id.clone())
+            {
+                ids.push(id);
+            }
         }
     }
     ids
+}
+
+fn sole_tax_id_looks_like_buyer(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    [
+        "bill to",
+        "nabywca",
+        "odbiorca",
+        "kupujący",
+        "kupujacy",
+        "buyer",
+        "customer",
+    ]
+    .iter()
+    .any(|label| lower.contains(label))
 }
 
 fn normalize_tax_id(value: &str) -> Option<String> {
@@ -3089,7 +3252,16 @@ fn normalize_tax_id(value: &str) -> Option<String> {
 fn parse_date(value: &str) -> Option<NaiveDate> {
     let value = value.trim();
     for fmt in [
-        "%Y-%m-%d", "%d.%m.%Y", "%d-%m-%Y", "%Y/%m/%d", "%d/%m/%Y", "%d %m %Y",
+        "%Y-%m-%d",
+        "%d.%m.%Y",
+        "%d-%m-%Y",
+        "%Y/%m/%d",
+        "%d/%m/%Y",
+        "%d %m %Y",
+        "%B %-d, %Y",
+        "%B %d, %Y",
+        "%b %-d, %Y",
+        "%b %d, %Y",
     ] {
         if let Ok(date) = NaiveDate::parse_from_str(value, fmt) {
             return Some(date);
@@ -3099,7 +3271,11 @@ fn parse_date(value: &str) -> Option<NaiveDate> {
 }
 
 fn date_from_text(text: &str) -> Option<NaiveDate> {
-    let patterns = [r"\b\d{4}-\d{2}-\d{2}\b", r"\b\d{2}[./-]\d{2}[./-]\d{4}\b"];
+    let patterns = [
+        r"\b\d{4}-\d{2}-\d{2}\b",
+        r"\b\d{2}[./-]\d{2}[./-]\d{4}\b",
+        r"\b[A-Za-z]{3,9}\s+\d{1,2},\s+\d{4}\b",
+    ];
     for pattern in patterns {
         let re = Regex::new(pattern).unwrap();
         for m in re.find_iter(text) {
@@ -3114,7 +3290,7 @@ fn date_from_text(text: &str) -> Option<NaiveDate> {
 fn labeled_date_from_text(text: &str, labels: &[&str]) -> Option<NaiveDate> {
     for label in labels {
         let pattern = format!(
-            r"(?i){}[^0-9]{{0,30}}(\d{{4}}-\d{{2}}-\d{{2}}|\d{{2}}[./-]\d{{2}}[./-]\d{{4}})",
+            r"(?i){}[^0-9A-Z]{{0,30}}(\d{{4}}-\d{{2}}-\d{{2}}|\d{{2}}[./-]\d{{2}}[./-]\d{{4}}|[A-Z]{{3,9}}\s+\d{{1,2}},\s+\d{{4}})",
             regex::escape(label)
         );
         let re = Regex::new(&pattern).unwrap();
@@ -3146,6 +3322,7 @@ fn clean_name(value: &str) -> Option<String> {
 
 fn counterparty_names_from_text(text: &str) -> (Option<String>, Option<String>) {
     let seller = name_after_label(text, &["sprzedawca", "wystawca", "seller", "supplier"])
+        .or_else(|| name_before_label(text, &["bill to", "buyer", "customer"]))
         .or_else(|| name_before_first_nip(text));
     let buyer = name_after_label(
         text,
@@ -3156,6 +3333,7 @@ fn counterparty_names_from_text(text: &str) -> (Option<String>, Option<String>) 
             "kupujacy",
             "buyer",
             "customer",
+            "bill to",
         ],
     )
     .or_else(|| name_before_nth_nip(text, 2));
@@ -3163,25 +3341,80 @@ fn counterparty_names_from_text(text: &str) -> (Option<String>, Option<String>) 
 }
 
 fn name_after_label(text: &str, labels: &[&str]) -> Option<String> {
-    let lines = clean_lines(text);
+    let lines = raw_nonempty_lines(text);
     for (idx, line) in lines.iter().enumerate() {
         let lower = line.to_lowercase();
-        if labels.iter().any(|label| lower.contains(label)) {
-            if let Some(after_colon) = line
-                .split_once(':')
-                .and_then(|(_, value)| clean_name(value))
-                && is_probable_name_line(&after_colon)
-            {
-                return Some(after_colon);
-            }
-            for candidate in lines.iter().skip(idx + 1).take(4) {
-                if is_probable_name_line(candidate) {
-                    return clean_name(candidate);
+        let Some((label_pos, label_len)) = labels
+            .iter()
+            .find_map(|label| lower.find(label).map(|pos| (pos, label.len())))
+        else {
+            continue;
+        };
+        let prefer_right_column = !line[..label_pos].trim().is_empty();
+        if let Some(after_label) = line.get(label_pos + label_len..).and_then(clean_name)
+            && is_probable_name_line(&after_label)
+        {
+            return Some(after_label);
+        }
+        if let Some(after_colon) = line
+            .split_once(':')
+            .and_then(|(_, value)| clean_name(value))
+            && is_probable_name_line(&after_colon)
+        {
+            return Some(after_colon);
+        }
+        for candidate in lines.iter().skip(idx + 1).take(6) {
+            if prefer_right_column {
+                if let Some(segment) = right_column_segment(candidate)
+                    && is_probable_name_line(&segment)
+                {
+                    return clean_name(&segment);
                 }
+            }
+            let cleaned = candidate.split_whitespace().collect::<Vec<_>>().join(" ");
+            if is_probable_name_line(&cleaned) {
+                return clean_name(&cleaned);
             }
         }
     }
     None
+}
+
+fn name_before_label(text: &str, labels: &[&str]) -> Option<String> {
+    let lines = raw_nonempty_lines(text);
+    for (idx, line) in lines.iter().enumerate() {
+        let lower = line.to_lowercase();
+        let Some(label_pos) = labels.iter().find_map(|label| lower.find(label)) else {
+            continue;
+        };
+        if let Some(before_label) = clean_name(&line[..label_pos])
+            && is_probable_name_line(&before_label)
+        {
+            return Some(before_label);
+        }
+        for candidate in lines[..idx].iter().rev().take(8) {
+            let cleaned = candidate.split_whitespace().collect::<Vec<_>>().join(" ");
+            if is_probable_name_line(&cleaned) {
+                return clean_name(&cleaned);
+            }
+        }
+    }
+    None
+}
+
+fn raw_nonempty_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+fn right_column_segment(line: &str) -> Option<String> {
+    Regex::new(r"\s{2,}")
+        .ok()?
+        .split(line.trim())
+        .filter_map(clean_name)
+        .last()
 }
 
 fn name_before_first_nip(text: &str) -> Option<String> {
@@ -3224,7 +3457,20 @@ fn is_probable_name_line(line: &str) -> bool {
         && !lower.starts_with("ul.")
         && !lower.starts_with("ul ")
         && !lower.contains("data")
+        && !lower.contains('@')
+        && !lower.contains("http")
+        && !line.chars().next().is_some_and(|c| c.is_ascii_digit())
         && !lower.contains("faktura")
+        && !lower.contains("invoice")
+        && !lower.contains("date")
+        && !lower.contains("street")
+        && !lower.contains("united states")
+        && !lower.contains("poland")
+        && !lower.contains("california")
+        && !lower.contains("warszawa")
+        && !lower.contains("pasadena")
+        && !lower.contains("p.o. box")
+        && !lower.contains("pmb ")
         && !lower.contains("razem")
         && !lower.contains("zapłaty")
         && !lower.contains("zapl")
@@ -3281,7 +3527,7 @@ fn parse_money_minor(value: &str) -> Option<i64> {
 fn amount_from_text(text: &str, labels: &[&str]) -> Option<i64> {
     for label in labels {
         let pattern = format!(
-            r"(?i){}[^0-9\-]{{0,40}}(-?[0-9][0-9\s.,]{{0,20}})",
+            r"(?i){}[^0-9€$£\-]{{0,120}}(?:[€$£]\s*)?(-?[0-9][0-9\s.,]{{0,20}})",
             regex::escape(label)
         );
         let re = Regex::new(&pattern).unwrap();
@@ -3294,11 +3540,75 @@ fn amount_from_text(text: &str, labels: &[&str]) -> Option<i64> {
     None
 }
 
+fn normalize_currency(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let code_re = Regex::new(r"(?i)\b(PLN|EUR|USD|GBP|CHF|CZK|SEK|NOK|DKK)\b").unwrap();
+    if let Some(code) = code_re.captures(value).and_then(|caps| caps.get(1)) {
+        return Some(code.as_str().to_ascii_uppercase());
+    }
+
+    let lower = value.to_lowercase();
+    if lower.contains('€') || Regex::new(r"(?i)\beuro\b").unwrap().is_match(value) {
+        return Some("EUR".to_string());
+    }
+    if lower.contains("zł")
+        || Regex::new(r"(?i)\bzl\b|\bzlot(?:y|ych|e)?\b|\bzłot(?:y|ych|e)?\b")
+            .unwrap()
+            .is_match(value)
+    {
+        return Some("PLN".to_string());
+    }
+    if value.contains('$')
+        || Regex::new(r"(?i)\bdol(?:ar|lar|lars?)\b")
+            .unwrap()
+            .is_match(value)
+    {
+        return Some("USD".to_string());
+    }
+    if value.contains('£')
+        || Regex::new(r"(?i)\b(?:gbp|pound|funt)\b")
+            .unwrap()
+            .is_match(value)
+    {
+        return Some("GBP".to_string());
+    }
+    if Regex::new(r"(?i)\bfrank(?:a|ów)?\b")
+        .unwrap()
+        .is_match(value)
+    {
+        return Some("CHF".to_string());
+    }
+
+    None
+}
+
 fn currency_from_text(text: &str) -> Option<String> {
-    let re = Regex::new(r"\b(PLN|EUR|USD|GBP|CHF)\b").unwrap();
-    re.captures(text)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_ascii_uppercase())
+    let labels = [
+        "waluta",
+        "currency",
+        "currency code",
+        "kod waluty",
+        "kwota",
+        "razem",
+        "total",
+        "amount",
+        "do zapłaty",
+        "do zaplaty",
+    ];
+    for label in labels {
+        let pattern = format!(r"(?i){}[^\n]{{0,80}}", regex::escape(label));
+        let re = Regex::new(&pattern).unwrap();
+        for value in re.find_iter(text) {
+            if let Some(currency) = normalize_currency(value.as_str()) {
+                return Some(currency);
+            }
+        }
+    }
+    normalize_currency(text)
 }
 
 fn ksef_reference_from_text(text: &str) -> Option<String> {
@@ -4721,7 +5031,7 @@ fn ksef_metadata_to_record(item: &Value) -> Option<InvoiceRecord> {
     record.gross_amount_minor = money_value_to_minor(item.get("grossAmount"));
     record.net_amount_minor = money_value_to_minor(item.get("netAmount"));
     record.vat_amount_minor = money_value_to_minor(item.get("vatAmount"));
-    record.currency = json_string(item, "currency").map(|v| v.to_ascii_uppercase());
+    record.currency = json_string(item, "currency").and_then(|v| normalize_currency(&v));
 
     if let Some(seller) = item.get("seller") {
         record.seller_tax_id = json_string(seller, "nip").and_then(|v| normalize_tax_id(&v));
@@ -5304,7 +5614,7 @@ fn apply_extracted_invoice_json(record: &mut InvoiceRecord, value: &Value) {
     }
     if record.currency.is_none() {
         record.currency =
-            json_first_string(value, &["currency"]).map(|v| v.trim().to_ascii_uppercase());
+            json_first_string(value, &["currency"]).and_then(|v| normalize_currency(&v));
     }
     if record.seller_tax_id.is_none() {
         record.seller_tax_id =
@@ -5510,7 +5820,12 @@ fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<Value> {
     match name {
         "sync" => {
             let year = json_i32(args, "year", 2026);
-            let conn = if json_bool(args, "store", false) {
+            let auto_store_online_ksef = json_path_arg(args, "ksef_input").is_none()
+                && (json_bool(args, "ksef", false)
+                    || (!json_bool(args, "ksef", false)
+                        && !json_bool(args, "mail", false)
+                        && !json_bool(args, "saldeo", false)));
+            let conn = if json_bool(args, "store", false) || auto_store_online_ksef {
                 Some(open_db(db_path)?)
             } else {
                 None
@@ -5759,10 +6074,22 @@ fn saldeo_upload_plan(
     plan: &mut SaldeoSyncPlan,
     storage_state: &Path,
     upload_url: &str,
+    file_field: &str,
+) -> Result<()> {
+    saldeo_upload_plan_with_progress(plan, storage_state, upload_url, file_field, None)
+}
+
+fn saldeo_upload_plan_with_progress(
+    plan: &mut SaldeoSyncPlan,
+    storage_state: &Path,
+    upload_url: &str,
     _file_field: &str,
+    progress: Option<Arc<Mutex<String>>>,
 ) -> Result<()> {
     let session = read_saldeo_session(storage_state)?;
     let client = Client::builder().build()?;
+    let uploadable_count = plan.items.iter().filter(|item| item.can_upload).count();
+    let mut upload_index = 0usize;
     for item in &mut plan.items {
         if !item.can_upload {
             continue;
@@ -5770,6 +6097,18 @@ fn saldeo_upload_plan(
         let Some(source_path) = &item.source_path else {
             continue;
         };
+        upload_index += 1;
+        if let Some(progress) = &progress {
+            let label = Path::new(source_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .or(item.invoice_number.as_deref())
+                .unwrap_or("plik");
+            set_progress(
+                progress,
+                format!("Upload Saldeo {upload_index}/{uploadable_count}: {label}"),
+            );
+        }
         let upload_year = item.issue_date.map(|d| d.year()).unwrap_or(plan.year);
         let upload_month = item
             .issue_date
@@ -6121,7 +6460,15 @@ fn saldeo_fetch(year: i32, storage_state: &Path, out_dir: &Path) -> Result<Salde
         }
     }
 
-    let records = saldeo_documents_to_records(&documents);
+    let mut records = saldeo_documents_to_records(&documents);
+    saldeo_enrich_records_from_ksef(&mut records, year)?;
+    saldeo_enrich_records_from_downloads(
+        &client,
+        &cookie_header,
+        out_dir,
+        &documents,
+        &mut records,
+    )?;
     let raw_output = out_dir.join("documents.json");
     let records_output = out_dir.join("records.jsonl");
     fs::write(&raw_output, serde_json::to_vec_pretty(&documents)?)?;
@@ -6170,6 +6517,199 @@ fn saldeo_documents_to_records(documents: &[Value]) -> Vec<InvoiceRecord> {
         .collect()
 }
 
+fn saldeo_enrich_records_from_ksef(records: &mut [InvoiceRecord], year: i32) -> Result<()> {
+    let ksef_path = configured_ksef_out_path(year);
+    if !ksef_path.exists() {
+        return Ok(());
+    }
+    let ksef_records = load_records(SourceKind::Ksef, &ksef_path)
+        .with_context(|| format!("odczyt lokalnych metadanych KSeF {}", ksef_path.display()))?;
+    let by_ksef = ksef_records
+        .iter()
+        .filter_map(|record| {
+            record
+                .ksef_reference
+                .as_ref()
+                .map(|ksef| (ksef.clone(), record))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut enriched = 0usize;
+    for record in records.iter_mut() {
+        let Some(ksef_reference) = record.ksef_reference.as_ref() else {
+            continue;
+        };
+        let Some(ksef_record) = by_ksef.get(ksef_reference) else {
+            continue;
+        };
+        if merge_missing_invoice_metadata(record, ksef_record) {
+            enriched += 1;
+            record
+                .warnings
+                .push("saldeo enriched from ksef metadata".to_string());
+        }
+    }
+    if enriched > 0 {
+        eprintln!("  [Saldeo] uzupełniono z KSeF: {enriched} rekordów");
+    }
+    Ok(())
+}
+
+fn saldeo_enrich_records_from_downloads(
+    client: &Client,
+    cookie_header: &str,
+    out_dir: &Path,
+    documents: &[Value],
+    records: &mut [InvoiceRecord],
+) -> Result<()> {
+    let mut by_hash = records
+        .iter()
+        .enumerate()
+        .map(|(idx, record)| (record.content_hash.clone(), idx))
+        .collect::<HashMap<_, _>>();
+    let mut enriched = 0usize;
+    for doc in documents {
+        let Some(document_id) = saldeo_document_id_from_value(doc) else {
+            continue;
+        };
+        let key = format!("saldeo:{document_id}");
+        let Some(record_idx) = by_hash.get(&key).copied() else {
+            continue;
+        };
+        if record_has_counterparty(&records[record_idx])
+            && records[record_idx].issue_date.is_some()
+            && records[record_idx].gross_amount_minor.is_some()
+        {
+            continue;
+        }
+        let Some(download_url) = json_string(doc, "downloadUrl") else {
+            continue;
+        };
+        let local_path = saldeo_cached_document_path(out_dir, doc, &document_id);
+        if let Err(err) =
+            saldeo_download_document(client, cookie_header, &download_url, &local_path)
+        {
+            records[record_idx]
+                .warnings
+                .push(format!("saldeo download fallback failed: {err}"));
+            continue;
+        }
+        match parse_file(SourceKind::Saldeo, &local_path) {
+            Ok(parsed) => {
+                if merge_missing_invoice_metadata(&mut records[record_idx], &parsed) {
+                    records[record_idx]
+                        .warnings
+                        .push("saldeo enriched from downloaded document".to_string());
+                    enriched += 1;
+                }
+            }
+            Err(err) => records[record_idx]
+                .warnings
+                .push(format!("saldeo parse fallback failed: {err}")),
+        }
+    }
+    if enriched > 0 {
+        eprintln!("  [Saldeo] uzupełniono z pobranych plików: {enriched} rekordów");
+    }
+    by_hash.clear();
+    Ok(())
+}
+
+fn saldeo_document_id_from_value(doc: &Value) -> Option<String> {
+    json_scalar_string(doc, "documentId")
+}
+
+fn saldeo_cached_document_path(out_dir: &Path, doc: &Value, document_id: &str) -> PathBuf {
+    let filename = json_string(doc, "filename")
+        .or_else(|| json_string(doc, "name"))
+        .unwrap_or_else(|| format!("{document_id}.bin"));
+    out_dir
+        .join("files")
+        .join(format!("{}_{}", document_id, sanitize_filename(&filename)))
+}
+
+fn saldeo_download_document(
+    client: &Client,
+    cookie_header: &str,
+    download_url: &str,
+    local_path: &Path,
+) -> Result<()> {
+    if local_path.is_file() && local_path.metadata().map(|m| m.len()).unwrap_or(0) > 0 {
+        return Ok(());
+    }
+    if let Some(parent) = local_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    let bytes = client
+        .get(download_url)
+        .header("Cookie", cookie_header)
+        .send()
+        .with_context(|| format!("Saldeo download {download_url}"))?
+        .error_for_status()
+        .with_context(|| format!("Saldeo download status {download_url}"))?
+        .bytes()
+        .with_context(|| format!("Saldeo download body {download_url}"))?;
+    fs::write(local_path, &bytes).with_context(|| format!("zapis {}", local_path.display()))?;
+    Ok(())
+}
+
+fn record_has_counterparty(record: &InvoiceRecord) -> bool {
+    record
+        .seller_name
+        .as_ref()
+        .or(record.buyer_name.as_ref())
+        .is_some_and(|name| !name.trim().is_empty())
+}
+
+fn merge_missing_invoice_metadata(target: &mut InvoiceRecord, source: &InvoiceRecord) -> bool {
+    let mut changed = false;
+    macro_rules! fill_clone {
+        ($field:ident) => {
+            if target.$field.is_none() {
+                if let Some(value) = source.$field.clone() {
+                    target.$field = Some(value);
+                    changed = true;
+                }
+            }
+        };
+    }
+    macro_rules! fill_copy {
+        ($field:ident) => {
+            if target.$field.is_none() {
+                if let Some(value) = source.$field {
+                    target.$field = Some(value);
+                    changed = true;
+                }
+            }
+        };
+    }
+    if target.invoice_number.is_none()
+        || target
+            .invoice_number
+            .as_deref()
+            .is_some_and(looks_like_filename_invoice_number)
+    {
+        if let Some(value) = source.invoice_number.clone() {
+            if !looks_like_filename_invoice_number(&value) {
+                target.invoice_number = Some(value);
+                changed = true;
+            }
+        }
+    }
+    fill_clone!(seller_tax_id);
+    fill_clone!(buyer_tax_id);
+    fill_clone!(seller_name);
+    fill_clone!(buyer_name);
+    fill_copy!(issue_date);
+    fill_copy!(sale_date);
+    fill_copy!(due_date);
+    fill_copy!(gross_amount_minor);
+    fill_copy!(net_amount_minor);
+    fill_copy!(vat_amount_minor);
+    fill_clone!(currency);
+    fill_clone!(ksef_reference);
+    changed
+}
+
 fn saldeo_document_to_record(doc: &Value) -> Option<InvoiceRecord> {
     let invoice_number = json_string(doc, "number").or_else(|| json_string(doc, "name"));
     let ksef_reference = json_string(doc, "ksefNumber");
@@ -6187,18 +6727,20 @@ fn saldeo_document_to_record(doc: &Value) -> Option<InvoiceRecord> {
     record.gross_amount_minor = money_value_to_minor(doc.get("grossPrice"));
     record.net_amount_minor = money_value_to_minor(doc.get("netPrice"));
     record.vat_amount_minor = money_value_to_minor(doc.get("vatPrice"));
-    record.currency = json_string(doc, "currency").or_else(|| {
-        doc.get("grossPrice")
-            .and_then(|v| v.get("currency"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
+    record.currency = json_string(doc, "currency")
+        .or_else(|| {
+            doc.get("grossPrice")
+                .and_then(|v| v.get("currency"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .and_then(|v| normalize_currency(&v));
     record.ksef_reference = ksef_reference;
     record.seller_name = json_string(doc, "contractorDescription")
         .or_else(|| json_string(doc, "contractorName"))
         .and_then(|v| clean_name(&v));
     record.source_path = json_string(doc, "downloadUrl").or_else(|| json_string(doc, "filename"));
-    record.content_hash = json_string(doc, "documentId")
+    record.content_hash = saldeo_document_id_from_value(doc)
         .map(|id| format!("saldeo:{id}"))
         .or_else(|| record.ksef_reference.clone())
         .unwrap_or_else(|| {
@@ -6206,6 +6748,23 @@ fn saldeo_document_to_record(doc: &Value) -> Option<InvoiceRecord> {
             hex::encode(Sha256::digest(raw.as_bytes()))
         });
     Some(record)
+}
+
+fn looks_like_filename_invoice_number(value: &str) -> bool {
+    let upper = value.trim().to_ascii_uppercase();
+    upper.ends_with(".PDF")
+        || upper.ends_with(".XML")
+        || upper.ends_with(".JPG")
+        || upper.ends_with(".JPEG")
+        || upper.ends_with(".PNG")
+}
+
+fn json_scalar_string(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(|v| match v {
+        Value::String(s) => Some(s.trim().to_string()).filter(|s| !s.is_empty()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    })
 }
 
 fn json_string(value: &Value, key: &str) -> Option<String> {
@@ -6667,6 +7226,7 @@ struct OnboardStatus {
     saldeo_valid: bool,
     pdftotext_ok: bool,
     python_ok: bool,
+    openssl_ok: bool,
     year: i32,
     ksef_dir: PathBuf,
     ksef_data_exists: bool,
@@ -6731,6 +7291,7 @@ impl OnboardStatus {
     fn all_ok(&self) -> bool {
         self.pdftotext_ok
             && self.python_ok
+            && self.openssl_ok
             && self.gmail_authed
             && self.saldeo_valid
             && self.ksef_api_ok
@@ -6850,6 +7411,11 @@ fn collect_onboard_status(db_path: &Path) -> Result<OnboardStatus> {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
+    let openssl_ok = Command::new("openssl")
+        .arg("version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
 
     let db_exists = db_path.exists();
     if !db_exists {
@@ -6889,6 +7455,7 @@ fn collect_onboard_status(db_path: &Path) -> Result<OnboardStatus> {
         saldeo_valid,
         pdftotext_ok,
         python_ok,
+        openssl_ok,
         year,
         ksef_dir,
         ksef_data_exists,
@@ -6926,6 +7493,14 @@ fn print_onboard_status(status: &OnboardStatus, db_path: &Path) {
             "✓"
         } else {
             "✗ (zainstaluj ppmlx i model gemma-4-e4b)"
+        }
+    );
+    eprintln!(
+        "  openssl:         {}",
+        if status.openssl_ok {
+            "✓"
+        } else {
+            "✗ (potrzebny do szyfrowania tokenu KSeF)"
         }
     );
     eprintln!(
@@ -6995,6 +7570,9 @@ fn onboard_next_steps(status: &OnboardStatus, gmail_ok: bool) -> Vec<&'static st
     if !status.python_ok {
         steps.push("Zainstaluj ppmlx i pobierz model: ppmlx pull gemma-4-e4b");
     }
+    if !status.openssl_ok {
+        steps.push("Zainstaluj openssl/libressl CLI potrzebny do szyfrowania tokenu KSeF");
+    }
     if !gmail_ok {
         steps.push("lab onboard --gmail-client-secret <ścieżka>");
     }
@@ -7016,7 +7594,7 @@ fn onboard_next_steps(status: &OnboardStatus, gmail_ok: bool) -> Vec<&'static st
 fn write_onboard_check_json(status: &OnboardStatus) -> Result<()> {
     let steps = onboard_next_steps(status, status.gmail_authed);
     let status_json = serde_json::json!({
-        "prerequisites": { "pdftotext": status.pdftotext_ok, "ppmlx_gemma": status.python_ok },
+        "prerequisites": { "pdftotext": status.pdftotext_ok, "ppmlx_gemma": status.python_ok, "openssl": status.openssl_ok },
         "gmail": { "token_valid": status.gmail_authed },
         "saldeo": { "session_valid": status.saldeo_valid },
         "ksef": { "api_ok": status.ksef_api_ok, "data_exists": status.ksef_data_exists },
@@ -7148,6 +7726,36 @@ fn onboard_edit_env_secret(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn ensure_saldeo_session_or_auth(progress: Option<Arc<Mutex<String>>>) -> Result<()> {
+    let storage_state = default_saldeo_storage_state_path();
+    if let Some(progress) = &progress {
+        set_progress(progress, "Saldeo: sprawdzam zapisane cookies...");
+    }
+    if saldeo_session_valid(&storage_state) {
+        return Ok(());
+    }
+
+    if let Some(progress) = &progress {
+        set_progress(
+            progress,
+            "Saldeo: sesja nieważna — zaloguj się w Helium; zapiszę auth automatycznie...",
+        );
+    }
+    saldeo_auth_noninteractive()?;
+
+    let storage_state = default_saldeo_storage_state_path();
+    if let Some(progress) = &progress {
+        set_progress(progress, "Saldeo: sprawdzam nowe cookies...");
+    }
+    if saldeo_session_valid(&storage_state) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "Saldeo auth nie jest jeszcze poprawny; zaloguj się w Helium i spróbuj ponownie"
+        ))
+    }
+}
+
 fn saldeo_auth_noninteractive() -> Result<()> {
     let target = preferred_saldeo_storage_state_path();
     if let Some(parent) = target.parent() {
@@ -7163,30 +7771,94 @@ fn saldeo_auth_noninteractive() -> Result<()> {
     let node_script = r#"
 const { chromium } = require('playwright');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function cookieHeader(cookies) {
+  return cookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; ');
+}
+
+function xsrfToken(cookies) {
+  const cookie = cookies.find(cookie => cookie.name === 'X-SALDEO-XSRF-C-TOKEN');
+  return cookie && cookie.value;
+}
+
+function authCheckBody() {
+  return {
+    pagination: { pageNumber: 0, pageSize: 1, totalCount: 0,
+      columnSorted: { sortColumn: 'DOCUMENT_CREATE_DATE', sortDirection: 'ASC' } },
+    filter: { period: { partOfYear: 1, year: new Date().getFullYear(), selectionType: 'selectedMonth' },
+      duplicatesEnable: false, duplicates: false, splitPayment: false,
+      types: [], contractors: [], stages: [], categories: [], registers: [],
+      tags: [], assignUsers: [], addedBy: [], added: [],
+      paymentStatuses: [], accountingPaymentTypes: [],
+      searchQuery: '', selectKsefDocumentsYesCheckbox: false,
+      selectKsefDocumentsNoCheckbox: false, ksefNumber: '',
+      ksefMiniWorkflowStatus: null, ksefBoId: null,
+      dimensionReportDocumentIds: [], dimensions: null }
+  };
+}
+
+async function storageAuthenticated(context) {
+  const state = await context.storageState();
+  const cookies = state.cookies || [];
+  const xsrf = xsrfToken(cookies);
+  if (!xsrf) return false;
+  try {
+    const response = await context.request.post('https://saldeo.brainshare.pl/rest/client/document/list/search', {
+      headers: {
+        Cookie: cookieHeader(cookies),
+        'X-SALDEO-XSRF-H-TOKEN': xsrf,
+        saldeoApp: 'angularApp',
+        timeout: '60000',
+      },
+      data: authCheckBody(),
+    });
+    return response.ok();
+  } catch (_) {
+    return false;
+  }
+}
+
 (async () => {
   const out = process.env.LAB_SALDEO_STORAGE_STATE;
   const url = process.env.SALDEO_URL || 'https://saldeo.brainshare.pl/';
   const executablePath = process.env.HELIUM_EXECUTABLE;
-  const userDataDir = path.join(require('os').homedir(), '.config', 'lab', 'helium-profile');
+  const timeoutMs = Number.parseInt(process.env.SALDEO_AUTH_TIMEOUT_MS || '180000', 10);
+  const userDataDir = path.join(os.homedir(), '.config', 'lab', 'helium-profile');
   fs.mkdirSync(userDataDir, { recursive: true });
   const context = await chromium.launchPersistentContext(userDataDir, {
     executablePath,
     headless: false,
     viewport: { width: 1400, height: 1000 },
   });
+  let closed = false;
+  context.once('close', () => { closed = true; });
   const page = context.pages()[0] || await context.newPage();
   await page.goto(url, { waitUntil: 'domcontentloaded' });
-  await Promise.race([
-    new Promise(resolve => context.once('close', resolve)),
-    new Promise(resolve => setTimeout(resolve, 120000)),
-  ]);
-  try {
+
+  const deadline = Date.now() + timeoutMs;
+  let authenticated = false;
+  while (!closed && Date.now() < deadline) {
+    await context.storageState({ path: out }).catch(() => {});
+    if (await storageAuthenticated(context)) {
+      authenticated = true;
+      break;
+    }
+    await sleep(2000);
+  }
+
+  if (!closed) {
     await context.storageState({ path: out });
     await context.close().catch(() => {});
-  } catch (e) {
-    console.error('storageState error:', e.message);
-    process.exit(1);
+  }
+  if (!authenticated) {
+    console.error(`Saldeo auth timeout after ${Math.round(timeoutMs / 1000)}s`);
+    process.exit(2);
   }
 })().catch(err => { console.error(err && err.stack ? err.stack : err); process.exit(1); });
 "#;
@@ -7202,7 +7874,6 @@ const path = require('path');
         .env("HELIUM_EXECUTABLE", &helium)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
         .output()
         .context("uruchomienie npx playwright + Helium (noninteractive)")?;
     if !output.status.success() {
@@ -7256,63 +7927,7 @@ fn run_saldeo_auth_script() -> Result<()> {
     eprintln!(
         "Nie znalazłem scripts/saldeo-auth.sh — uruchamiam fallback przez npx playwright + Helium."
     );
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-    }
-    let url =
-        std::env::var("SALDEO_URL").unwrap_or_else(|_| "https://saldeo.brainshare.pl/".to_string());
-    let helium = std::env::var("HELIUM_EXECUTABLE")
-        .unwrap_or_else(|_| "/Applications/Helium.app/Contents/MacOS/Helium".to_string());
-    if !Path::new(&helium).is_file() {
-        return Err(anyhow!("nie znalazłem Helium executable: {helium}"));
-    }
-    let node_script = r#"
-const { chromium } = require('playwright');
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
-const readline = require('readline');
-(async () => {
-  const out = process.env.LAB_SALDEO_STORAGE_STATE;
-  const url = process.env.SALDEO_URL || 'https://saldeo.brainshare.pl/';
-  const executablePath = process.env.HELIUM_EXECUTABLE;
-  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lab-helium-profile-'));
-  const context = await chromium.launchPersistentContext(userDataDir, { executablePath, headless: false, viewport: { width: 1400, height: 1000 } });
-  const page = context.pages()[0] || await context.newPage();
-  await page.goto(url, { waitUntil: 'domcontentloaded' });
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  await new Promise(resolve => rl.question('\nPo zalogowaniu naciśnij Enter, żeby zapisać auth... ', resolve));
-  rl.close();
-  await context.storageState({ path: out });
-  await context.close();
-  fs.rmSync(userDataDir, { recursive: true, force: true });
-})().catch(err => { console.error(err && err.stack ? err.stack : err); process.exit(1); });
-"#;
-    let status = Command::new("npx")
-        .arg("--yes")
-        .arg("-p")
-        .arg("playwright")
-        .arg("node")
-        .arg("-e")
-        .arg(node_script)
-        .env("LAB_SALDEO_STORAGE_STATE", &target)
-        .env("SALDEO_URL", &url)
-        .env("HELIUM_EXECUTABLE", &helium)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .context("uruchomienie npx playwright + Helium")?;
-    if !status.success() {
-        return Err(anyhow!("Playwright auth zakończył się błędem: {status}"));
-    }
-    if !target.exists() {
-        return Err(anyhow!(
-            "storage state nie został zapisany: {}",
-            target.display()
-        ));
-    }
-    save_saldeo_storage_state_secret(&target)?;
+    saldeo_auth_noninteractive()?;
     eprintln!("✓ Zapisano Saldeo auth: {}\n", target.display());
     Ok(())
 }
@@ -7565,6 +8180,7 @@ fn doctor(db_path: &Path, token_env: &str) -> Result<()> {
     let gmail_usable = gmail_env_present || status.gmail_authed;
     let all_ok = status.pdftotext_ok
         && status.python_ok
+        && status.openssl_ok
         && gmail_usable
         && status.saldeo_valid
         && status.ksef_api_ok
@@ -7589,7 +8205,8 @@ fn doctor(db_path: &Path, token_env: &str) -> Result<()> {
         "year": year,
         "prerequisites": {
             "pdftotext_present": status.pdftotext_ok,
-            "ppmlx_present": status.python_ok
+            "ppmlx_present": status.python_ok,
+            "openssl_present": status.openssl_ok
         },
         "gmail": {
             "token_env": token_env,
@@ -7653,6 +8270,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn maps_ksef_online_metadata_to_invoice_record() {
+        let metadata = serde_json::json!({
+            "ksefNumber": "5242920020-20260501-ABCDEF1234-12",
+            "invoiceNumber": "FV/42/2026",
+            "issueDate": "2026-05-01",
+            "seller": {"nip": "521-000-00-01", "name": "Sprzedawca Sp. z o.o."},
+            "buyer": {"identifier": {"type": "Nip", "value": "5242920020"}, "name": "Productmesh"},
+            "netAmount": 100.0,
+            "grossAmount": 123.0,
+            "vatAmount": 23.0,
+            "currency": "pln"
+        });
+        let record = ksef_metadata_to_record(&metadata).unwrap();
+        assert_eq!(
+            record.content_hash,
+            "ksef:5242920020-20260501-ABCDEF1234-12"
+        );
+        assert_eq!(record.invoice_number.as_deref(), Some("FV/42/2026"));
+        assert_eq!(
+            record.ksef_reference.as_deref(),
+            Some("5242920020-20260501-ABCDEF1234-12")
+        );
+        assert_eq!(record.seller_tax_id.as_deref(), Some("5210000001"));
+        assert_eq!(record.buyer_tax_id.as_deref(), Some("5242920020"));
+        assert_eq!(record.gross_amount_minor, Some(12300));
+        assert_eq!(record.currency.as_deref(), Some("PLN"));
+    }
+
+    #[test]
+    fn ksef_year_ranges_are_quarterly() {
+        let ranges = ksef_year_quarter_ranges(2026);
+        assert_eq!(ranges.len(), 4);
+        assert_eq!(ranges[0].0, "2026-01-01T00:00:00+00:00");
+        assert_eq!(ranges[3].1, "2027-01-01T00:00:00+00:00");
+    }
+
+    #[test]
     fn parses_ksef_like_xml() {
         let xml = r#"
         <Faktura>
@@ -7687,12 +8341,53 @@ mod tests {
 
     #[test]
     fn parses_text_invoice() {
-        let text = "Subject: Faktura FV/9/2026\nFrom: billing@example.com\nNIP 521-000-00-01\nData: 01.05.2026\nRazem do zapłaty: 99,90 PLN";
+        let text = "Subject: Faktura FV/9/2026\nFrom: billing@example.com\nNIP 521-000-00-01\nData: 01.05.2026\nRazem do zapłaty: 99,90 zł";
         let record = parse_text_invoice(SourceKind::Mail, text);
         assert_eq!(record.invoice_number.as_deref(), Some("FV/9/2026"));
         assert_eq!(record.seller_tax_id.as_deref(), Some("5210000001"));
         assert_eq!(record.gross_amount_minor, Some(9990));
         assert_eq!(record.currency.as_deref(), Some("PLN"));
+    }
+
+    #[test]
+    fn parses_stripe_style_invoice_counterparties() {
+        let text = r#"Invoice
+Invoice number 44871C26-0020
+Date of issue  January 5, 2026
+Date due       January 5, 2026
+
+
+Anthropic, PBC                                    Bill to
+548 Market Street                                 Rafal Wyderka
+PMB 90375                                         Mokra 33/49
+San Francisco, California 94104                   03-562 Warszawa
+United States                                     Poland
+support@anthropic.com                             wyderkarafal@gmail.com
+                                                  PL VAT PL5242920020
+
+€12.91 due January 5, 2026
+Subtotal                                              €12.91
+Total                                                 €12.91
+Amount due                                           €12.91
+"#;
+        let record = parse_text_invoice(SourceKind::Saldeo, text);
+        assert_eq!(record.invoice_number.as_deref(), Some("44871C26-0020"));
+        assert_eq!(record.seller_name.as_deref(), Some("Anthropic, PBC"));
+        assert_eq!(record.buyer_name.as_deref(), Some("Rafal Wyderka"));
+        assert_eq!(record.buyer_tax_id.as_deref(), Some("5242920020"));
+        assert_eq!(record.gross_amount_minor, Some(1291));
+        assert_eq!(record.currency.as_deref(), Some("EUR"));
+    }
+
+    #[test]
+    fn normalizes_invoice_currency_variants() {
+        assert_eq!(normalize_currency("zł"), Some("PLN".to_string()));
+        assert_eq!(normalize_currency("waluta: euro"), Some("EUR".to_string()));
+        assert_eq!(normalize_currency("Currency: usd"), Some("USD".to_string()));
+        assert_eq!(
+            currency_from_text("Total due: 42.00 €"),
+            Some("EUR".to_string())
+        );
     }
 
     #[test]

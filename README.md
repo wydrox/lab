@@ -42,7 +42,7 @@ Sam test (bez kreatora):
 lab onboard --check
 ```
 
-Pobranie auth do Saldeo przez Playwright: wybierz `SALDEO_AUTH_SCRIPT` w `lab onboard`, albo uruchom ręcznie. Używa Helium Browser (`/Applications/Helium.app/Contents/MacOS/Helium`); można nadpisać `HELIUM_EXECUTABLE=/ścieżka/do/Helium`.
+Pobranie auth do Saldeo przez Playwright: wybierz `SALDEO_AUTH_SCRIPT` w `lab onboard`, albo uruchom ręcznie. Używa Helium Browser (`/Applications/Helium.app/Contents/MacOS/Helium`); można nadpisać `HELIUM_EXECUTABLE=/ścieżka/do/Helium`. Skrypt automatycznie zapisuje auth po poprawnym sprawdzeniu cookies (bez ręcznego Enter); timeout można zmienić przez `SALDEO_AUTH_TIMEOUT_MS`.
 
 ```bash
 ./scripts/saldeo-auth.sh
@@ -55,7 +55,7 @@ Pobranie auth do Saldeo przez Playwright: wybierz `SALDEO_AUTH_SCRIPT` w `lab on
 ```bash
 lab                      # interaktywna tabela faktur: akcje upload / zatwierdź KSeF / odrzuć KSeF
 lab sync                 # synchronizuje wszystkie trzy źródła
-lab sync --ksef          # tylko KSeF
+lab sync --ksef          # tylko KSeF online; zapisuje metadane także do lokalnej SQLite
 lab sync --mail          # tylko Gmail/PDF (pobiera, parsuje, filtruje)
 lab sync --saldeo        # tylko Saldeo
 
@@ -74,7 +74,7 @@ lab upload                 # plan brakujących załączników Gmail → Saldeo
 lab upload --confirm       # faktyczny upload brakujących załączników
 ```
 
-Puste `lab` otwiera interaktywną tabelę faktur z tri-reconcile. Skróty: `j/k` lub strzałki — ruch, `u` — upload do Saldeo, `a` — zatwierdź KSeF, `r` — odrzuć KSeF, `n` — wyczyść, `f` — filtr pozycji z możliwymi akcjami, `c` — wykonaj, `q` — wyjdź. Zapis w Saldeo wymaga dodatkowego potwierdzenia po wyjściu z tabeli.
+Puste `lab` otwiera interaktywną tabelę faktur z tri-reconcile. Skróty: `j/k` lub strzałki — ruch, `u` — upload do Saldeo, `a` — zatwierdź KSeF, `r` — odrzuć KSeF, `n` — wyczyść, `f` — filtr pozycji z możliwymi akcjami, `c` — wykonaj, `q` — wyjdź. `Akceptuj` wykonuje wybrane operacje bez wychodzenia z tabeli i odświeża status/tabelę na bieżąco.
 
 ## Automatyzacja macOS
 
