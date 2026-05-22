@@ -217,6 +217,26 @@ fn saldeo_without_ksef_reference_is_not_ksef_approvable_in_tui() {
         ksef: None,
         saldeo: Some(saldeo),
     };
-    let table_row = invoice_table_row_from_reconcile_row(&row, &HashMap::new()).unwrap();
+    let statuses = HashMap::new();
+    let table_row = invoice_table_row_from_reconcile_row(&row, Some(&statuses)).unwrap();
+    assert_eq!(invoice_table_action_ksef_label(&table_row), "—");
+}
+#[test]
+fn missing_saldeo_statuses_do_not_make_ksef_rows_actionable() {
+    let mut saldeo = empty_record(SourceKind::Saldeo);
+    saldeo.content_hash = "saldeo:123".into();
+    saldeo.invoice_number = Some("FV/1/2026".into());
+    saldeo.ksef_reference = Some("KSEF-REF".into());
+
+    let row = TriRow {
+        status: "ksef_saldeo_missing_gmail".into(),
+        mail_score_to_ksef: None,
+        mail_score_to_saldeo: None,
+        ksef_score_to_saldeo: Some(100),
+        mail: None,
+        ksef: None,
+        saldeo: Some(saldeo),
+    };
+    let table_row = invoice_table_row_from_reconcile_row(&row, None).unwrap();
     assert_eq!(invoice_table_action_ksef_label(&table_row), "—");
 }

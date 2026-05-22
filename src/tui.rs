@@ -30,6 +30,123 @@ pub(crate) enum TuiResult {
     Onboard,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TuiTheme {
+    light: bool,
+}
+
+impl TuiTheme {
+    fn detect() -> Self {
+        if let Ok(value) = std::env::var("LAB_TUI_THEME") {
+            return Self {
+                light: matches!(value.to_ascii_lowercase().as_str(), "light" | "jasny"),
+            };
+        }
+        if let Ok(value) = std::env::var("TERM_BACKGROUND") {
+            return Self {
+                light: value.eq_ignore_ascii_case("light"),
+            };
+        }
+        let light = std::env::var("COLORFGBG")
+            .ok()
+            .and_then(|value| {
+                value
+                    .split(';')
+                    .next_back()
+                    .and_then(|bg| bg.parse::<u8>().ok())
+            })
+            .is_some_and(|bg| bg == 7 || bg >= 15);
+        Self { light }
+    }
+
+    fn neutral(self) -> Style {
+        Style::default().fg(Color::Reset)
+    }
+
+    fn muted(self) -> Style {
+        Style::default().fg(if self.light {
+            Color::DarkGray
+        } else {
+            Color::Gray
+        })
+    }
+
+    fn very_muted(self) -> Style {
+        Style::default().fg(Color::DarkGray)
+    }
+
+    fn header(self) -> Style {
+        Style::default()
+            .fg(if self.light {
+                Color::Blue
+            } else {
+                Color::Yellow
+            })
+            .add_modifier(Modifier::BOLD)
+    }
+
+    fn updated(self) -> Style {
+        Style::default()
+            .fg(if self.light {
+                Color::Green
+            } else {
+                Color::LightGreen
+            })
+            .add_modifier(Modifier::ITALIC)
+    }
+
+    fn upload(self) -> Style {
+        Style::default().fg(if self.light { Color::Blue } else { Color::Cyan })
+    }
+
+    fn approve(self) -> Style {
+        Style::default().fg(Color::Green)
+    }
+
+    fn reject(self) -> Style {
+        Style::default().fg(Color::Red)
+    }
+
+    fn selected(self) -> Style {
+        Style::default()
+            .fg(Color::Black)
+            .bg(if self.light {
+                Color::Yellow
+            } else {
+                Color::White
+            })
+            .add_modifier(Modifier::BOLD)
+    }
+
+    fn table_highlight(self) -> Style {
+        Style::default()
+            .fg(Color::Black)
+            .bg(if self.light {
+                Color::Yellow
+            } else {
+                Color::White
+            })
+            .add_modifier(Modifier::BOLD)
+    }
+
+    fn inactive_button(self) -> Style {
+        let style = self.very_muted();
+        if self.light {
+            style
+        } else {
+            style.add_modifier(Modifier::DIM)
+        }
+    }
+
+    fn status_pending(self) -> Color {
+        if self.light {
+            Color::Blue
+        } else {
+            Color::Yellow
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InvoiceTableAction {
     None,
@@ -122,7 +239,7 @@ pub(crate) fn build_invoice_table_rows_with_progress(
         .map(|candidate| candidate.document_id)
         .collect::<Vec<_>>();
     let ksef_statuses = if ksef_ids.is_empty() {
-        HashMap::new()
+        Some(HashMap::new())
     } else {
         if let Some(progress) = &progress {
             set_progress(
@@ -133,8 +250,23 @@ pub(crate) fn build_invoice_table_rows_with_progress(
                 ),
             );
         }
-        let session = read_saldeo_session(&default_saldeo_storage_state_path())?;
-        saldeo_fetch_ksef_accounting_statuses(&session, &ksef_ids)?
+        match read_saldeo_session(&default_saldeo_storage_state_path())
+            .and_then(|session| saldeo_fetch_ksef_accounting_statuses(&session, &ksef_ids))
+        {
+            Ok(statuses) => Some(statuses),
+            Err(err) => {
+                eprintln!(
+                    "  [Saldeo] pomijam statusy KSeF w tabeli (sesja/API niedostępne): {err}"
+                );
+                if let Some(progress) = &progress {
+                    set_progress(
+                        progress,
+                        "Tabela: status KSeF w Saldeo niedostępny — użyj Menu → Saldeo, aby odświeżyć sesję",
+                    );
+                }
+                None
+            }
+        }
     };
 
     if let Some(progress) = &progress {
@@ -146,14 +278,14 @@ pub(crate) fn build_invoice_table_rows_with_progress(
     let rows = report
         .rows
         .iter()
-        .filter_map(|row| invoice_table_row_from_reconcile_row(row, &ksef_statuses))
+        .filter_map(|row| invoice_table_row_from_reconcile_row(row, ksef_statuses.as_ref()))
         .collect::<Vec<_>>();
     Ok(rows)
 }
 
 pub(crate) fn invoice_table_row_from_reconcile_row(
     row: &TriRow,
-    ksef_statuses: &HashMap<i64, Option<bool>>,
+    ksef_statuses: Option<&HashMap<i64, Option<bool>>>,
 ) -> Option<InvoiceTableRow> {
     let record = tri_row_display_record(row)?;
     let upload_item = row.mail.as_ref().and_then(|mail| {
@@ -178,6 +310,9 @@ pub(crate) fn invoice_table_row_from_reconcile_row(
         })
         .and_then(saldeo_document_id)
         .map(|document_id| {
+            let Some(ksef_statuses) = ksef_statuses else {
+                return (None, None);
+            };
             let accounting = ksef_statuses.get(&document_id).copied().flatten();
             let actionable_id = if accounting.is_none() {
                 Some(document_id)
@@ -524,6 +659,7 @@ pub(crate) fn run_invoice_table_tui(
     db_path: &Path,
 ) -> Result<TuiResult> {
     let mut terminal = ratatui::init();
+    let theme = TuiTheme::detect();
     let mut table_sel = 0usize;
     let mut menu_sel = 0usize;
     let mut actionable_only = false;
@@ -688,11 +824,7 @@ pub(crate) fn run_invoice_table_tui(
                 Cell::from("brutto"),
                 Cell::from("wal"),
             ])
-            .style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            );
+            .style(theme.header());
             let table_rows = visible.iter().map(|vidx| {
                 let row = &rows[*vidx];
                 let sel_mark = if pending_action.is_some() && row.selected {
@@ -705,18 +837,14 @@ pub(crate) fn run_invoice_table_tui(
                     "[ ]".to_string()
                 };
                 let style = if row.updated {
-                    Style::default()
-                        .fg(Color::LightGreen)
-                        .add_modifier(Modifier::ITALIC)
+                    theme.updated()
                 } else {
                     match row.action {
-                        InvoiceTableAction::Upload => Style::default().fg(Color::Cyan),
-                        InvoiceTableAction::ApproveKsef => Style::default().fg(Color::Green),
-                        InvoiceTableAction::RejectKsef => Style::default().fg(Color::Red),
-                        InvoiceTableAction::None if row.needs_attention() => {
-                            Style::default().fg(Color::White)
-                        }
-                        InvoiceTableAction::None => Style::default().fg(Color::DarkGray),
+                        InvoiceTableAction::Upload => theme.upload(),
+                        InvoiceTableAction::ApproveKsef => theme.approve(),
+                        InvoiceTableAction::RejectKsef => theme.reject(),
+                        InvoiceTableAction::None if row.needs_attention() => theme.neutral(),
+                        InvoiceTableAction::None => theme.very_muted(),
                     }
                 };
                 Row::new(vec![
@@ -762,13 +890,9 @@ pub(crate) fn run_invoice_table_tui(
                 Block::default()
                     .title(format!(" LAB faktury {year} · próg {review_score} "))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
+                    .border_style(theme.very_muted()),
             )
-            .row_highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            );
+            .row_highlight_style(theme.table_highlight());
             let mut table_state = TableState::default();
             if !visible.is_empty() {
                 table_state.select(Some(table_sel));
@@ -788,14 +912,9 @@ pub(crate) fn run_invoice_table_tui(
                     format!("[ {} ]", label)
                 };
                 let style = if idx == menu_sel || editing {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::White)
-                        .add_modifier(Modifier::BOLD)
+                    theme.selected()
                 } else {
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM)
+                    theme.inactive_button()
                 };
                 ratatui::text::Line::styled(text, style)
             };
@@ -883,9 +1002,9 @@ pub(crate) fn run_invoice_table_tui(
                 } else if pending_action.is_some() {
                     let spinner_chars = ['◐', '◓', '◑', '◒'];
                     let spin = spinner_chars[spinner_frame % spinner_chars.len()];
-                    (spin.to_string(), Color::Yellow)
+                    (spin.to_string(), theme.status_pending())
                 } else {
-                    ("".to_string(), Color::Yellow)
+                    ("".to_string(), theme.status_pending())
                 };
                 let full_text = if prefix.is_empty() {
                     format!(" {}", active_msg)
@@ -920,11 +1039,9 @@ pub(crate) fn run_invoice_table_tui(
             let help = "f=braki/zmiany  spc=toggle  ⏎=select  ⌘c=commit  q=wyjdź".to_string();
             let stats_span = ratatui::text::Span::styled(
                 stats_text,
-                Style::default()
-                    .fg(Color::Gray)
-                    .add_modifier(Modifier::ITALIC),
+                theme.muted().add_modifier(Modifier::ITALIC),
             );
-            let help_span = ratatui::text::Span::styled(help, Style::default().fg(Color::DarkGray));
+            let help_span = ratatui::text::Span::styled(help, theme.very_muted());
             let stats_area = Layout::horizontal([
                 Constraint::Fill(1),
                 Constraint::Length(help_span.width() as u16),
