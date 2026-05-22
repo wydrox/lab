@@ -4,7 +4,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD},
 };
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, ValueEnum};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use dialoguer::{Confirm, Input, Password, Select, theme::ColorfulTheme};
 use ratatui::{
@@ -29,165 +29,30 @@ use std::thread::sleep;
 use std::time::Duration;
 use walkdir::WalkDir;
 
+mod cli;
+#[cfg(test)]
+mod tests;
+
+use cli::{Cli, Commands, DbCommands};
+
+mod ksef;
+mod mcp;
+mod onboard;
+mod reconcile;
+mod saldeo;
+mod tui;
+
+pub(crate) use ksef::*;
+pub(crate) use mcp::*;
+pub(crate) use onboard::*;
+pub(crate) use reconcile::*;
+pub(crate) use saldeo::*;
+pub(crate) use tui::*;
+
 const KEYCHAIN_SERVICE: &str = "lab-cli";
 const KEYCHAIN_ACCOUNT_GMAIL_TOKEN: &str = "gmail_token";
 const KEYCHAIN_ACCOUNT_SALDEO_STORAGE_STATE: &str = "saldeo_storage_state";
 const DEFAULT_PRODUCTMESH_NIP: &str = "5242920020";
-
-#[derive(Parser, Debug)]
-#[command(name = "lab-cli")]
-#[command(about = "LAB — Lazy Accounting Buddy", long_about = None)]
-struct Cli {
-    /// Dedykowana baza SQLite na rekordy, przebiegi i dopasowania.
-    #[arg(long, global = true, default_value = "lab.sqlite")]
-    db: PathBuf,
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-#[derive(Subcommand, Debug)]
-enum Commands {
-    /// Konfiguruje środowisko: sprawdza Gmail, Saldeo, bazę danych.
-    Onboard {
-        /// Tylko sprawdź status, nie uruchamiaj kreatora.
-        #[arg(long)]
-        check: bool,
-        /// Google OAuth Desktop Client JSON do autoryzacji Gmail.
-        #[arg(long)]
-        gmail_client_secret: Option<PathBuf>,
-    },
-    /// Synchronizuje dane z Gmaila/PDF, KSeF i/lub Saldeo.
-    /// Bez flag synchronizuje wszystkie trzy źródła.
-    Sync {
-        /// Tylko KSeF.
-        #[arg(long)]
-        ksef: bool,
-        /// Tylko Gmail/PDF (pobiera załączniki, parsuje, filtruje).
-        #[arg(long)]
-        mail: bool,
-        /// Tylko Saldeo.
-        #[arg(long)]
-        saldeo: bool,
-        /// Rok rozliczeniowy.
-        #[arg(long, default_value_t = 2026)]
-        year: i32,
-        /// Katalog/plik z eksportem KSeF (XML, JSON, JSONL). Domyślnie data/ksef-<year>.
-        #[arg(long)]
-        ksef_input: Option<PathBuf>,
-        /// Google OAuth Desktop Client JSON do odświeżenia tokenu Gmail.
-        #[arg(long)]
-        gmail_client_secret: Option<PathBuf>,
-        /// Plik tokenu Gmail; domyślnie ~/.config/lab/gmail_token.json.
-        #[arg(long)]
-        gmail_token_file: Option<PathBuf>,
-        /// NIP do filtrowania PDF-ów z Gmaila.
-        #[arg(long, default_value = DEFAULT_PRODUCTMESH_NIP)]
-        productmesh_nip: String,
-        /// Zapisz rekordy do SQLite.
-        #[arg(long)]
-        store: bool,
-    },
-    /// Porównuje rekordy z Gmaila/PDF, KSeF i Saldeo.
-    /// Z --status pokazuje ostatni raport z bazy.
-    Reconcile {
-        /// Pokaż ostatni raport uzgodnienia z bazy zamiast liczyć na nowo.
-        #[arg(long)]
-        status: bool,
-        /// JSON/JSONL z rekordami Gmail/PDF.
-        #[arg(long)]
-        mail: Option<PathBuf>,
-        /// JSON/JSONL z rekordami KSeF.
-        #[arg(long)]
-        ksef: Option<PathBuf>,
-        /// Raw documents.json z Saldeo albo JSON/JSONL z rekordami Saldeo.
-        #[arg(long)]
-        saldeo: Option<PathBuf>,
-        /// Minimalny score dopasowania.
-        #[arg(long, default_value_t = 45)]
-        review_score: u8,
-        /// Plik JSON z raportem.
-        #[arg(long)]
-        output: Option<PathBuf>,
-        /// Wypisz pełny JSON zamiast czytelnego podsumowania.
-        #[arg(long)]
-        raw: bool,
-        /// Opcjonalny CSV z raportem.
-        #[arg(long)]
-        csv: Option<PathBuf>,
-        /// Zapisz temporalny snapshot tri-reconcile w SQLite.
-        #[arg(long)]
-        store: bool,
-        /// Rok przy --store i --status.
-        #[arg(long, default_value_t = 2026)]
-        year: i32,
-    },
-    /// Wysyła brakujące faktury do SaldeoSMART.
-    Upload {
-        /// Rok rozliczeniowy.
-        #[arg(long, default_value_t = 2026)]
-        year: i32,
-        /// Raport tri-reconcile JSON. Jeśli brak, podaj --mail, --ksef i --saldeo.
-        #[arg(long)]
-        tri_report: Option<PathBuf>,
-        /// JSON/JSONL z rekordami Gmail/PDF.
-        #[arg(long)]
-        mail: Option<PathBuf>,
-        /// JSON/JSONL z rekordami KSeF.
-        #[arg(long)]
-        ksef: Option<PathBuf>,
-        /// Raw documents.json z Saldeo albo JSON/JSONL z rekordami Saldeo.
-        #[arg(long)]
-        saldeo: Option<PathBuf>,
-        /// Minimalny score dopasowania, gdy raport jest liczony z wejść.
-        #[arg(long, default_value_t = 70)]
-        review_score: u8,
-        /// Plik JSON z wynikiem.
-        #[arg(long)]
-        output: Option<PathBuf>,
-        /// Opcjonalny CSV z wynikiem.
-        #[arg(long)]
-        csv: Option<PathBuf>,
-        /// Wykonaj upload do Saldeo. Bez tej flagi zwraca tylko plan.
-        #[arg(long)]
-        confirm: bool,
-    },
-    /// Uruchamia prosty serwer MCP po stdio dla agentów.
-    Mcp,
-    /// Operacje na dedykowanej bazie SQLite.
-    Db {
-        #[command(subcommand)]
-        command: DbCommands,
-    },
-    /// Sprawdza zależności i konfigurację środowiska.
-    Doctor {
-        /// Nazwa env var z tokenem OAuth do Gmaila.
-        #[arg(long, default_value = "GMAIL_ACCESS_TOKEN")]
-        token_env: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum DbCommands {
-    /// Tworzy tabele w bazie, jeśli jeszcze ich nie ma.
-    Init,
-    /// Pokazuje liczbę rekordów w bazie.
-    Stats,
-    /// Wypisuje rekordy faktur z SQLite jako JSON.
-    List {
-        /// Opcjonalny filtr: ksef albo mail.
-        #[arg(long, value_enum)]
-        source: Option<SourceKind>,
-        /// Maksymalna liczba rekordów.
-        #[arg(long, default_value_t = 50)]
-        limit: usize,
-    },
-    /// Lista temporalnych przebiegów tri-reconcile z licznikami diffów.
-    TriRuns {
-        /// Maksymalna liczba przebiegów.
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-    },
-}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -356,6 +221,33 @@ fn run_sync_sources(
     productmesh_nip: &str,
     conn: Option<&Connection>,
 ) -> Result<SyncRunSummary> {
+    run_sync_sources_with_progress(
+        year,
+        ksef,
+        mail,
+        saldeo,
+        ksef_input,
+        gmail_client_secret,
+        gmail_token_file,
+        productmesh_nip,
+        conn,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_sync_sources_with_progress(
+    year: i32,
+    ksef: bool,
+    mail: bool,
+    saldeo: bool,
+    ksef_input: Option<&Path>,
+    gmail_client_secret: Option<&Path>,
+    gmail_token_file: Option<&Path>,
+    productmesh_nip: &str,
+    conn: Option<&Connection>,
+    progress: Option<Arc<Mutex<String>>>,
+) -> Result<SyncRunSummary> {
     let all = !ksef && !mail && !saldeo;
     if all {
         eprintln!("Sync: wszystkie źródła (KSeF + Gmail/PDF + Saldeo)");
@@ -367,21 +259,43 @@ fn run_sync_sources(
     if ksef || all {
         let result = if let Some(input) = ksef_input {
             eprintln!("  [KSeF] synchronizacja z lokalnego eksportu...");
+            if let Some(progress) = &progress {
+                set_progress(progress, "KSeF: synchronizacja z lokalnego eksportu...");
+            }
             ksef_sync(year, input, None)?
         } else {
             eprintln!("  [KSeF] synchronizacja online...");
-            ksef_online_sync(year, None)?
+            if progress.is_some() {
+                ksef_online_sync_cached_with_progress(year, None, progress.clone())?
+            } else {
+                ksef_online_sync_with_progress(year, None, progress.clone())?
+            }
         };
         records_count += result.records.len();
+        if let Some(progress) = &progress {
+            set_progress(
+                progress,
+                format!("KSeF: zapis do bazy ({} rekordów)...", result.records.len()),
+            );
+        }
         if let Some(conn) = conn {
             store_records(conn, &result.records)?;
         }
         eprintln!("  [KSeF] gotowe: {} rekordów", result.summary.records_count);
+        if let Some(progress) = &progress {
+            set_progress(
+                progress,
+                format!("KSeF: gotowe — {} rekordów", result.summary.records_count),
+            );
+        }
         synced.push(format!("ksef ({})", result.summary.records_count));
     }
 
     if mail || all {
         eprintln!("  [Gmail] sprawdzanie wiadomości i cache załączników...");
+        if let Some(progress) = &progress {
+            set_progress(progress, "Gmail: sprawdzanie tokena...");
+        }
         let token_path = gmail_token_file
             .map(PathBuf::from)
             .unwrap_or_else(default_gmail_token_path);
@@ -394,6 +308,7 @@ fn run_sync_sources(
             &mail_out,
             500,
             &["pdf".to_string()],
+            progress.clone(),
         )?;
         eprintln!(
             "  [Gmail] wiadomości: {} znalezionych, {} z cache, {} pobranych z API; nowe pliki: {} metadane, {} załączniki",
@@ -403,18 +318,63 @@ fn run_sync_sources(
             gmail_result.metadata_saved,
             gmail_result.attachments_saved
         );
+        if let Some(progress) = &progress {
+            set_progress(
+                progress,
+                format!(
+                    "Gmail: {} wiadomości, cache {}, API {}, załączniki {}",
+                    gmail_result.messages_seen,
+                    gmail_result.messages_cached,
+                    gmail_result.messages_fetched,
+                    gmail_result.attachments_saved
+                ),
+            );
+        }
         eprintln!("  [Gmail] skanowanie nowych PDF...");
+        if let Some(progress) = &progress {
+            set_progress(progress, "Gmail: skanowanie nowych PDF...");
+        }
         let (mail_records, parsed_count) = sync_mail_records(&mail_out, &gmail_result.saved_files)?;
         eprintln!("  [Gmail] sparsowano {} nowych PDF", parsed_count);
+        if let Some(progress) = &progress {
+            set_progress(
+                progress,
+                format!(
+                    "Gmail: sparsowano {parsed_count} nowych PDF, razem {}",
+                    mail_records.len()
+                ),
+            );
+        }
+        if let Some(progress) = &progress {
+            set_progress(progress, "Gmail: wybór kandydatów ProductMesh...");
+        }
         let mut candidates = productmesh_invoice_candidates(&mail_records, productmesh_nip);
+        if let Some(progress) = &progress {
+            set_progress(
+                progress,
+                format!("Gmail: cache kandydatów ({} faktur)...", candidates.len()),
+            );
+        }
         let cached_candidates = apply_cached_mail_candidates(year, &mut candidates)?;
-        enrich_candidates_with_gemma(&mut candidates, &cached_candidates, None)?;
+        enrich_candidates_with_gemma(&mut candidates, &cached_candidates, progress.clone())?;
+        if let Some(progress) = &progress {
+            set_progress(
+                progress,
+                format!("Gmail: zapis {} kandydatów...", candidates.len()),
+            );
+        }
         write_records(
             &candidates,
             OutputFormat::Jsonl,
             Some(&default_mail_candidates_path(year)),
         )?;
         records_count += candidates.len();
+        if let Some(progress) = &progress {
+            set_progress(
+                progress,
+                format!("Gmail: zapis do bazy ({} rekordów)...", candidates.len()),
+            );
+        }
         if let Some(conn) = conn {
             store_records(conn, &candidates)?;
         }
@@ -423,6 +383,16 @@ fn run_sync_sources(
             mail_records.len(),
             candidates.len()
         );
+        if let Some(progress) = &progress {
+            set_progress(
+                progress,
+                format!(
+                    "Gmail: gotowe — {} PDF, {} faktur",
+                    mail_records.len(),
+                    candidates.len()
+                ),
+            );
+        }
         synced.push(format!(
             "mail ({} new attachments, {} pdfs, {} candidates)",
             gmail_result.attachments_saved,
@@ -433,12 +403,22 @@ fn run_sync_sources(
 
     if saldeo || all {
         eprintln!("  [Saldeo] pobieranie dokumentów...");
-        let result = saldeo_fetch(
+        let result = saldeo_fetch_with_progress(
             year,
             &default_saldeo_storage_state_path(),
             &default_saldeo_out_path(year),
+            progress.clone(),
         )?;
         records_count += result.records.len();
+        if let Some(progress) = &progress {
+            set_progress(
+                progress,
+                format!(
+                    "Saldeo: zapis do bazy ({} rekordów)...",
+                    result.records.len()
+                ),
+            );
+        }
         if let Some(conn) = conn {
             store_records(conn, &result.records)?;
         }
@@ -446,6 +426,15 @@ fn run_sync_sources(
             "  [Saldeo] gotowe: {} dokumentów",
             result.summary.documents_count
         );
+        if let Some(progress) = &progress {
+            set_progress(
+                progress,
+                format!(
+                    "Saldeo: gotowe — {} dokumentów",
+                    result.summary.documents_count
+                ),
+            );
+        }
         synced.push(format!("saldeo ({})", result.summary.documents_count));
     }
 
@@ -458,21 +447,60 @@ fn run_sync_sources(
 }
 
 fn sync_reconcile_metadata(year: i32, ksef: bool, saldeo: bool, db_path: &Path) -> Result<()> {
+    sync_reconcile_metadata_with_progress(year, ksef, saldeo, db_path, None)
+}
+
+fn sync_reconcile_metadata_with_progress(
+    year: i32,
+    ksef: bool,
+    saldeo: bool,
+    db_path: &Path,
+    progress: Option<Arc<Mutex<String>>>,
+) -> Result<()> {
+    if let Some(progress) = &progress {
+        set_progress(progress, "Reconcile: otwieranie lokalnej bazy...");
+    }
     let conn = open_db(db_path)?;
     if ksef {
         eprintln!("  [KSeF] pobieranie metadanych online do lokalnej bazy...");
-        let result = ksef_online_sync(year, None)?;
+        let result = if progress.is_some() {
+            ksef_online_sync_cached_with_progress(year, None, progress.clone())?
+        } else {
+            ksef_online_sync_with_progress(year, None, progress.clone())?
+        };
+        if let Some(progress) = &progress {
+            set_progress(
+                progress,
+                format!(
+                    "Reconcile/KSeF: zapis do bazy ({} rekordów)...",
+                    result.records.len()
+                ),
+            );
+        }
         store_records(&conn, &result.records)?;
     }
 
     if saldeo {
         eprintln!("  [Saldeo] pobieranie metadanych reconcile do lokalnej bazy...");
-        let result = saldeo_fetch(
+        let result = saldeo_fetch_with_progress(
             year,
             &default_saldeo_storage_state_path(),
             &default_saldeo_out_path(year),
+            progress.clone(),
         )?;
+        if let Some(progress) = &progress {
+            set_progress(
+                progress,
+                format!(
+                    "Reconcile/Saldeo: zapis do bazy ({} rekordów)...",
+                    result.records.len()
+                ),
+            );
+        }
         store_records(&conn, &result.records)?;
+    }
+    if let Some(progress) = &progress {
+        set_progress(progress, "Reconcile: metadane odświeżone");
     }
     Ok(())
 }
@@ -480,16 +508,18 @@ fn sync_reconcile_metadata(year: i32, ksef: bool, saldeo: bool, db_path: &Path) 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let db_path = cli.db;
-    let Some(command) = cli.command else {
-        return interactive_tui(&db_path);
-    };
+    match cli.command {
+        Some(command) => handle_command(&db_path, command),
+        None => interactive_tui(&db_path),
+    }
+}
+
+fn handle_command(db_path: &Path, command: Commands) -> Result<()> {
     match command {
         Commands::Onboard {
             check,
             gmail_client_secret,
-        } => {
-            onboard(&db_path, check, gmail_client_secret.as_deref())?;
-        }
+        } => onboard(db_path, check, gmail_client_secret.as_deref()),
         Commands::Sync {
             ksef,
             mail,
@@ -500,27 +530,18 @@ fn main() -> Result<()> {
             gmail_token_file,
             productmesh_nip,
             store,
-        } => {
-            let auto_store_online_ksef =
-                ksef_input.is_none() && (ksef || (!ksef && !mail && !saldeo));
-            let conn = if store || auto_store_online_ksef {
-                Some(open_db(&db_path)?)
-            } else {
-                None
-            };
-            let summary = run_sync_sources(
-                year,
-                ksef,
-                mail,
-                saldeo,
-                ksef_input.as_deref(),
-                gmail_client_secret.as_deref(),
-                gmail_token_file.as_deref(),
-                &productmesh_nip,
-                conn.as_ref(),
-            )?;
-            write_json(&summary, None)?;
-        }
+        } => handle_sync_command(
+            db_path,
+            year,
+            ksef,
+            mail,
+            saldeo,
+            ksef_input,
+            gmail_client_secret,
+            gmail_token_file,
+            productmesh_nip,
+            store,
+        ),
         Commands::Reconcile {
             status,
             mail,
@@ -532,49 +553,19 @@ fn main() -> Result<()> {
             csv,
             store,
             year,
-        } => {
-            if status {
-                let conn = open_db(&db_path)?;
-                let report = load_last_tri_report(&conn, year)?;
-                if raw || output.is_some() {
-                    return write_json(&report, output.as_deref());
-                }
-                return write_reconcile_human(&report, None);
-            }
-            let refresh_ksef = ksef.is_none();
-            let refresh_saldeo = saldeo.is_none();
-            sync_reconcile_metadata(year, refresh_ksef, refresh_saldeo, &db_path)?;
-            let mail_path = mail.unwrap_or_else(|| default_mail_candidates_path(year));
-            let ksef_path = ksef.unwrap_or_else(|| configured_ksef_out_path(year));
-            let saldeo_path = saldeo.unwrap_or_else(|| default_saldeo_records_path(year));
-            let mail_records = load_records(SourceKind::Mail, &mail_path)?;
-            let ksef_records = load_records(SourceKind::Ksef, &ksef_path)?;
-            let saldeo_records = load_saldeo_records(&saldeo_path)?;
-            let report = tri_reconcile(mail_records, ksef_records, saldeo_records, review_score);
-            let temporal_diff = if store {
-                let conn = open_db(&db_path)?;
-                Some(store_tri_reconcile_report(&conn, year, &report)?)
-            } else {
-                None
-            };
-            if let Some(csv_path) = csv {
-                write_tri_csv(&report, &csv_path)?;
-            }
-            if output.is_some() {
-                write_json(&report, output.as_deref())?;
-            } else if raw {
-                if temporal_diff.is_some() {
-                    write_json(
-                        &serde_json::json!({"report": report, "temporal_diff": temporal_diff}),
-                        None,
-                    )?;
-                } else {
-                    write_json(&report, None)?;
-                }
-            } else {
-                write_reconcile_human(&report, temporal_diff.as_ref())?;
-            }
-        }
+        } => handle_reconcile_command(
+            db_path,
+            status,
+            mail,
+            ksef,
+            saldeo,
+            review_score,
+            output,
+            raw,
+            csv,
+            store,
+            year,
+        ),
         Commands::Upload {
             year,
             tri_report,
@@ -585,1333 +576,146 @@ fn main() -> Result<()> {
             output,
             csv,
             confirm,
-        } => {
-            let mut plan = saldeo_sync_plan(SaldeoSyncPlanConfig {
-                year,
-                tri_report: tri_report.as_deref(),
-                mail: mail.as_deref(),
-                ksef: ksef.as_deref(),
-                saldeo: saldeo.as_deref(),
-                review_score,
-                confirm,
-                upload_url: None,
-            })?;
-            if confirm {
-                let storage_state = default_saldeo_storage_state_path();
-                saldeo_upload_plan(&mut plan, &storage_state, DEFAULT_SALDEO_UPLOAD_URL, "file")?;
-            }
-            if let Some(csv_path) = csv {
-                write_saldeo_sync_csv(&plan, &csv_path)?;
-            }
-            write_json(&plan, output.as_deref())?;
-        }
-        Commands::Mcp => run_mcp_server(&db_path)?,
-        Commands::Db { command } => handle_db_command(&db_path, command)?,
-        Commands::Doctor { token_env } => doctor(&db_path, &token_env)?,
-    }
-    Ok(())
-}
-
-fn interactive_tui(db_path: &Path) -> Result<()> {
-    interactive_reconcile_actions(db_path)
-}
-
-fn interactive_reconcile_actions(db_path: &Path) -> Result<()> {
-    let mut year: i32 = 2026;
-    let mut review_score: u8 = 70;
-    let mut rows = build_invoice_table_rows(year, review_score)?;
-
-    loop {
-        match run_invoice_table_tui(&mut rows, &mut year, &mut review_score, db_path)? {
-            TuiResult::Cancel => return Ok(()),
-            TuiResult::Doctor => {
-                eprintln!("  [LAB] diagnostyka...");
-                doctor(db_path, "GMAIL_ACCESS_TOKEN")?;
-            }
-            TuiResult::Onboard => {
-                eprintln!("  [LAB] konfiguracja...");
-                onboard(db_path, false, None)?;
-            }
-        }
-    }
-}
-
-enum TuiResult {
-    Cancel,
-    Doctor,
-    Onboard,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InvoiceTableAction {
-    None,
-    Upload,
-    ApproveKsef,
-    RejectKsef,
-}
-
-#[derive(Debug, Clone)]
-struct InvoiceTableRow {
-    selected: bool,
-    sources: String,
-    record: InvoiceRecord,
-    upload_item: Option<SaldeoSyncItem>,
-    ksef_document_id: Option<i64>,
-    ksef_accounting: Option<bool>,
-    action: InvoiceTableAction,
-}
-
-impl InvoiceTableRow {
-    fn is_actionable(&self) -> bool {
-        self.upload_item.is_some() || self.ksef_document_id.is_some()
-    }
-
-    fn can_upload(&self) -> bool {
-        self.upload_item.is_some()
-    }
-
-    fn can_mark_ksef(&self) -> bool {
-        self.ksef_document_id.is_some()
-    }
-}
-
-fn build_invoice_table_rows(year: i32, review_score: u8) -> Result<Vec<InvoiceTableRow>> {
-    let mail = default_mail_candidates_path(year);
-    let ksef = configured_ksef_out_path(year);
-    let saldeo = default_saldeo_records_path(year);
-    let mail_records = load_records(SourceKind::Mail, &mail)?;
-    let ksef_records = load_records(SourceKind::Ksef, &ksef)?;
-    let saldeo_records = load_saldeo_records(&saldeo)?;
-    let report = tri_reconcile(
-        mail_records,
-        ksef_records,
-        saldeo_records.clone(),
-        review_score,
-    );
-
-    let ksef_ids = saldeo_ksef_accounting_candidates(&saldeo_records)
-        .into_iter()
-        .map(|candidate| candidate.document_id)
-        .collect::<Vec<_>>();
-    let ksef_statuses = if ksef_ids.is_empty() {
-        HashMap::new()
-    } else {
-        let session = read_saldeo_session(&default_saldeo_storage_state_path())?;
-        saldeo_fetch_ksef_accounting_statuses(&session, &ksef_ids)?
-    };
-
-    let rows = report
-        .rows
-        .iter()
-        .filter_map(|row| invoice_table_row_from_reconcile_row(row, &ksef_statuses))
-        .collect::<Vec<_>>();
-    Ok(rows)
-}
-
-fn invoice_table_row_from_reconcile_row(
-    row: &TriRow,
-    ksef_statuses: &HashMap<i64, Option<bool>>,
-) -> Option<InvoiceTableRow> {
-    let record = tri_row_display_record(row)?;
-    let upload_item = row.mail.as_ref().and_then(|mail| {
-        if row.saldeo.is_some() {
-            return None;
-        }
-        let related_sources = [("mail", row.mail.as_ref()), ("ksef", row.ksef.as_ref())]
-            .into_iter()
-            .filter_map(|(name, record)| record.map(|_| name.to_string()))
-            .collect::<Vec<_>>();
-        let item = saldeo_sync_item_from_record(&row.status, mail, related_sources);
-        item.can_upload.then_some(item)
-    });
-    let (ksef_document_id, ksef_accounting) = row
-        .saldeo
-        .as_ref()
-        .and_then(saldeo_document_id)
-        .map(|document_id| {
-            let accounting = ksef_statuses.get(&document_id).copied().flatten();
-            let actionable_id = if accounting.is_none() {
-                Some(document_id)
-            } else {
-                None
-            };
-            (actionable_id, accounting)
-        })
-        .unwrap_or((None, None));
-    Some(InvoiceTableRow {
-        selected: false,
-        sources: row_source_mask(row),
-        record,
-        upload_item,
-        ksef_document_id,
-        ksef_accounting,
-        action: InvoiceTableAction::None,
-    })
-}
-
-fn invoice_table_counts(rows: &[InvoiceTableRow]) -> (usize, usize, usize, usize) {
-    let mut u = 0;
-    let mut a = 0;
-    let mut r = 0;
-    let mut s = 0;
-    for row in rows {
-        if row.selected {
-            s += 1;
-        }
-        match row.action {
-            InvoiceTableAction::Upload => u += 1,
-            InvoiceTableAction::ApproveKsef => a += 1,
-            InvoiceTableAction::RejectKsef => r += 1,
-            InvoiceTableAction::None => {}
-        }
-    }
-    (u, a, r, s)
-}
-
-fn collect_invoice_table_actions(
-    rows: &[InvoiceTableRow],
-) -> (Vec<SaldeoSyncItem>, Vec<i64>, Vec<i64>) {
-    let selected_upload_items = rows
-        .iter()
-        .filter(|row| row.action == InvoiceTableAction::Upload)
-        .filter_map(|row| row.upload_item.clone())
-        .collect::<Vec<_>>();
-    let selected_approve_ids = rows
-        .iter()
-        .filter(|row| row.action == InvoiceTableAction::ApproveKsef)
-        .filter_map(|row| row.ksef_document_id)
-        .collect::<Vec<_>>();
-    let selected_reject_ids = rows
-        .iter()
-        .filter(|row| row.action == InvoiceTableAction::RejectKsef)
-        .filter_map(|row| row.ksef_document_id)
-        .collect::<Vec<_>>();
-    (
-        selected_upload_items,
-        selected_approve_ids,
-        selected_reject_ids,
-    )
-}
-
-struct PendingAction {
-    receiver: std::sync::mpsc::Receiver<Result<Vec<InvoiceTableRow>>>,
-    description: String,
-    new_year: Option<i32>,
-    new_review_score: Option<u8>,
-    progress: Arc<Mutex<String>>,
-}
-
-enum PendingActionStart {
-    Started(PendingAction),
-    Noop(String),
-}
-
-fn set_progress(progress: &Arc<Mutex<String>>, message: impl Into<String>) {
-    *progress.lock().unwrap() = message.into();
-}
-
-fn begin_invoice_table_commit(
-    rows: &[InvoiceTableRow],
-    year: i32,
-    review_score: u8,
-) -> PendingActionStart {
-    let (upload_items, approve_ids, reject_ids) = collect_invoice_table_actions(rows);
-    if upload_items.is_empty() && approve_ids.is_empty() && reject_ids.is_empty() {
-        return PendingActionStart::Noop(
-            "Akceptuj: nic do wykonania (najpierw wybierz Upload/Zatwierdź/Odrzuć)".to_string(),
-        );
-    }
-
-    let description = format!(
-        "Akceptuj (upload {}, zatw. {}, odrz. {})",
-        upload_items.len(),
-        approve_ids.len(),
-        reject_ids.len()
-    );
-    let rows_snapshot = rows.to_vec();
-    let progress = Arc::new(Mutex::new(format!(
-        "{}: przygotowanie operacji...",
-        description
-    )));
-    let progress_clone = progress.clone();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        redirect_stderr_to_log();
-        let result =
-            execute_invoice_table_actions(year, review_score, rows_snapshot, progress_clone);
-        let _ = tx.send(result);
-    });
-
-    PendingActionStart::Started(PendingAction {
-        receiver: rx,
-        description,
-        new_year: Some(year),
-        new_review_score: Some(review_score),
-        progress,
-    })
-}
-
-fn execute_invoice_table_actions(
-    year: i32,
-    review_score: u8,
-    rows: Vec<InvoiceTableRow>,
-    progress: Arc<Mutex<String>>,
-) -> Result<Vec<InvoiceTableRow>> {
-    let (selected_upload_items, selected_approve_ids, selected_reject_ids) =
-        collect_invoice_table_actions(&rows);
-    let storage_state = default_saldeo_storage_state_path();
-
-    if !selected_upload_items.is_empty() {
-        set_progress(
-            &progress,
-            format!(
-                "Akceptuj: upload do Saldeo ({} plików)...",
-                selected_upload_items.len()
-            ),
-        );
-        let mut upload_plan = SaldeoSyncPlan {
-            generated_at: Utc::now(),
+        } => handle_upload_command(
             year,
-            confirm: true,
-            upload_url: Some(DEFAULT_SALDEO_UPLOAD_URL.to_string()),
-            summary: saldeo_sync_summary(&selected_upload_items),
-            items: selected_upload_items,
-        };
-        saldeo_upload_plan_with_progress(
-            &mut upload_plan,
-            &storage_state,
-            DEFAULT_SALDEO_UPLOAD_URL,
-            "file",
-            Some(progress.clone()),
-        )?;
-        if upload_plan.summary.failed_count > 0 {
-            let errors = upload_plan
-                .items
-                .iter()
-                .filter(|item| item.upload_status == "failed")
-                .filter_map(|item| {
-                    let name = item
-                        .source_path
-                        .as_deref()
-                        .and_then(|path| Path::new(path).file_name())
-                        .and_then(|name| name.to_str())
-                        .or(item.invoice_number.as_deref())
-                        .unwrap_or("plik");
-                    item.error.as_ref().map(|error| format!("{name}: {error}"))
-                })
-                .collect::<Vec<_>>()
-                .join(" | ");
-            return Err(anyhow!(
-                "upload Saldeo nie powiódł się ({}/{} błędów): {}",
-                upload_plan.summary.failed_count,
-                upload_plan.summary.uploadable_count,
-                errors
-            ));
-        }
-    }
-
-    if !selected_approve_ids.is_empty() || !selected_reject_ids.is_empty() {
-        let session = read_saldeo_session(&storage_state)?;
-        if !selected_approve_ids.is_empty() {
-            set_progress(
-                &progress,
-                format!(
-                    "Akceptuj: zatwierdzam KSeF w Saldeo ({} dokumentów)...",
-                    selected_approve_ids.len()
-                ),
-            );
-            saldeo_mark_ksef_documents(&session, &selected_approve_ids, true)?;
-        }
-        if !selected_reject_ids.is_empty() {
-            set_progress(
-                &progress,
-                format!(
-                    "Akceptuj: odrzucam KSeF w Saldeo ({} dokumentów)...",
-                    selected_reject_ids.len()
-                ),
-            );
-            saldeo_mark_ksef_documents(&session, &selected_reject_ids, false)?;
-        }
-    }
-
-    set_progress(&progress, "Akceptuj: odświeżam Saldeo po zmianach...");
-    saldeo_fetch(year, &storage_state, &default_saldeo_out_path(year))?;
-    set_progress(&progress, "Akceptuj: przebudowuję tabelę...");
-    build_invoice_table_rows(year, review_score)
-}
-
-/// Redirect stderr to a log file for the current thread.
-fn redirect_stderr_to_log() {
-    let log_path = std::env::var("LAB_LOG").unwrap_or_else(|_| "/tmp/lab.log".to_string());
-    if let Ok(file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
-        use std::os::unix::io::IntoRawFd;
-        let fd = file.into_raw_fd();
-        unsafe {
-            libc::dup2(fd, libc::STDERR_FILENO);
-            libc::close(fd);
-        }
+            tri_report,
+            mail,
+            ksef,
+            saldeo,
+            review_score,
+            output,
+            csv,
+            confirm,
+        ),
+        Commands::Mcp => run_mcp_server(db_path),
+        Commands::Db { command } => handle_db_command(db_path, command),
+        Commands::Doctor { token_env } => doctor(db_path, &token_env),
     }
 }
 
-fn run_invoice_table_tui(
-    rows: &mut Vec<InvoiceTableRow>,
-    year: &mut i32,
-    review_score: &mut u8,
+#[allow(clippy::too_many_arguments)]
+fn handle_sync_command(
     db_path: &Path,
-) -> Result<TuiResult> {
-    let mut terminal = ratatui::init();
-    let mut table_sel = 0usize;
-    let mut menu_sel = 0usize;
-    let mut actionable_only = false;
-    let mut editing_year: Option<String> = None;
-    let mut editing_threshold: Option<String> = None;
-    let mut paint_mode: bool = false;
-    let mut menu_open: bool = false;
-    let mut spinner_frame: usize = 0;
-    let mut status_message: String = String::new();
-    let mut pending_action: Option<PendingAction> = None;
-    let mut loop_result: Result<TuiResult> = Ok(TuiResult::Cancel);
+    year: i32,
+    ksef: bool,
+    mail: bool,
+    saldeo: bool,
+    ksef_input: Option<PathBuf>,
+    gmail_client_secret: Option<PathBuf>,
+    gmail_token_file: Option<PathBuf>,
+    productmesh_nip: String,
+    store: bool,
+) -> Result<()> {
+    let auto_store_online_ksef = ksef_input.is_none() && (ksef || (!ksef && !mail && !saldeo));
+    let conn = if store || auto_store_online_ksef {
+        Some(open_db(db_path)?)
+    } else {
+        None
+    };
+    let summary = run_sync_sources(
+        year,
+        ksef,
+        mail,
+        saldeo,
+        ksef_input.as_deref(),
+        gmail_client_secret.as_deref(),
+        gmail_token_file.as_deref(),
+        &productmesh_nip,
+        conn.as_ref(),
+    )?;
+    write_json(&summary, None)
+}
 
-    // Main menu
-    const MI_SYNC: usize = 0;
-    const MI_RECONCILE: usize = 1;
-    const MI_LLM: usize = 2;
-    const MI_UPLOAD: usize = 3;
-    const MI_APPROVE: usize = 4;
-    const MI_REJECT: usize = 5;
-    const MI_CLEAR: usize = 6;
-    const MI_COMMIT: usize = 7;
-    const MI_MENU: usize = 8;
-    const MAIN_COUNT: usize = 9;
-    // Submenu (when menu_open)
-    const SM_DOCTOR: usize = 0;
-    const SM_ONBOARD: usize = 1;
-    const SM_YEAR: usize = 2;
-    const SM_THRESHOLD: usize = 3;
-    const SM_SALDEO: usize = 4;
-    const SM_BACK: usize = 5;
-    const SUB_COUNT: usize = 6;
-
-    let tick_rate = std::time::Duration::from_millis(100);
-    let mut last_tick = std::time::Instant::now();
-
-    loop {
-        // Check pending async action
-        if let Some(ref pending) = pending_action {
-            match pending.receiver.try_recv() {
-                Ok(Ok(new_rows)) => {
-                    if let Some(y) = pending.new_year {
-                        *year = y;
-                    }
-                    if let Some(t) = pending.new_review_score {
-                        *review_score = t;
-                    }
-                    *rows = new_rows;
-                    status_message = format!(
-                        "✓ {} zakończone: {} faktur",
-                        pending.description,
-                        rows.len()
-                    );
-                    pending_action = None;
-                    table_sel = 0;
-                }
-                Ok(Err(e)) => {
-                    status_message = format!("✗ Błąd {}: {e}", pending.description);
-                    pending_action = None;
-                    table_sel = 0;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    // Still running
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    status_message = format!("✗ Błąd {}: wątek przerwany", pending.description);
-                    pending_action = None;
-                    table_sel = 0;
-                }
-            }
+#[allow(clippy::too_many_arguments)]
+fn handle_reconcile_command(
+    db_path: &Path,
+    status: bool,
+    mail: Option<PathBuf>,
+    ksef: Option<PathBuf>,
+    saldeo: Option<PathBuf>,
+    review_score: u8,
+    output: Option<PathBuf>,
+    raw: bool,
+    csv: Option<PathBuf>,
+    store: bool,
+    year: i32,
+) -> Result<()> {
+    if status {
+        let conn = open_db(db_path)?;
+        let report = load_last_tri_report(&conn, year)?;
+        if raw || output.is_some() {
+            return write_json(&report, output.as_deref());
         }
+        return write_reconcile_human(&report, None);
+    }
 
-        // Tick spinner every 100ms
-        if last_tick.elapsed() >= tick_rate {
-            spinner_frame = spinner_frame.wrapping_add(1);
-            last_tick = std::time::Instant::now();
-        }
+    let refresh_ksef = ksef.is_none();
+    let refresh_saldeo = saldeo.is_none();
+    sync_reconcile_metadata(year, refresh_ksef, refresh_saldeo, db_path)?;
 
-        let visible = rows
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, row)| (!actionable_only || row.is_actionable()).then_some(idx))
-            .collect::<Vec<_>>();
-        if visible.is_empty() {
-            table_sel = 0;
-        } else if table_sel >= visible.len() {
-            table_sel = visible.len().saturating_sub(1);
-        }
-        let menu_items = if menu_open { SUB_COUNT } else { MAIN_COUNT };
-        if menu_sel >= menu_items {
-            menu_sel = menu_items.saturating_sub(1);
-        }
+    let mail_path = mail.unwrap_or_else(|| default_mail_candidates_path(year));
+    let ksef_path = ksef.unwrap_or_else(|| configured_ksef_out_path(year));
+    let saldeo_path = saldeo.unwrap_or_else(|| default_saldeo_records_path(year));
+    let mail_records = load_records(SourceKind::Mail, &mail_path)?;
+    let ksef_records = load_records(SourceKind::Ksef, &ksef_path)?;
+    let saldeo_records = load_saldeo_records(&saldeo_path)?;
+    let report = tri_reconcile(mail_records, ksef_records, saldeo_records, review_score);
 
-        if let Err(err) = terminal.draw(|frame| {
-            let area = frame.area();
-            let chunks = Layout::vertical([
-                Constraint::Min(5),
-                Constraint::Length(2),
-                Constraint::Length(1),
-                Constraint::Length(1),
-            ])
-            .split(area);
-
-            // Table
-            let header = Row::new(vec![
-                Cell::from("sel"),
-                Cell::from("akcja / KSeF"),
-                Cell::from("G/K/S"),
-                Cell::from("faktura"),
-                Cell::from("kontrahent"),
-                Cell::from("data"),
-                Cell::from("brutto"),
-                Cell::from("wal"),
-            ])
-            .style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            );
-            let table_rows = visible.iter().map(|vidx| {
-                let row = &rows[*vidx];
-                let sel_mark = if pending_action.is_some() && row.selected {
-                    let spinner_chars = ['◐', '◓', '◑', '◒'];
-                    let spin = spinner_chars[spinner_frame % spinner_chars.len()];
-                    format!("[{}]", spin)
-                } else if row.selected {
-                    "[*]".to_string()
-                } else {
-                    "[ ]".to_string()
-                };
-                let style = match row.action {
-                    InvoiceTableAction::Upload => Style::default().fg(Color::Cyan),
-                    InvoiceTableAction::ApproveKsef => Style::default().fg(Color::Green),
-                    InvoiceTableAction::RejectKsef => Style::default().fg(Color::Red),
-                    InvoiceTableAction::None if row.is_actionable() => {
-                        Style::default().fg(Color::White)
-                    }
-                    InvoiceTableAction::None => Style::default().fg(Color::DarkGray),
-                };
-                Row::new(vec![
-                    Cell::from(sel_mark),
-                    Cell::from(invoice_table_action_ksef_label(row)),
-                    Cell::from(row.sources.clone()),
-                    Cell::from(truncate(
-                        row.record.invoice_number.as_deref().unwrap_or("-"),
-                        24,
-                    )),
-                    Cell::from(truncate(&counterparty_name(Some(&row.record)), 26)),
-                    Cell::from(
-                        row.record
-                            .issue_date
-                            .map(|date| date.to_string())
-                            .unwrap_or_else(|| "-".to_string()),
-                    ),
-                    Cell::from(
-                        row.record
-                            .gross_amount_minor
-                            .map(format_minor_money)
-                            .unwrap_or_else(|| "-".to_string()),
-                    ),
-                    Cell::from(row.record.currency.as_deref().unwrap_or("-")),
-                ])
-                .style(style)
-            });
-            let table = Table::new(
-                table_rows,
-                [
-                    Constraint::Percentage(4),
-                    Constraint::Percentage(14),
-                    Constraint::Percentage(7),
-                    Constraint::Percentage(20),
-                    Constraint::Percentage(22),
-                    Constraint::Percentage(10),
-                    Constraint::Percentage(16),
-                    Constraint::Percentage(7),
-                ],
+    let temporal_diff = if store {
+        let conn = open_db(db_path)?;
+        Some(store_tri_reconcile_report(&conn, year, &report)?)
+    } else {
+        None
+    };
+    if let Some(csv_path) = csv {
+        write_tri_csv(&report, &csv_path)?;
+    }
+    if output.is_some() {
+        write_json(&report, output.as_deref())
+    } else if raw {
+        if temporal_diff.is_some() {
+            write_json(
+                &serde_json::json!({"report": report, "temporal_diff": temporal_diff}),
+                None,
             )
-            .header(header)
-            .block(
-                Block::default()
-                    .title(format!(" LAB faktury {year} · próg {review_score} "))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            )
-            .row_highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            );
-            let mut table_state = TableState::default();
-            if !visible.is_empty() {
-                table_state.select(Some(table_sel));
-            }
-            frame.render_stateful_widget(table, chunks[0], &mut table_state);
-
-            // Menu bar
-            let (u, a, r, sel) = invoice_table_counts(rows);
-            let year_text = editing_year.clone().unwrap_or_else(|| year.to_string());
-            let threshold_text = editing_threshold
-                .clone()
-                .unwrap_or_else(|| review_score.to_string());
-            let mkbtn = |label: &str, idx: usize, editing: bool| {
-                let text = if editing {
-                    format!("[ {}_ ]", label)
-                } else {
-                    format!("[ {} ]", label)
-                };
-                let style = if idx == menu_sel || editing {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::White)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM)
-                };
-                ratatui::text::Line::styled(text, style)
-            };
-            if menu_open {
-                let items = [
-                    mkbtn("Doctor", SM_DOCTOR, false),
-                    mkbtn("Onboard", SM_ONBOARD, false),
-                    mkbtn(
-                        &format!("Rok:{}", year_text),
-                        SM_YEAR,
-                        editing_year.is_some(),
-                    ),
-                    mkbtn(
-                        &format!("Próg:{}", threshold_text),
-                        SM_THRESHOLD,
-                        editing_threshold.is_some(),
-                    ),
-                    mkbtn("Saldeo", SM_SALDEO, false),
-                    mkbtn("◀ Wróć", SM_BACK, false),
-                ];
-                let mut sub_constraints = vec![Constraint::Fill(1)];
-                for (i, line) in items.clone().iter().enumerate() {
-                    let width = line.width() as u16;
-                    sub_constraints.push(Constraint::Length(width));
-                    if i < items.len() - 1 {
-                        sub_constraints.push(Constraint::Length(1));
-                    }
-                }
-                let menu_area = Layout::horizontal(sub_constraints).split(chunks[1]);
-                for (i, line) in items.into_iter().enumerate() {
-                    frame.render_widget(Paragraph::new(line), menu_area[i * 2 + 1]);
-                }
-            } else {
-                let items = [
-                    mkbtn("Sync", MI_SYNC, false),
-                    mkbtn("Reconcile", MI_RECONCILE, false),
-                    mkbtn("LLM", MI_LLM, false),
-                    mkbtn("Upload", MI_UPLOAD, false),
-                    mkbtn("Zatwierdź", MI_APPROVE, false),
-                    mkbtn("Odrzuć", MI_REJECT, false),
-                    mkbtn("Wyczyść", MI_CLEAR, false),
-                    mkbtn("Akceptuj", MI_COMMIT, false),
-                    mkbtn("☰ Menu", MI_MENU, false),
-                ];
-                let mut main_constraints = vec![];
-                for (i, line) in items.clone().iter().enumerate() {
-                    let width = line.width() as u16;
-                    main_constraints.push(Constraint::Length(width));
-                    if i < items.len() - 2 {
-                        main_constraints.push(Constraint::Length(1));
-                    } else if i == items.len() - 2 {
-                        // Gap before Menu is Fill to push it right
-                        main_constraints.push(Constraint::Fill(1));
-                    }
-                }
-                let menu_area = Layout::horizontal(main_constraints).split(chunks[1]);
-                let item_count = items.len();
-                for (i, line) in items.into_iter().enumerate() {
-                    let area_idx = if i == item_count - 1 {
-                        menu_area.len() - 1
-                    } else {
-                        i * 2
-                    };
-                    frame.render_widget(Paragraph::new(line), menu_area[area_idx]);
-                }
-            }
-            // Status bar
-            let active_msg = if let Some(ref pending) = pending_action {
-                let progress = pending.progress.lock().unwrap();
-                if progress.is_empty() {
-                    status_message.clone()
-                } else {
-                    progress.clone()
-                }
-            } else if !status_message.is_empty() {
-                status_message.clone()
-            } else {
-                String::new()
-            };
-            if !active_msg.is_empty() {
-                let (prefix, color) = if active_msg.starts_with("✓") {
-                    ("".to_string(), Color::Green)
-                } else if active_msg.starts_with("✗") {
-                    ("".to_string(), Color::Red)
-                } else if pending_action.is_some() {
-                    let spinner_chars = ['◐', '◓', '◑', '◒'];
-                    let spin = spinner_chars[spinner_frame % spinner_chars.len()];
-                    (spin.to_string(), Color::Yellow)
-                } else {
-                    ("".to_string(), Color::Yellow)
-                };
-                let full_text = if prefix.is_empty() {
-                    format!(" {}", active_msg)
-                } else {
-                    format!(" {} {}", prefix, active_msg)
-                };
-                let max_width = chunks[2].width as usize;
-                let display_text = if full_text.chars().count() > max_width {
-                    format!("{}...", &full_text[..max_width.saturating_sub(3)])
-                } else {
-                    full_text
-                };
-                let line = ratatui::text::Line::styled(
-                    display_text,
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                );
-                frame.render_widget(Paragraph::new(line), chunks[2]);
-            }
-
-            // Stats bar — stats left, help right
-            let stats_text = format!(
-                "sel:{} | up:{} | zatw:{} | odrz:{} | {}/{}",
-                sel,
-                u,
-                a,
-                r,
-                visible.len(),
-                rows.len()
-            );
-            let help = "f=filtr  spc=toggle  ⏎=select  ⌘c=commit  q=wyjdź".to_string();
-            let stats_span = ratatui::text::Span::styled(
-                stats_text,
-                Style::default()
-                    .fg(Color::Gray)
-                    .add_modifier(Modifier::ITALIC),
-            );
-            let help_span = ratatui::text::Span::styled(help, Style::default().fg(Color::DarkGray));
-            let stats_area = Layout::horizontal([
-                Constraint::Fill(1),
-                Constraint::Length(help_span.width() as u16),
-            ])
-            .split(chunks[3]);
-            frame.render_widget(
-                Paragraph::new(ratatui::text::Line::from(stats_span)),
-                stats_area[0],
-            );
-            frame.render_widget(
-                Paragraph::new(ratatui::text::Line::from(help_span)),
-                stats_area[1],
-            );
-        }) {
-            loop_result = Err(anyhow!("terminal draw: {err}"));
-            break;
+        } else {
+            write_json(&report, None)
         }
-
-        let timeout = tick_rate
-            .checked_sub(last_tick.elapsed())
-            .unwrap_or_else(|| std::time::Duration::from_secs(0));
-        if event::poll(timeout)? {
-            let Event::Key(key) = event::read()? else {
-                continue;
-            };
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            let cmd = key
-                .modifiers
-                .intersects(crossterm::event::KeyModifiers::SUPER)
-                || key
-                    .modifiers
-                    .intersects(crossterm::event::KeyModifiers::META);
-            let shift = key
-                .modifiers
-                .intersects(crossterm::event::KeyModifiers::SHIFT);
-
-            // Handle field editing
-            let editing = editing_year.is_some() || editing_threshold.is_some();
-            if editing {
-                let field = if editing_year.is_some() {
-                    editing_year.as_mut()
-                } else {
-                    editing_threshold.as_mut()
-                };
-                match key.code {
-                    KeyCode::Esc => {
-                        editing_year = None;
-                        editing_threshold = None;
-                    }
-                    KeyCode::Enter => {
-                        if let Some(val) = editing_year.take() {
-                            if let Ok(y) = val.parse::<i32>() {
-                                let score = *review_score;
-                                let (tx, rx) = std::sync::mpsc::channel();
-                                let progress =
-                                    Arc::new(Mutex::new(format!("Przebudowa (rok {y})...")));
-                                std::thread::spawn(move || {
-                                    redirect_stderr_to_log();
-                                    let _ = tx.send(build_invoice_table_rows(y, score));
-                                });
-                                pending_action = Some(PendingAction {
-                                    receiver: rx,
-                                    description: "Rebuild".to_string(),
-                                    new_year: Some(y),
-                                    new_review_score: Some(score),
-                                    progress,
-                                });
-                            }
-                        } else if let Some(val) = editing_threshold.take()
-                            && let Ok(t) = val.parse::<u8>()
-                        {
-                            let y = *year;
-                            let (tx, rx) = std::sync::mpsc::channel();
-                            let progress =
-                                Arc::new(Mutex::new(format!("Przebudowa (próg {t})...")));
-                            std::thread::spawn(move || {
-                                redirect_stderr_to_log();
-                                let _ = tx.send(build_invoice_table_rows(y, t));
-                            });
-                            pending_action = Some(PendingAction {
-                                receiver: rx,
-                                description: "Rebuild".to_string(),
-                                new_year: Some(y),
-                                new_review_score: Some(t),
-                                progress,
-                            });
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        if let Some(s) = field {
-                            s.pop();
-                        }
-                    }
-                    KeyCode::Char(c) if c.is_ascii_digit() => {
-                        if let Some(s) = field {
-                            s.push(c);
-                        }
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-
-            match key.code {
-                KeyCode::Char('q') => break,
-                KeyCode::Esc => {
-                    if menu_open {
-                        menu_open = false;
-                    } else {
-                        break;
-                    }
-                }
-                KeyCode::Char('c') if cmd => {
-                    if pending_action.is_some() {
-                        status_message = "Trwa operacja — poczekaj na zakończenie".to_string();
-                    } else {
-                        match begin_invoice_table_commit(rows, *year, *review_score) {
-                            PendingActionStart::Started(action) => pending_action = Some(action),
-                            PendingActionStart::Noop(message) => status_message = message,
-                        }
-                    }
-                }
-                KeyCode::Enter if cmd => {
-                    if pending_action.is_some() {
-                        status_message = "Trwa operacja — poczekaj na zakończenie".to_string();
-                    } else {
-                        match begin_invoice_table_commit(rows, *year, *review_score) {
-                            PendingActionStart::Started(action) => pending_action = Some(action),
-                            PendingActionStart::Noop(message) => status_message = message,
-                        }
-                    }
-                }
-                KeyCode::Enter => {
-                    if pending_action.is_some() {
-                        status_message = "Trwa operacja — poczekaj na zakończenie".to_string();
-                        continue;
-                    }
-                    if menu_open {
-                        match menu_sel {
-                            SM_DOCTOR => {
-                                loop_result = Ok(TuiResult::Doctor);
-                                break;
-                            }
-                            SM_ONBOARD => {
-                                loop_result = Ok(TuiResult::Onboard);
-                                break;
-                            }
-                            SM_YEAR => editing_year = Some(year.to_string()),
-                            SM_THRESHOLD => editing_threshold = Some(review_score.to_string()),
-                            SM_SALDEO => {
-                                let y = *year;
-                                let score = *review_score;
-                                let db = db_path.to_path_buf();
-                                let (tx, rx) = std::sync::mpsc::channel();
-                                let progress = Arc::new(Mutex::new(
-                                    "Saldeo: sprawdzam zapisaną sesję...".to_string(),
-                                ));
-                                let progress_clone = progress.clone();
-                                std::thread::spawn(move || {
-                                    redirect_stderr_to_log();
-                                    let result = (|| -> Result<Vec<InvoiceTableRow>> {
-                                        ensure_saldeo_session_or_auth(Some(
-                                            progress_clone.clone(),
-                                        ))?;
-                                        set_progress(
-                                            &progress_clone,
-                                            "Saldeo: odświeżanie danych...",
-                                        );
-                                        sync_reconcile_metadata(y, false, true, &db)?;
-                                        set_progress(
-                                            &progress_clone,
-                                            "Saldeo: budowanie tabeli...",
-                                        );
-                                        build_invoice_table_rows(y, score)
-                                    })();
-                                    let _ = tx.send(result);
-                                });
-                                pending_action = Some(PendingAction {
-                                    receiver: rx,
-                                    description: "Saldeo".to_string(),
-                                    new_year: Some(y),
-                                    new_review_score: Some(score),
-                                    progress,
-                                });
-                            }
-                            SM_BACK => {
-                                menu_open = false;
-                                menu_sel = MI_MENU;
-                            }
-                            _ => {}
-                        }
-                    } else {
-                        match menu_sel {
-                            MI_SYNC => {
-                                let y = *year;
-                                let score = *review_score;
-                                let db = db_path.to_path_buf();
-                                let (tx, rx) = std::sync::mpsc::channel();
-                                let progress = Arc::new(Mutex::new(format!(
-                                    "Pełny sync dla roku {y} (KSeF + Gmail/PDF + Saldeo)..."
-                                )));
-                                let progress_clone = progress.clone();
-                                std::thread::spawn(move || {
-                                    redirect_stderr_to_log();
-                                    let result = (|| -> Result<Vec<InvoiceTableRow>> {
-                                        *progress_clone.lock().unwrap() = format!(
-                                            "Sync: KSeF + Gmail/PDF + Saldeo dla roku {y}..."
-                                        );
-                                        let conn = open_db(&db)?;
-                                        run_sync_sources(
-                                            y,
-                                            false,
-                                            false,
-                                            false,
-                                            None,
-                                            None,
-                                            None,
-                                            DEFAULT_PRODUCTMESH_NIP,
-                                            Some(&conn),
-                                        )?;
-                                        *progress_clone.lock().unwrap() =
-                                            "Sync: budowanie tabeli...".to_string();
-                                        build_invoice_table_rows(y, score)
-                                    })();
-                                    let _ = tx.send(result);
-                                });
-                                pending_action = Some(PendingAction {
-                                    receiver: rx,
-                                    description: "Sync".to_string(),
-                                    new_year: Some(y),
-                                    new_review_score: Some(score),
-                                    progress,
-                                });
-                            }
-                            MI_RECONCILE => {
-                                let y = *year;
-                                let t = *review_score;
-                                let db = db_path.to_path_buf();
-                                let (tx, rx) = std::sync::mpsc::channel();
-                                let progress = Arc::new(Mutex::new(format!(
-                                    "Reconcile: metadane KSeF/Saldeo dla roku {y}..."
-                                )));
-                                let progress_clone = progress.clone();
-                                std::thread::spawn(move || {
-                                    redirect_stderr_to_log();
-                                    let result = (|| -> Result<Vec<InvoiceTableRow>> {
-                                        *progress_clone.lock().unwrap() =
-                                            "Reconcile: odświeżanie metadanych KSeF/Saldeo..."
-                                                .to_string();
-                                        sync_reconcile_metadata(y, true, true, &db)?;
-                                        *progress_clone.lock().unwrap() =
-                                            "Reconcile: budowanie tabeli...".to_string();
-                                        build_invoice_table_rows(y, t)
-                                    })();
-                                    let _ = tx.send(result);
-                                });
-                                pending_action = Some(PendingAction {
-                                    receiver: rx,
-                                    description: "Reconcile".to_string(),
-                                    new_year: Some(y),
-                                    new_review_score: Some(t),
-                                    progress,
-                                });
-                            }
-                            MI_LLM => {
-                                let y = *year;
-                                let score = *review_score;
-                                let selected_hashes: Vec<String> = rows
-                                    .iter()
-                                    .filter(|r| r.selected && r.sources.contains('G'))
-                                    .map(|r| r.record.content_hash.clone())
-                                    .collect();
-                                let has_selection = !selected_hashes.is_empty();
-                                let selected_hashes_clone = selected_hashes.clone();
-                                let (tx, rx) = std::sync::mpsc::channel();
-                                let progress = Arc::new(Mutex::new(if has_selection {
-                                    format!(
-                                        "LLM: przygotowanie {} faktur...",
-                                        selected_hashes.len()
-                                    )
-                                } else {
-                                    format!("LLM: wczytywanie faktur dla roku {y}...")
-                                }));
-                                let progress_clone = progress.clone();
-                                std::thread::spawn(move || {
-                                    redirect_stderr_to_log();
-                                    let result = (|| -> Result<Vec<InvoiceTableRow>> {
-                                        let mail_path = default_mail_candidates_path(y);
-                                        if mail_path.exists() {
-                                            *progress_clone.lock().unwrap() =
-                                                "LLM: wczytywanie faktur...".to_string();
-                                            let mut candidates =
-                                                load_records(SourceKind::Mail, &mail_path)?;
-                                            if has_selection {
-                                                let mut to_enrich: Vec<InvoiceRecord> = candidates
-                                                    .iter()
-                                                    .filter(|c| {
-                                                        selected_hashes_clone
-                                                            .contains(&c.content_hash)
-                                                    })
-                                                    .cloned()
-                                                    .collect();
-                                                // Wyczyść pola aby wymusić ponowne parsowanie
-                                                for r in &mut to_enrich {
-                                                    r.issue_date = None;
-                                                    r.gross_amount_minor = None;
-                                                    r.net_amount_minor = None;
-                                                    r.vat_amount_minor = None;
-                                                    r.currency = None;
-                                                    r.seller_name = None;
-                                                    r.buyer_name = None;
-                                                    r.seller_tax_id = None;
-                                                    r.buyer_tax_id = None;
-                                                    r.sale_date = None;
-                                                    r.due_date = None;
-                                                    r.warnings.clear();
-                                                }
-                                                if !to_enrich.is_empty() {
-                                                    *progress_clone.lock().unwrap() = format!(
-                                                        "LLM: parsowanie {} faktur...",
-                                                        to_enrich.len()
-                                                    );
-                                                    let empty_skip =
-                                                        std::collections::HashSet::new();
-                                                    enrich_candidates_with_gemma(
-                                                        &mut to_enrich,
-                                                        &empty_skip,
-                                                        Some(progress_clone.clone()),
-                                                    )?;
-                                                    *progress_clone.lock().unwrap() =
-                                                        "LLM: zapisywanie wyników...".to_string();
-                                                    for enriched in to_enrich {
-                                                        if let Some(pos) =
-                                                            candidates.iter().position(|c| {
-                                                                c.content_hash
-                                                                    == enriched.content_hash
-                                                            })
-                                                        {
-                                                            candidates[pos] = enriched;
-                                                        }
-                                                    }
-                                                    write_records(
-                                                        &candidates,
-                                                        OutputFormat::Jsonl,
-                                                        Some(&default_mail_candidates_path(y)),
-                                                    )?;
-                                                }
-                                            } else {
-                                                let cached = apply_cached_mail_candidates(
-                                                    y,
-                                                    &mut candidates,
-                                                )?;
-                                                *progress_clone.lock().unwrap() =
-                                                    "LLM: parsowanie faktur...".to_string();
-                                                enrich_candidates_with_gemma(
-                                                    &mut candidates,
-                                                    &cached,
-                                                    Some(progress_clone.clone()),
-                                                )?;
-                                                *progress_clone.lock().unwrap() =
-                                                    "LLM: zapisywanie wyników...".to_string();
-                                                write_records(
-                                                    &candidates,
-                                                    OutputFormat::Jsonl,
-                                                    Some(&default_mail_candidates_path(y)),
-                                                )?;
-                                            }
-                                        }
-                                        *progress_clone.lock().unwrap() =
-                                            "LLM: budowanie tabeli...".to_string();
-                                        build_invoice_table_rows(y, score)
-                                    })();
-                                    let _ = tx.send(result);
-                                });
-                                pending_action = Some(PendingAction {
-                                    receiver: rx,
-                                    description: if has_selection {
-                                        "LLM (wybrane)".to_string()
-                                    } else {
-                                        "LLM".to_string()
-                                    },
-                                    new_year: Some(y),
-                                    new_review_score: None,
-                                    progress,
-                                });
-                            }
-                            MI_UPLOAD => {
-                                for row in rows.iter_mut().filter(|r| r.selected) {
-                                    if row.can_upload() {
-                                        row.action = InvoiceTableAction::Upload;
-                                    }
-                                }
-                            }
-                            MI_APPROVE => {
-                                for row in rows.iter_mut().filter(|r| r.selected) {
-                                    if row.can_mark_ksef() {
-                                        row.action = InvoiceTableAction::ApproveKsef;
-                                    }
-                                }
-                            }
-                            MI_REJECT => {
-                                for row in rows.iter_mut().filter(|r| r.selected) {
-                                    if row.can_mark_ksef() {
-                                        row.action = InvoiceTableAction::RejectKsef;
-                                    }
-                                }
-                            }
-                            MI_CLEAR => {
-                                for row in rows.iter_mut().filter(|r| r.selected) {
-                                    row.action = InvoiceTableAction::None;
-                                    row.selected = false;
-                                }
-                            }
-                            MI_COMMIT => {
-                                match begin_invoice_table_commit(rows, *year, *review_score) {
-                                    PendingActionStart::Started(action) => {
-                                        pending_action = Some(action)
-                                    }
-                                    PendingActionStart::Noop(message) => status_message = message,
-                                }
-                            }
-                            MI_MENU => {
-                                menu_open = true;
-                                menu_sel = SM_BACK;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                KeyCode::Down => {
-                    if table_sel + 1 < visible.len() {
-                        table_sel += 1;
-                        if (paint_mode || shift)
-                            && let Some(row_idx) = visible.get(table_sel).copied()
-                        {
-                            rows[row_idx].selected = !rows[row_idx].selected;
-                        }
-                    }
-                }
-                KeyCode::Up => {
-                    if table_sel > 0 {
-                        table_sel -= 1;
-                        if (paint_mode || shift)
-                            && let Some(row_idx) = visible.get(table_sel).copied()
-                        {
-                            rows[row_idx].selected = !rows[row_idx].selected;
-                        }
-                    }
-                }
-                KeyCode::Right => {
-                    let max = if menu_open { SUB_COUNT } else { MAIN_COUNT };
-                    menu_sel = (menu_sel + 1).min(max.saturating_sub(1));
-                }
-                KeyCode::Left => {
-                    menu_sel = menu_sel.saturating_sub(1);
-                }
-                KeyCode::Home => {
-                    table_sel = 0;
-                    if paint_mode && let Some(row_idx) = visible.get(table_sel).copied() {
-                        rows[row_idx].selected = !rows[row_idx].selected;
-                    }
-                }
-                KeyCode::End => {
-                    table_sel = visible.len().saturating_sub(1);
-                    if paint_mode && let Some(row_idx) = visible.get(table_sel).copied() {
-                        rows[row_idx].selected = !rows[row_idx].selected;
-                    }
-                }
-                KeyCode::Char('f') => {
-                    actionable_only = !actionable_only;
-                    table_sel = 0;
-                }
-                KeyCode::Char('v') => {
-                    paint_mode = !paint_mode;
-                }
-                KeyCode::Char(' ') => {
-                    if let Some(row_idx) = visible.get(table_sel).copied() {
-                        rows[row_idx].selected = !rows[row_idx].selected;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    ratatui::restore();
-    loop_result
-}
-
-fn invoice_table_action_ksef_label(row: &InvoiceTableRow) -> String {
-    match row.action {
-        InvoiceTableAction::Upload => "UPLOAD".to_string(),
-        InvoiceTableAction::ApproveKsef => "ZATWIERDŹ".to_string(),
-        InvoiceTableAction::RejectKsef => "ODRZUĆ".to_string(),
-        InvoiceTableAction::None => invoice_table_ksef_status(row),
+    } else {
+        write_reconcile_human(&report, temporal_diff.as_ref())
     }
 }
 
-fn invoice_table_ksef_status(row: &InvoiceTableRow) -> String {
-    match (row.ksef_document_id, row.ksef_accounting) {
-        (Some(_), None) => "nieozn.".to_string(),
-        (_, Some(true)) => "zatw.".to_string(),
-        (_, Some(false)) => "odrz.".to_string(),
-        _ => "—".to_string(),
+#[allow(clippy::too_many_arguments)]
+fn handle_upload_command(
+    year: i32,
+    tri_report: Option<PathBuf>,
+    mail: Option<PathBuf>,
+    ksef: Option<PathBuf>,
+    saldeo: Option<PathBuf>,
+    review_score: u8,
+    output: Option<PathBuf>,
+    csv: Option<PathBuf>,
+    confirm: bool,
+) -> Result<()> {
+    let mut plan = saldeo_sync_plan(SaldeoSyncPlanConfig {
+        year,
+        tri_report: tri_report.as_deref(),
+        mail: mail.as_deref(),
+        ksef: ksef.as_deref(),
+        saldeo: saldeo.as_deref(),
+        review_score,
+        confirm,
+        upload_url: None,
+    })?;
+    if confirm {
+        let storage_state = default_saldeo_storage_state_path();
+        saldeo_upload_plan(&mut plan, &storage_state, DEFAULT_SALDEO_UPLOAD_URL, "file")?;
     }
-}
-
-fn row_source_mask(row: &TriRow) -> String {
-    format!(
-        "{}/{}/{}",
-        if row.mail.is_some() { "G" } else { "-" },
-        if row.ksef.is_some() { "K" } else { "-" },
-        if row.saldeo.is_some() { "S" } else { "-" }
-    )
-}
-
-#[derive(Debug, Clone)]
-struct SaldeoKsefAccountingCandidate {
-    document_id: i64,
-}
-
-fn saldeo_ksef_accounting_candidates(
-    records: &[InvoiceRecord],
-) -> Vec<SaldeoKsefAccountingCandidate> {
-    let mut seen = HashSet::new();
-    records
-        .iter()
-        .filter(|record| record.ksef_reference.is_some())
-        .filter_map(|record| {
-            let document_id = saldeo_document_id(record)?;
-            if !seen.insert(document_id) {
-                return None;
-            }
-            Some(SaldeoKsefAccountingCandidate { document_id })
-        })
-        .collect()
-}
-
-fn saldeo_document_id(record: &InvoiceRecord) -> Option<i64> {
-    record.content_hash.strip_prefix("saldeo:")?.parse().ok()
-}
-
-fn saldeo_fetch_ksef_accounting_statuses(
-    session: &SaldeoSession,
-    document_ids: &[i64],
-) -> Result<HashMap<i64, Option<bool>>> {
-    if document_ids.is_empty() {
-        return Ok(HashMap::new());
+    if let Some(csv_path) = csv {
+        write_saldeo_sync_csv(&plan, &csv_path)?;
     }
-    let client = Client::builder().build()?;
-    let body = serde_json::json!({"clientId": 0, "documentIds": document_ids});
-    let response: Value = client
-        .post("https://saldeo.brainshare.pl/rest/client/document/ksef/accounting")
-        .header("Cookie", &session.cookie_header)
-        .header("X-SALDEO-XSRF-H-TOKEN", &session.xsrf)
-        .header("saldeoApp", "angularApp")
-        .json(&body)
-        .send()?
-        .error_for_status()?
-        .json()?;
-    if response.get("status").and_then(|v| v.as_str()) != Some("SUCCESS") {
-        return Err(anyhow!("Saldeo KSeF accounting status failed: {response}"));
-    }
-    let mut out = HashMap::new();
-    for item in response
-        .get("data")
-        .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-    {
-        if let Some(document_id) = item.get("documentId").and_then(|v| v.as_i64()) {
-            out.insert(
-                document_id,
-                item.get("accounting").and_then(|v| v.as_bool()),
-            );
-        }
-    }
-    Ok(out)
-}
-
-fn saldeo_mark_ksef_documents(
-    session: &SaldeoSession,
-    document_ids: &[i64],
-    mark_is_accounting: bool,
-) -> Result<Value> {
-    let client = Client::builder().build()?;
-    let body = serde_json::json!({
-        "ids": document_ids,
-        "markIsAccounting": mark_is_accounting,
-        "skipPreviousSetup": true,
-    });
-    let response: Value = client
-        .post("https://saldeo.brainshare.pl/rest/client/document/list/bulkupdate/markAccounting")
-        .header("Cookie", &session.cookie_header)
-        .header("X-SALDEO-XSRF-H-TOKEN", &session.xsrf)
-        .header("saldeoApp", "angularApp")
-        .json(&body)
-        .send()?
-        .error_for_status()?
-        .json()?;
-    if response.get("status").and_then(|v| v.as_str()) != Some("SUCCESS") {
-        return Err(anyhow!("Saldeo markAccounting failed: {response}"));
-    }
-    Ok(response)
+    write_json(&plan, output.as_deref())
 }
 
 fn write_records(
@@ -4063,7 +2867,11 @@ fn gmail_fetch(
     out_dir: &Path,
     max: usize,
     extensions: &[String],
+    progress: Option<Arc<Mutex<String>>>,
 ) -> Result<GmailFetchResult> {
+    if let Some(progress) = &progress {
+        set_progress(progress, "Gmail: przygotowanie katalogu i klienta...");
+    }
     fs::create_dir_all(out_dir).with_context(|| format!("mkdir {}", out_dir.display()))?;
     let client = Client::builder().build()?;
     let allowed_exts = extensions
@@ -4074,6 +2882,15 @@ fn gmail_fetch(
     let mut message_ids = Vec::new();
 
     while message_ids.len() < max {
+        if let Some(progress) = &progress {
+            set_progress(
+                progress,
+                format!(
+                    "Gmail: lista wiadomości (znaleziono {})...",
+                    message_ids.len()
+                ),
+            );
+        }
         let mut req = client
             .get(format!(
                 "https://gmail.googleapis.com/gmail/v1/users/{}/messages",
@@ -4098,6 +2915,15 @@ fn gmail_fetch(
             .get("nextPageToken")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        if let Some(progress) = &progress {
+            set_progress(
+                progress,
+                format!(
+                    "Gmail: lista wiadomości: {} znalezionych",
+                    message_ids.len()
+                ),
+            );
+        }
         if page_token.is_none() {
             break;
         }
@@ -4112,10 +2938,34 @@ fn gmail_fetch(
         let metadata_path = out_dir.join(format!("{}_message.json", sanitize_filename(id)));
         if gmail_message_cached(out_dir, id, &allowed_exts) {
             messages_cached += 1;
+            if let Some(progress) = &progress {
+                set_progress(
+                    progress,
+                    format!(
+                        "Gmail: cache {}/{} wiadomości, API {}, pliki {}",
+                        messages_cached,
+                        message_ids.len(),
+                        messages_fetched,
+                        saved_files.len()
+                    ),
+                );
+            }
             continue;
         }
 
         messages_fetched += 1;
+        if let Some(progress) = &progress {
+            set_progress(
+                progress,
+                format!(
+                    "Gmail: pobieram wiadomość {}/{} (cache {}, API {})...",
+                    messages_cached + messages_fetched,
+                    message_ids.len(),
+                    messages_cached,
+                    messages_fetched
+                ),
+            );
+        }
         let msg: Value = client
             .get(format!(
                 "https://gmail.googleapis.com/gmail/v1/users/{}/messages/{}",
@@ -4147,6 +2997,15 @@ fn gmail_fetch(
             &mut saved_files,
         )?;
         attachments_saved += saved_files.len().saturating_sub(before_parts);
+        if let Some(progress) = &progress {
+            set_progress(
+                progress,
+                format!(
+                    "Gmail: zapisano {} metadanych i {} załączników",
+                    metadata_saved, attachments_saved
+                ),
+            );
+        }
     }
 
     Ok(GmailFetchResult {
@@ -4340,740 +3199,6 @@ fn sanitize_filename(value: &str) -> String {
     s.trim_matches('_').chars().take(180).collect()
 }
 
-#[derive(Debug, Clone)]
-struct KsefOnlineConfig {
-    base_url: String,
-    context_type: String,
-    context_value: String,
-    ksef_token: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct KsefTokenCache {
-    base_url: String,
-    context_type: String,
-    context_value: String,
-    access_token: String,
-    access_valid_until: DateTime<Utc>,
-    refresh_token: Option<String>,
-    refresh_valid_until: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct KsefPublicKeyCertificate {
-    certificate: String,
-    public_key_id: String,
-    valid_from: DateTime<Utc>,
-    valid_to: DateTime<Utc>,
-    usage: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct KsefChallengeResponse {
-    challenge: String,
-    #[serde(rename = "timestampMs")]
-    timestamp_ms: i64,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct KsefTokenInfo {
-    token: String,
-    valid_until: DateTime<Utc>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct KsefAuthInitResponse {
-    reference_number: String,
-    authentication_token: KsefTokenInfo,
-}
-
-#[derive(Debug, Deserialize)]
-struct KsefAuthStatusResponse {
-    status: KsefStatusInfo,
-}
-
-#[derive(Debug, Deserialize)]
-struct KsefStatusInfo {
-    code: i64,
-    description: Option<String>,
-    details: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct KsefTokensResponse {
-    access_token: KsefTokenInfo,
-    refresh_token: KsefTokenInfo,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct KsefRefreshResponse {
-    access_token: KsefTokenInfo,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct KsefQueryMetadataResponse {
-    has_more: bool,
-    is_truncated: bool,
-    invoices: Vec<Value>,
-}
-
-fn ksef_online_sync(year: i32, out_dir: Option<&Path>) -> Result<KsefSyncResult> {
-    let config = ksef_online_config()?;
-    let client = Client::builder()
-        .timeout(ksef_http_timeout())
-        .build()
-        .context("KSeF HTTP client")?;
-    let access_token = ksef_access_token(&client, &config)?;
-    let page_size = ksef_metadata_page_size();
-    let mut metadata = Vec::new();
-
-    for subject_type in ksef_subject_types() {
-        for (from, to) in ksef_year_quarter_ranges(year) {
-            let mut page_offset = 0usize;
-            loop {
-                ksef_rate_limit_wait("metadata", 8, 16, 20)?;
-                let url = format!("{}/invoices/query/metadata", config.base_url);
-                let query = vec![
-                    ("sortOrder".to_string(), "Asc".to_string()),
-                    ("pageOffset".to_string(), page_offset.to_string()),
-                    ("pageSize".to_string(), page_size.to_string()),
-                ];
-                let body = serde_json::json!({
-                    "subjectType": subject_type,
-                    "dateRange": {
-                        "dateType": "Issue",
-                        "from": from,
-                        "to": to,
-                    }
-                });
-                let response: KsefQueryMetadataResponse = ksef_send_with_retry(
-                    client
-                        .post(&url)
-                        .bearer_auth(&access_token)
-                        .header("X-Error-Format", "problem-details")
-                        .query(&query)
-                        .json(&body),
-                    "query invoice metadata",
-                )?
-                .json()
-                .context("KSeF metadata response JSON")?;
-
-                if response.is_truncated {
-                    return Err(anyhow!(
-                        "KSeF metadata query truncated for {subject_type} {from}..{to}; zmniejsz zakres dat albo uruchom mniejszymi partiami"
-                    ));
-                }
-                let count = response.invoices.len();
-                eprintln!(
-                    "  [KSeF] metadata {subject_type} {from}..{to}, strona {page_offset}: {count}"
-                );
-                metadata.extend(response.invoices);
-                if !response.has_more {
-                    break;
-                }
-                page_offset += 1;
-            }
-        }
-    }
-
-    let mut seen = HashSet::new();
-    let mut records = Vec::new();
-    for item in &metadata {
-        if let Some(record) = ksef_metadata_to_record(item) {
-            if seen.insert(record.content_hash.clone()) {
-                records.push(record);
-            }
-        }
-    }
-
-    let out_dir = out_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(|| configured_ksef_out_path(year));
-    fs::create_dir_all(&out_dir).with_context(|| format!("mkdir {}", out_dir.display()))?;
-    let raw_output = out_dir.join("ksef_raw_metadata.json");
-    let json_output = out_dir.join("records.json");
-    let jsonl_output = out_dir.join("records.jsonl");
-    fs::write(&raw_output, serde_json::to_vec_pretty(&metadata)?)
-        .with_context(|| format!("zapis {}", raw_output.display()))?;
-    write_records(&records, OutputFormat::Json, Some(&json_output))?;
-    write_records(&records, OutputFormat::Jsonl, Some(&jsonl_output))?;
-
-    Ok(KsefSyncResult {
-        summary: KsefSyncSummary {
-            year,
-            records_count: records.len(),
-            input: format!(
-                "online:{}:{}:{}",
-                config.base_url, config.context_type, config.context_value
-            ),
-            json_output: json_output.display().to_string(),
-            jsonl_output: jsonl_output.display().to_string(),
-        },
-        records,
-    })
-}
-
-fn ksef_online_config() -> Result<KsefOnlineConfig> {
-    let base_url = ksef_base_url();
-    let context_type = lab_config_var("KSEF_CONTEXT_TYPE").unwrap_or_else(|| "Nip".to_string());
-    let raw_context = lab_config_var("KSEF_CONTEXT_NIP")
-        .or_else(|| lab_config_var("KSEF_NIP"))
-        .unwrap_or_else(|| DEFAULT_PRODUCTMESH_NIP.to_string());
-    let context_value = if context_type.eq_ignore_ascii_case("Nip") {
-        normalize_tax_id(&raw_context).unwrap_or(raw_context)
-    } else {
-        raw_context
-    };
-    let ksef_token = lab_config_var("KSEF_TOKEN").ok_or_else(|| {
-        anyhow!("brak KSEF_TOKEN; potrzebny token KSeF z uprawnieniem InvoiceRead")
-    })?;
-    Ok(KsefOnlineConfig {
-        base_url,
-        context_type,
-        context_value,
-        ksef_token,
-    })
-}
-
-fn ksef_base_url() -> String {
-    let url = lab_config_var("KSEF_BASE_URL").unwrap_or_else(|| {
-        match lab_config_var("KSEF_ENV")
-            .unwrap_or_else(|| "prod".to_string())
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "test" | "te" => "https://api-test.ksef.mf.gov.pl/v2".to_string(),
-            "demo" | "preprod" | "pre-production" => {
-                "https://api-demo.ksef.mf.gov.pl/v2".to_string()
-            }
-            _ => "https://api.ksef.mf.gov.pl/v2".to_string(),
-        }
-    });
-    url.trim_end_matches('/').to_string()
-}
-
-fn ksef_http_timeout() -> Duration {
-    Duration::from_secs(
-        lab_config_var("KSEF_TIMEOUT_SECS")
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(60),
-    )
-}
-
-fn ksef_metadata_page_size() -> usize {
-    lab_config_var("KSEF_PAGE_SIZE")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(250)
-        .clamp(10, 250)
-}
-
-fn ksef_subject_types() -> Vec<String> {
-    lab_config_var("KSEF_SUBJECT_TYPES")
-        .map(|value| {
-            value
-                .split(',')
-                .map(|part| part.trim().to_string())
-                .filter(|part| !part.is_empty())
-                .collect::<Vec<_>>()
-        })
-        .filter(|items| !items.is_empty())
-        .unwrap_or_else(|| vec!["Subject1".to_string(), "Subject2".to_string()])
-}
-
-fn ksef_year_quarter_ranges(year: i32) -> Vec<(String, String)> {
-    let starts = [(year, 1, 1), (year, 4, 1), (year, 7, 1), (year, 10, 1)];
-    let ends = [(year, 4, 1), (year, 7, 1), (year, 10, 1), (year + 1, 1, 1)];
-    starts
-        .into_iter()
-        .zip(ends)
-        .map(|((sy, sm, sd), (ey, em, ed))| {
-            (
-                format!("{sy:04}-{sm:02}-{sd:02}T00:00:00+00:00"),
-                format!("{ey:04}-{em:02}-{ed:02}T00:00:00+00:00"),
-            )
-        })
-        .collect()
-}
-
-fn ksef_access_token(client: &Client, config: &KsefOnlineConfig) -> Result<String> {
-    if let Some(token) = lab_config_var("KSEF_ACCESS_TOKEN") {
-        return Ok(token);
-    }
-
-    if let Ok(cache) = read_ksef_token_cache()
-        && cache.base_url == config.base_url
-        && cache.context_type == config.context_type
-        && cache.context_value == config.context_value
-    {
-        if cache.access_valid_until > Utc::now() + chrono::Duration::seconds(60) {
-            return Ok(cache.access_token);
-        }
-        if let (Some(refresh_token), Some(refresh_valid_until)) =
-            (cache.refresh_token.clone(), cache.refresh_valid_until)
-            && refresh_valid_until > Utc::now() + chrono::Duration::seconds(60)
-            && let Ok(refreshed) = ksef_refresh_access_token(client, config, &cache, &refresh_token)
-        {
-            return Ok(refreshed);
-        }
-    }
-
-    ksef_authenticate_with_ksef_token(client, config)
-}
-
-fn ksef_refresh_access_token(
-    client: &Client,
-    config: &KsefOnlineConfig,
-    cache: &KsefTokenCache,
-    refresh_token: &str,
-) -> Result<String> {
-    let url = format!("{}/auth/token/refresh", config.base_url);
-    let response: KsefRefreshResponse = ksef_send_with_retry(
-        client
-            .post(&url)
-            .bearer_auth(refresh_token)
-            .header("X-Error-Format", "problem-details"),
-        "refresh access token",
-    )?
-    .json()
-    .context("KSeF refresh response JSON")?;
-    let new_cache = KsefTokenCache {
-        base_url: config.base_url.clone(),
-        context_type: config.context_type.clone(),
-        context_value: config.context_value.clone(),
-        access_token: response.access_token.token.clone(),
-        access_valid_until: response.access_token.valid_until,
-        refresh_token: cache.refresh_token.clone(),
-        refresh_valid_until: cache.refresh_valid_until,
-    };
-    save_ksef_token_cache(&new_cache)?;
-    Ok(new_cache.access_token)
-}
-
-fn ksef_authenticate_with_ksef_token(client: &Client, config: &KsefOnlineConfig) -> Result<String> {
-    let key = ksef_token_encryption_key(client, &config.base_url)?;
-    let challenge_url = format!("{}/auth/challenge", config.base_url);
-    let challenge: KsefChallengeResponse = ksef_send_with_retry(
-        client
-            .post(&challenge_url)
-            .header("X-Error-Format", "problem-details"),
-        "auth challenge",
-    )?
-    .json()
-    .context("KSeF challenge response JSON")?;
-
-    let token_with_timestamp = format!("{}|{}", config.ksef_token, challenge.timestamp_ms);
-    let encrypted_token =
-        ksef_encrypt_token_with_certificate(&key.certificate, &token_with_timestamp)?;
-    let auth_url = format!("{}/auth/ksef-token", config.base_url);
-    let auth_body = serde_json::json!({
-        "challenge": challenge.challenge,
-        "contextIdentifier": {
-            "type": config.context_type,
-            "value": config.context_value,
-        },
-        "encryptedToken": encrypted_token,
-        "publicKeyId": key.public_key_id,
-    });
-    let init: KsefAuthInitResponse = ksef_send_with_retry(
-        client
-            .post(&auth_url)
-            .header("X-Error-Format", "problem-details")
-            .json(&auth_body),
-        "authenticate by KSeF token",
-    )?
-    .json()
-    .context("KSeF auth init response JSON")?;
-
-    ksef_wait_for_auth(client, config, &init)?;
-
-    let redeem_url = format!("{}/auth/token/redeem", config.base_url);
-    let tokens: KsefTokensResponse = ksef_send_with_retry(
-        client
-            .post(&redeem_url)
-            .bearer_auth(&init.authentication_token.token)
-            .header("X-Error-Format", "problem-details"),
-        "redeem access token",
-    )?
-    .json()
-    .context("KSeF redeem response JSON")?;
-
-    let cache = KsefTokenCache {
-        base_url: config.base_url.clone(),
-        context_type: config.context_type.clone(),
-        context_value: config.context_value.clone(),
-        access_token: tokens.access_token.token.clone(),
-        access_valid_until: tokens.access_token.valid_until,
-        refresh_token: Some(tokens.refresh_token.token),
-        refresh_valid_until: Some(tokens.refresh_token.valid_until),
-    };
-    save_ksef_token_cache(&cache)?;
-    Ok(cache.access_token)
-}
-
-fn ksef_wait_for_auth(
-    client: &Client,
-    config: &KsefOnlineConfig,
-    init: &KsefAuthInitResponse,
-) -> Result<()> {
-    let status_url = format!("{}/auth/{}", config.base_url, init.reference_number);
-    for attempt in 0..30 {
-        let status: KsefAuthStatusResponse = ksef_send_with_retry(
-            client
-                .get(&status_url)
-                .bearer_auth(&init.authentication_token.token)
-                .header("X-Error-Format", "problem-details"),
-            "auth status",
-        )?
-        .json()
-        .context("KSeF auth status response JSON")?;
-        match status.status.code {
-            200 => return Ok(()),
-            100 => {
-                sleep(Duration::from_secs(1));
-            }
-            code => {
-                return Err(anyhow!(
-                    "KSeF auth failed: code={} description={} details={}",
-                    code,
-                    status.status.description.unwrap_or_default(),
-                    status.status.details.unwrap_or_default().join("; ")
-                ));
-            }
-        }
-        if attempt == 29 {
-            return Err(anyhow!("KSeF auth timeout for {}", init.reference_number));
-        }
-    }
-    Ok(())
-}
-
-fn ksef_token_encryption_key(client: &Client, base_url: &str) -> Result<KsefPublicKeyCertificate> {
-    let url = format!("{base_url}/security/public-key-certificates");
-    let certificates: Vec<KsefPublicKeyCertificate> = ksef_send_with_retry(
-        client.get(&url).header("X-Error-Format", "problem-details"),
-        "public key certificates",
-    )?
-    .json()
-    .context("KSeF public key certificates response JSON")?;
-    let now = Utc::now();
-    certificates
-        .into_iter()
-        .filter(|cert| {
-            cert.usage
-                .iter()
-                .any(|usage| usage == "KsefTokenEncryption")
-        })
-        .max_by_key(|cert| {
-            let active = cert.valid_from <= now && cert.valid_to > now;
-            (active, cert.valid_from)
-        })
-        .ok_or_else(|| anyhow!("KSeF nie zwrócił certyfikatu KsefTokenEncryption"))
-}
-
-fn ksef_encrypt_token_with_certificate(certificate_b64: &str, plaintext: &str) -> Result<String> {
-    let tmp_dir = std::env::temp_dir();
-    let nonce = format!(
-        "{}-{}",
-        std::process::id(),
-        Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    );
-    let cert_path = tmp_dir.join(format!("lab-ksef-{nonce}.der"));
-    let pub_path = tmp_dir.join(format!("lab-ksef-{nonce}.pem"));
-    let plain_path = tmp_dir.join(format!("lab-ksef-{nonce}.txt"));
-    let encrypted_path = tmp_dir.join(format!("lab-ksef-{nonce}.bin"));
-
-    let result = (|| -> Result<String> {
-        let cert = STANDARD
-            .decode(certificate_b64)
-            .context("dekodowanie certyfikatu KSeF")?;
-        fs::write(&cert_path, cert).with_context(|| format!("zapis {}", cert_path.display()))?;
-        fs::write(&plain_path, plaintext.as_bytes())
-            .with_context(|| format!("zapis {}", plain_path.display()))?;
-
-        let output = Command::new("openssl")
-            .arg("x509")
-            .arg("-inform")
-            .arg("DER")
-            .arg("-in")
-            .arg(&cert_path)
-            .arg("-pubkey")
-            .arg("-noout")
-            .output()
-            .context("openssl x509 -pubkey")?;
-        if !output.status.success() {
-            return Err(anyhow!(
-                "openssl x509 failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-        fs::write(&pub_path, output.stdout)
-            .with_context(|| format!("zapis {}", pub_path.display()))?;
-
-        let output = Command::new("openssl")
-            .arg("pkeyutl")
-            .arg("-encrypt")
-            .arg("-pubin")
-            .arg("-inkey")
-            .arg(&pub_path)
-            .arg("-in")
-            .arg(&plain_path)
-            .arg("-out")
-            .arg(&encrypted_path)
-            .arg("-pkeyopt")
-            .arg("rsa_padding_mode:oaep")
-            .arg("-pkeyopt")
-            .arg("rsa_oaep_md:sha256")
-            .arg("-pkeyopt")
-            .arg("rsa_mgf1_md:sha256")
-            .output()
-            .context("openssl pkeyutl RSA-OAEP SHA-256")?;
-        if !output.status.success() {
-            return Err(anyhow!(
-                "openssl pkeyutl failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-        let encrypted = fs::read(&encrypted_path)
-            .with_context(|| format!("odczyt {}", encrypted_path.display()))?;
-        Ok(STANDARD.encode(encrypted))
-    })();
-
-    for path in [&cert_path, &pub_path, &plain_path, &encrypted_path] {
-        let _ = fs::remove_file(path);
-    }
-    result
-}
-
-fn ksef_send_with_retry(
-    builder: reqwest::blocking::RequestBuilder,
-    description: &str,
-) -> Result<reqwest::blocking::Response> {
-    let mut delay = Duration::from_secs(1);
-    for attempt in 0..6 {
-        let request = builder
-            .try_clone()
-            .ok_or_else(|| anyhow!("KSeF request cannot be cloned: {description}"))?;
-        match request.send() {
-            Ok(response) => {
-                let status = response.status();
-                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    let wait = response
-                        .headers()
-                        .get(reqwest::header::RETRY_AFTER)
-                        .and_then(|value| value.to_str().ok())
-                        .and_then(|value| value.parse::<u64>().ok())
-                        .map(Duration::from_secs)
-                        .unwrap_or(delay);
-                    eprintln!(
-                        "  [KSeF] rate limit 429 ({description}), czekam {}s",
-                        wait.as_secs()
-                    );
-                    sleep(wait + Duration::from_millis(250));
-                    delay = (delay * 2).min(Duration::from_secs(60));
-                    continue;
-                }
-                if status.is_server_error() && attempt < 5 {
-                    eprintln!(
-                        "  [KSeF] HTTP {} ({description}), retry za {}s",
-                        status,
-                        delay.as_secs()
-                    );
-                    sleep(delay);
-                    delay = (delay * 2).min(Duration::from_secs(60));
-                    continue;
-                }
-                if !status.is_success() {
-                    let body = response.text().unwrap_or_default();
-                    return Err(anyhow!("KSeF {description} HTTP {status}: {body}"));
-                }
-                return Ok(response);
-            }
-            Err(err) if attempt < 5 => {
-                eprintln!(
-                    "  [KSeF] błąd sieci ({description}): {err}; retry za {}s",
-                    delay.as_secs()
-                );
-                sleep(delay);
-                delay = (delay * 2).min(Duration::from_secs(60));
-            }
-            Err(err) => return Err(err).context(format!("KSeF {description}")),
-        }
-    }
-    Err(anyhow!("KSeF {description}: retry exhausted"))
-}
-
-fn ksef_rate_limit_wait(
-    group: &str,
-    per_second: usize,
-    per_minute: usize,
-    per_hour: usize,
-) -> Result<()> {
-    let path = ksef_rate_limit_path(group);
-    loop {
-        let now = Utc::now().timestamp_millis();
-        let mut timestamps = read_i64_json_array(&path).unwrap_or_default();
-        timestamps.retain(|ts| now - *ts < 3_600_000);
-        timestamps.sort_unstable();
-
-        let wait_ms = [
-            rate_limit_wait_for_window(&timestamps, now, 1_000, per_second),
-            rate_limit_wait_for_window(&timestamps, now, 60_000, per_minute),
-            rate_limit_wait_for_window(&timestamps, now, 3_600_000, per_hour),
-        ]
-        .into_iter()
-        .flatten()
-        .max()
-        .unwrap_or(0);
-
-        if wait_ms <= 0 {
-            timestamps.push(now);
-            write_i64_json_array(&path, &timestamps)?;
-            return Ok(());
-        }
-
-        let wait = Duration::from_millis(wait_ms as u64 + 250);
-        eprintln!(
-            "  [KSeF] lokalny limiter {group}: czekam {}s",
-            wait.as_secs().max(1)
-        );
-        sleep(wait);
-    }
-}
-
-fn rate_limit_wait_for_window(
-    timestamps: &[i64],
-    now: i64,
-    window_ms: i64,
-    limit: usize,
-) -> Option<i64> {
-    if limit == 0 {
-        return None;
-    }
-    let mut in_window = timestamps
-        .iter()
-        .copied()
-        .filter(|ts| now - *ts < window_ms)
-        .collect::<Vec<_>>();
-    if in_window.len() < limit {
-        return None;
-    }
-    in_window.sort_unstable();
-    let oldest_blocking = in_window[in_window.len().saturating_sub(limit)];
-    Some((oldest_blocking + window_ms - now).max(0))
-}
-
-fn ksef_rate_limit_path(group: &str) -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config")
-        .join("lab")
-        .join(format!("ksef-rate-{group}.json"))
-}
-
-fn read_i64_json_array(path: &Path) -> Result<Vec<i64>> {
-    let text = fs::read_to_string(path).with_context(|| format!("odczyt {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("JSON {}", path.display()))
-}
-
-fn write_i64_json_array(path: &Path, values: &[i64]) -> Result<()> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-    }
-    fs::write(path, serde_json::to_vec(values)?)
-        .with_context(|| format!("zapis {}", path.display()))
-}
-
-fn read_ksef_token_cache() -> Result<KsefTokenCache> {
-    let path = default_ksef_access_token_path();
-    let text = fs::read_to_string(&path).with_context(|| format!("odczyt {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("JSON {}", path.display()))
-}
-
-fn save_ksef_token_cache(cache: &KsefTokenCache) -> Result<()> {
-    let path = default_ksef_access_token_path();
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-    }
-    fs::write(&path, serde_json::to_vec_pretty(cache)?)
-        .with_context(|| format!("zapis {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
-}
-
-fn default_ksef_access_token_path() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config")
-        .join("lab")
-        .join("ksef_access_token.json")
-}
-
-fn ksef_metadata_to_record(item: &Value) -> Option<InvoiceRecord> {
-    let ksef_number = json_string(item, "ksefNumber")?;
-    let mut record = empty_record(SourceKind::Ksef);
-    record.content_hash = format!("ksef:{ksef_number}");
-    record.ksef_reference = Some(ksef_number.clone());
-    record.source_path = Some(format!("ksef:{ksef_number}"));
-    record.invoice_number = json_string(item, "invoiceNumber").map(|v| clean_invoice_number(&v));
-    record.issue_date = json_string(item, "issueDate").and_then(|v| parse_date(&v));
-    record.gross_amount_minor = money_value_to_minor(item.get("grossAmount"));
-    record.net_amount_minor = money_value_to_minor(item.get("netAmount"));
-    record.vat_amount_minor = money_value_to_minor(item.get("vatAmount"));
-    record.currency = json_string(item, "currency").and_then(|v| normalize_currency(&v));
-
-    if let Some(seller) = item.get("seller") {
-        record.seller_tax_id = json_string(seller, "nip").and_then(|v| normalize_tax_id(&v));
-        record.seller_name = json_string(seller, "name").and_then(|v| clean_name(&v));
-    }
-    if let Some(buyer) = item.get("buyer") {
-        record.buyer_name = json_string(buyer, "name").and_then(|v| clean_name(&v));
-        record.buyer_tax_id = buyer.get("identifier").and_then(|identifier| {
-            let id_type = json_string(identifier, "type")?;
-            if id_type.eq_ignore_ascii_case("Nip") {
-                json_string(identifier, "value").and_then(|v| normalize_tax_id(&v))
-            } else {
-                None
-            }
-        });
-    }
-    record.warnings.push("ksef online metadata".to_string());
-    Some(record)
-}
-
-fn ksef_sync(year: i32, input: &Path, out_dir: Option<&Path>) -> Result<KsefSyncResult> {
-    let records = load_records(SourceKind::Ksef, input)?;
-    let out_dir = out_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(|| configured_ksef_out_path(year));
-    fs::create_dir_all(&out_dir).with_context(|| format!("mkdir {}", out_dir.display()))?;
-    let json_output = out_dir.join("records.json");
-    let jsonl_output = out_dir.join("records.jsonl");
-    write_records(&records, OutputFormat::Json, Some(&json_output))?;
-    write_records(&records, OutputFormat::Jsonl, Some(&jsonl_output))?;
-    Ok(KsefSyncResult {
-        summary: KsefSyncSummary {
-            year,
-            records_count: records.len(),
-            input: input.display().to_string(),
-            json_output: json_output.display().to_string(),
-            jsonl_output: jsonl_output.display().to_string(),
-        },
-        records,
-    })
-}
-
 fn default_gmail_query(year: i32) -> String {
     format!(
         "after:{year}/01/01 before:{}/01/01 has:attachment filename:pdf",
@@ -5215,6 +3340,18 @@ fn enrich_candidates_with_gemma(
     skip_hashes: &HashSet<String>,
     progress: Option<Arc<Mutex<String>>>,
 ) -> Result<()> {
+    enrich_candidates_with_gemma_with_hook(records, skip_hashes, progress, |_, _| Ok(()))
+}
+
+fn enrich_candidates_with_gemma_with_hook<F>(
+    records: &mut [InvoiceRecord],
+    skip_hashes: &HashSet<String>,
+    progress: Option<Arc<Mutex<String>>>,
+    mut after_record: F,
+) -> Result<()>
+where
+    F: FnMut(&[InvoiceRecord], usize) -> Result<()>,
+{
     let todo = records
         .iter()
         .filter(|record| !skip_hashes.contains(&record.content_hash))
@@ -5236,11 +3373,13 @@ fn enrich_candidates_with_gemma(
     ensure_ppmlx_server()?;
     let mut processed = 0usize;
     let mut consecutive_errors = 0usize;
-    for record in records.iter_mut() {
-        if skip_hashes.contains(&record.content_hash) || !record_missing_core_fields(record) {
+    for idx in 0..records.len() {
+        if skip_hashes.contains(&records[idx].content_hash)
+            || !record_missing_core_fields(&records[idx])
+        {
             continue;
         }
-        let Some(source_path) = record.source_path.clone() else {
+        let Some(source_path) = records[idx].source_path.clone() else {
             continue;
         };
         let path = Path::new(&source_path);
@@ -5254,10 +3393,11 @@ fn enrich_candidates_with_gemma(
         if let Some(ref p) = progress {
             *p.lock().unwrap() = status;
         }
-        match gemma_extract_invoice_fields(record, path) {
+        let mut stop_after_persist = false;
+        match gemma_extract_invoice_fields(&mut records[idx], path) {
             Ok(true) => {
                 consecutive_errors = 0;
-                record
+                records[idx]
                     .warnings
                     .push("gemma-4-e4b enrichment applied".to_string());
             }
@@ -5266,13 +3406,17 @@ fn enrich_candidates_with_gemma(
             }
             Err(err) => {
                 consecutive_errors += 1;
-                record.warnings.push(format!("gemma-4-e4b: {err}"));
+                records[idx].warnings.push(format!("gemma-4-e4b: {err}"));
                 eprintln!("  [Gmail/Gemma] błąd: {err}");
                 if consecutive_errors >= 2 {
-                    eprintln!("  [Gmail/Gemma] pomijam dalsze wzbogacanie po 2 kolejnych błędach");
-                    break;
+                    stop_after_persist = true;
                 }
             }
+        }
+        after_record(records, idx)?;
+        if stop_after_persist {
+            eprintln!("  [Gmail/Gemma] pomijam dalsze wzbogacanie po 2 kolejnych błędach");
+            break;
         }
     }
     eprintln!("  [Gmail/Gemma] gotowe");
@@ -5630,2816 +3774,5 @@ fn apply_extracted_invoice_json(record: &mut InvoiceRecord, value: &Value) {
     }
     if record.buyer_name.is_none() {
         record.buyer_name = json_first_string(value, &["buyer_name"]).and_then(|v| clean_name(&v));
-    }
-}
-
-fn read_tri_report(path: &Path) -> Result<TriReconcileReport> {
-    let text = fs::read_to_string(path).with_context(|| format!("odczyt {}", path.display()))?;
-    serde_json::from_str(&text)
-        .with_context(|| format!("niepoprawny tri report {}", path.display()))
-}
-
-fn run_mcp_server(db_path: &Path) -> Result<()> {
-    let stdin = io::stdin();
-    let mut reader = io::BufReader::new(stdin.lock());
-    let mut stdout = io::stdout();
-    while let Some(message) = read_mcp_message(&mut reader)? {
-        let request: Value = match serde_json::from_str(&message) {
-            Ok(value) => value,
-            Err(err) => {
-                write_mcp_error(
-                    &mut stdout,
-                    Value::Null,
-                    -32700,
-                    &format!("Parse error: {err}"),
-                )?;
-                continue;
-            }
-        };
-        let id = request.get("id").cloned().unwrap_or(Value::Null);
-        let method = request
-            .get("method")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        if method.starts_with("notifications/") {
-            continue;
-        }
-        match handle_mcp_request(
-            db_path,
-            method,
-            request.get("params").cloned().unwrap_or(Value::Null),
-        ) {
-            Ok(result) => write_mcp_result(&mut stdout, id, result)?,
-            Err(err) => write_mcp_error(&mut stdout, id, -32603, &err.to_string())?,
-        }
-    }
-    Ok(())
-}
-
-fn read_mcp_message<R: BufRead>(reader: &mut R) -> Result<Option<String>> {
-    let mut first = String::new();
-    if reader.read_line(&mut first)? == 0 {
-        return Ok(None);
-    }
-    if first.trim_start().starts_with('{') {
-        return Ok(Some(first));
-    }
-    let mut content_length = None;
-    let mut line = first;
-    loop {
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            break;
-        }
-        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
-            content_length = Some(value.trim().parse::<usize>()?);
-        }
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            return Ok(None);
-        }
-    }
-    let len = content_length.ok_or_else(|| anyhow!("MCP message without Content-Length"))?;
-    let mut bytes = vec![0u8; len];
-    reader.read_exact(&mut bytes)?;
-    Ok(Some(String::from_utf8(bytes)?))
-}
-
-fn write_mcp_result<W: Write>(writer: &mut W, id: Value, result: Value) -> Result<()> {
-    write_mcp_message(
-        writer,
-        &serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}),
-    )
-}
-
-fn write_mcp_error<W: Write>(writer: &mut W, id: Value, code: i32, message: &str) -> Result<()> {
-    write_mcp_message(
-        writer,
-        &serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}}),
-    )
-}
-
-fn write_mcp_message<W: Write>(writer: &mut W, value: &Value) -> Result<()> {
-    let body = serde_json::to_vec(value)?;
-    write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
-    writer.write_all(&body)?;
-    writer.flush()?;
-    Ok(())
-}
-
-fn handle_mcp_request(db_path: &Path, method: &str, params: Value) -> Result<Value> {
-    match method {
-        "initialize" => Ok(serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": { "tools": {} },
-            "serverInfo": { "name": "lab-mcp", "version": env!("CARGO_PKG_VERSION") }
-        })),
-        "tools/list" => Ok(serde_json::json!({ "tools": mcp_tools() })),
-        "tools/call" => {
-            let name = params
-                .get("name")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!("tools/call missing name"))?;
-            let args = params
-                .get("arguments")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({}));
-            let value = call_mcp_tool(db_path, name, &args)?;
-            Ok(serde_json::json!({
-                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&value)? }]
-            }))
-        }
-        _ => Err(anyhow!("unsupported MCP method: {method}")),
-    }
-}
-
-fn mcp_tools() -> Value {
-    serde_json::json!([
-        {
-            "name": "sync",
-            "description": "Sync invoice data from Gmail/PDF, KSeF, and/or Saldeo. Without source flags, syncs all three sources.",
-            "inputSchema": {"type":"object","properties":{
-                "ksef":{"type":"boolean","description":"Sync only KSeF"},
-                "mail":{"type":"boolean","description":"Sync only Gmail/PDF (fetch attachments, parse, filter, store)"},
-                "saldeo":{"type":"boolean","description":"Sync only Saldeo"},
-                "year":{"type":"integer","default":2026},
-                "ksef_input":{"type":"string","description":"Path to KSeF export directory/file"},
-                "gmail_client_secret":{"type":"string","description":"Google OAuth Desktop Client JSON for token refresh"},
-                "gmail_token_file":{"type":"string","description":"Path to Gmail token file"},
-                "productmesh_nip":{"type":"string","default":"5242920020","description":"NIP filter for mail scanning"},
-                "store":{"type":"boolean","default":false,"description":"Store records in SQLite"}
-            }}
-        },
-        {
-            "name": "reconcile",
-            "description": "Compare Gmail/PDF, KSeF, and Saldeo records (tri-reconcile). Defaults refresh KSeF/Saldeo metadata before comparing.",
-            "inputSchema": {"type":"object","properties":{
-                "mail":{"type":"string","description":"Path to Gmail/PDF records JSON/JSONL; defaults to cached mail candidates for year"},
-                "ksef":{"type":"string","description":"Path to KSeF records JSON/JSONL; defaults to configured KSeF data and refreshes it first"},
-                "saldeo":{"type":"string","description":"Path to Saldeo records JSON/JSONL or raw documents.json; defaults to fetched Saldeo records and refreshes them first"},
-                "review_score":{"type":"integer","default":45,"description":"Minimum match score"},
-                "store":{"type":"boolean","default":false,"description":"Store temporal snapshot in SQLite"},
-                "year":{"type":"integer","default":2026}
-            }}
-        },
-        {
-            "name": "reconcile_status",
-            "description": "Show the last tri-reconcile report from the database for a given year.",
-            "inputSchema": {"type":"object","properties":{
-                "year":{"type":"integer","default":2026}
-            }}
-        },
-        {
-            "name": "upload",
-            "description": "Upload invoices missing in Saldeo. Requires tri_report path or mail+ksef+saldeo paths.",
-            "inputSchema": {"type":"object","properties":{
-                "year":{"type":"integer","default":2026},
-                "tri_report":{"type":"string","description":"Path to tri-reconcile report JSON"},
-                "mail":{"type":"string","description":"Path to Gmail/PDF records JSON/JSONL"},
-                "ksef":{"type":"string","description":"Path to KSeF records JSON/JSONL"},
-                "saldeo":{"type":"string","description":"Path to Saldeo records JSON/JSONL"},
-                "review_score":{"type":"integer","default":70,"description":"Minimum match score when computing from sources"}
-            }}
-        },
-        {
-            "name": "db_stats",
-            "description": "Return SQLite record counts.",
-            "inputSchema": {"type":"object","properties":{}}
-        },
-        {
-            "name": "tri_runs",
-            "description": "List temporal tri-reconcile runs and diff counters.",
-            "inputSchema": {"type":"object","properties":{
-                "limit":{"type":"integer","default":20}
-            }}
-        }
-    ])
-}
-
-fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<Value> {
-    match name {
-        "sync" => {
-            let year = json_i32(args, "year", 2026);
-            let auto_store_online_ksef = json_path_arg(args, "ksef_input").is_none()
-                && (json_bool(args, "ksef", false)
-                    || (!json_bool(args, "ksef", false)
-                        && !json_bool(args, "mail", false)
-                        && !json_bool(args, "saldeo", false)));
-            let conn = if json_bool(args, "store", false) || auto_store_online_ksef {
-                Some(open_db(db_path)?)
-            } else {
-                None
-            };
-            let nip = json_string_arg(args, "productmesh_nip")
-                .unwrap_or_else(|| DEFAULT_PRODUCTMESH_NIP.to_string());
-            let summary = run_sync_sources(
-                year,
-                json_bool(args, "ksef", false),
-                json_bool(args, "mail", false),
-                json_bool(args, "saldeo", false),
-                json_path_arg(args, "ksef_input").as_deref(),
-                json_path_arg(args, "gmail_client_secret").as_deref(),
-                json_path_arg(args, "gmail_token_file").as_deref(),
-                &nip,
-                conn.as_ref(),
-            )?;
-            Ok(serde_json::to_value(summary)?)
-        }
-        "reconcile" => {
-            let year = json_i32(args, "year", 2026);
-            let mail =
-                json_path_arg(args, "mail").unwrap_or_else(|| default_mail_candidates_path(year));
-            let ksef_arg = json_path_arg(args, "ksef");
-            let saldeo_arg = json_path_arg(args, "saldeo");
-            sync_reconcile_metadata(year, ksef_arg.is_none(), saldeo_arg.is_none(), db_path)?;
-            let ksef = ksef_arg.unwrap_or_else(|| configured_ksef_out_path(year));
-            let saldeo = saldeo_arg.unwrap_or_else(|| default_saldeo_records_path(year));
-            let report = tri_reconcile(
-                load_records(SourceKind::Mail, &mail)?,
-                load_records(SourceKind::Ksef, &ksef)?,
-                load_saldeo_records(&saldeo)?,
-                json_u8(args, "review_score", 45),
-            );
-            if json_bool(args, "store", false) {
-                let conn = open_db(db_path)?;
-                let diff = store_tri_reconcile_report(&conn, year, &report)?;
-                return Ok(serde_json::json!({"report": report, "temporal_diff": diff}));
-            }
-            Ok(serde_json::to_value(report)?)
-        }
-        "reconcile_status" => {
-            let year = json_i32(args, "year", 2026);
-            let conn = open_db(db_path)?;
-            let report = load_last_tri_report(&conn, year)?;
-            Ok(serde_json::to_value(report)?)
-        }
-        "upload" => {
-            let year = json_i32(args, "year", 2026);
-            let tri_report = json_path_arg(args, "tri_report");
-            let mail = json_path_arg(args, "mail");
-            let ksef = json_path_arg(args, "ksef");
-            let saldeo = json_path_arg(args, "saldeo");
-            let mut plan = saldeo_sync_plan(SaldeoSyncPlanConfig {
-                year,
-                tri_report: tri_report.as_deref(),
-                mail: mail.as_deref(),
-                ksef: ksef.as_deref(),
-                saldeo: saldeo.as_deref(),
-                review_score: json_u8(args, "review_score", 70),
-                confirm: true,
-                upload_url: None,
-            })?;
-            saldeo_upload_plan(
-                &mut plan,
-                &default_saldeo_storage_state_path(),
-                DEFAULT_SALDEO_UPLOAD_URL,
-                "file",
-            )?;
-            Ok(serde_json::to_value(plan)?)
-        }
-        "db_stats" => {
-            let conn = open_db(db_path)?;
-            Ok(serde_json::to_value(db_stats(&conn)?)?)
-        }
-        "tri_runs" => {
-            let conn = open_db(db_path)?;
-            Ok(list_tri_runs(&conn, json_usize(args, "limit", 20))?)
-        }
-        _ => Err(anyhow!("unknown MCP tool: {name}")),
-    }
-}
-
-fn json_string_arg(args: &Value, key: &str) -> Option<String> {
-    args.get(key)
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-}
-
-fn json_path_arg(args: &Value, key: &str) -> Option<PathBuf> {
-    json_string_arg(args, key).map(PathBuf::from)
-}
-
-fn json_bool(args: &Value, key: &str, default: bool) -> bool {
-    args.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
-}
-
-fn json_i32(args: &Value, key: &str, default: i32) -> i32 {
-    args.get(key)
-        .and_then(|v| v.as_i64())
-        .and_then(|v| i32::try_from(v).ok())
-        .unwrap_or(default)
-}
-
-fn json_usize(args: &Value, key: &str, default: usize) -> usize {
-    args.get(key)
-        .and_then(|v| v.as_u64())
-        .and_then(|v| usize::try_from(v).ok())
-        .unwrap_or(default)
-}
-
-fn json_u8(args: &Value, key: &str, default: u8) -> u8 {
-    args.get(key)
-        .and_then(|v| v.as_u64())
-        .and_then(|v| u8::try_from(v).ok())
-        .unwrap_or(default)
-}
-
-struct SaldeoSyncPlanConfig<'a> {
-    year: i32,
-    tri_report: Option<&'a Path>,
-    mail: Option<&'a Path>,
-    ksef: Option<&'a Path>,
-    saldeo: Option<&'a Path>,
-    review_score: u8,
-    confirm: bool,
-    upload_url: Option<String>,
-}
-
-fn saldeo_sync_plan(config: SaldeoSyncPlanConfig<'_>) -> Result<SaldeoSyncPlan> {
-    let report = if let Some(path) = config.tri_report {
-        read_tri_report(path)?
-    } else {
-        let mail = config
-            .mail
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| default_mail_candidates_path(config.year));
-        let ksef = config
-            .ksef
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| configured_ksef_out_path(config.year));
-        let saldeo = config
-            .saldeo
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| default_saldeo_records_path(config.year));
-        tri_reconcile(
-            load_records(SourceKind::Mail, &mail)?,
-            load_records(SourceKind::Ksef, &ksef)?,
-            load_saldeo_records(&saldeo)?,
-            config.review_score,
-        )
-    };
-    let mut seen = HashSet::new();
-    let mut items = Vec::new();
-    for row in &report.rows {
-        if row.saldeo.is_some() {
-            continue;
-        }
-        let Some(record) = row.mail.as_ref() else {
-            continue;
-        };
-        let related_sources = [("mail", row.mail.as_ref()), ("ksef", row.ksef.as_ref())]
-            .into_iter()
-            .filter_map(|(name, record)| record.map(|_| name.to_string()))
-            .collect::<Vec<_>>();
-        let key = record
-            .source_path
-            .clone()
-            .or_else(|| record.invoice_number.clone())
-            .unwrap_or_else(|| tri_row_key(row));
-        if !seen.insert(key) {
-            continue;
-        }
-        items.push(saldeo_sync_item_from_record(
-            &row.status,
-            record,
-            related_sources,
-        ));
-    }
-    let summary = saldeo_sync_summary(&items);
-    Ok(SaldeoSyncPlan {
-        generated_at: Utc::now(),
-        year: config.year,
-        confirm: config.confirm,
-        upload_url: config
-            .upload_url
-            .or_else(|| Some(DEFAULT_SALDEO_UPLOAD_URL.to_string())),
-        summary,
-        items,
-    })
-}
-
-fn saldeo_sync_item_from_record(
-    status: &str,
-    record: &InvoiceRecord,
-    related_sources: Vec<String>,
-) -> SaldeoSyncItem {
-    let source_path = record.source_path.clone();
-    let can_upload = source_path
-        .as_deref()
-        .map(|path| Path::new(path).is_file())
-        .unwrap_or(false);
-    SaldeoSyncItem {
-        status: status.to_string(),
-        source: source_as_str(record.source).to_string(),
-        related_sources,
-        invoice_number: record.invoice_number.clone(),
-        issue_date: record.issue_date,
-        gross_amount_minor: record.gross_amount_minor,
-        currency: record.currency.clone(),
-        contractor: record
-            .seller_name
-            .clone()
-            .or_else(|| record.buyer_name.clone()),
-        source_path,
-        can_upload,
-        upload_status: if can_upload {
-            "planned"
-        } else {
-            "missing_local_file"
-        }
-        .to_string(),
-        saldeo_response_status: None,
-        saldeo_response_body: None,
-        error: None,
-    }
-}
-
-fn saldeo_sync_summary(items: &[SaldeoSyncItem]) -> SaldeoSyncSummary {
-    SaldeoSyncSummary {
-        total_missing_saldeo: items.len(),
-        uploadable_count: items.iter().filter(|i| i.can_upload).count(),
-        missing_file_count: items.iter().filter(|i| !i.can_upload).count(),
-        uploaded_count: items
-            .iter()
-            .filter(|i| i.upload_status == "uploaded")
-            .count(),
-        failed_count: items.iter().filter(|i| i.upload_status == "failed").count(),
-    }
-}
-
-const DEFAULT_SALDEO_UPLOAD_URL: &str =
-    "https://saldeo.brainshare.pl/rest/client/document/generate-urls-for-upload";
-
-fn saldeo_upload_plan(
-    plan: &mut SaldeoSyncPlan,
-    storage_state: &Path,
-    upload_url: &str,
-    file_field: &str,
-) -> Result<()> {
-    saldeo_upload_plan_with_progress(plan, storage_state, upload_url, file_field, None)
-}
-
-fn saldeo_upload_plan_with_progress(
-    plan: &mut SaldeoSyncPlan,
-    storage_state: &Path,
-    upload_url: &str,
-    _file_field: &str,
-    progress: Option<Arc<Mutex<String>>>,
-) -> Result<()> {
-    let session = read_saldeo_session(storage_state)?;
-    let client = Client::builder().build()?;
-    let uploadable_count = plan.items.iter().filter(|item| item.can_upload).count();
-    let mut upload_index = 0usize;
-    for item in &mut plan.items {
-        if !item.can_upload {
-            continue;
-        }
-        let Some(source_path) = &item.source_path else {
-            continue;
-        };
-        upload_index += 1;
-        if let Some(progress) = &progress {
-            let label = Path::new(source_path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .or(item.invoice_number.as_deref())
-                .unwrap_or("plik");
-            set_progress(
-                progress,
-                format!("Upload Saldeo {upload_index}/{uploadable_count}: {label}"),
-            );
-        }
-        let upload_year = item.issue_date.map(|d| d.year()).unwrap_or(plan.year);
-        let upload_month = item
-            .issue_date
-            .map(|d| d.month())
-            .unwrap_or_else(|| Utc::now().month());
-        match saldeo_upload_file(
-            &client,
-            &session,
-            upload_url,
-            Path::new(source_path),
-            upload_year,
-            upload_month,
-        ) {
-            Ok((status, body)) => {
-                item.upload_status = "uploaded".to_string();
-                item.saldeo_response_status = Some(status);
-                item.saldeo_response_body = Some(body);
-            }
-            Err(err) => {
-                item.upload_status = "failed".to_string();
-                item.error = Some(err.to_string());
-            }
-        }
-    }
-    plan.summary = saldeo_sync_summary(&plan.items);
-    Ok(())
-}
-
-struct SaldeoSession {
-    cookie_header: String,
-    xsrf: String,
-}
-
-fn read_saldeo_session(storage_state: &Path) -> Result<SaldeoSession> {
-    let storage: Value = serde_json::from_str(&read_saldeo_storage_state(storage_state)?)?;
-    let cookies = storage
-        .get("cookies")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("storage-state Saldeo nie zawiera cookies"))?;
-    let cookie_header = cookies
-        .iter()
-        .filter_map(|cookie| {
-            let name = cookie.get("name")?.as_str()?;
-            let value = cookie.get("value")?.as_str()?;
-            Some(format!("{name}={value}"))
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    let xsrf = cookies
-        .iter()
-        .find(|cookie| cookie.get("name").and_then(|v| v.as_str()) == Some("X-SALDEO-XSRF-C-TOKEN"))
-        .and_then(|cookie| cookie.get("value"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("brak X-SALDEO-XSRF-C-TOKEN w storage-state; odśwież sesję Saldeo"))?
-        .to_string();
-    Ok(SaldeoSession {
-        cookie_header,
-        xsrf,
-    })
-}
-
-fn saldeo_upload_file(
-    client: &Client,
-    session: &SaldeoSession,
-    upload_url: &str,
-    path: &Path,
-    year: i32,
-    month: u32,
-) -> Result<(u16, String)> {
-    let file_name = path
-        .file_name()
-        .and_then(|v| v.to_str())
-        .ok_or_else(|| anyhow!("brak nazwy pliku: {}", path.display()))?;
-    let bytes = fs::read(path).with_context(|| format!("odczyt {}", path.display()))?;
-    let content_type = content_type_for_path(path);
-    let body = serde_json::json!({
-        "year": year,
-        "month": month,
-        "documentTypeId": -1,
-        "files": [{
-            "filename": file_name,
-            "contentType": content_type,
-            "size": bytes.len(),
-        }],
-        "clientId": null,
-    });
-    let response: Value = client
-        .post(upload_url)
-        .header("Cookie", &session.cookie_header)
-        .header("X-SALDEO-XSRF-H-TOKEN", &session.xsrf)
-        .header("saldeoApp", "angularApp")
-        .header("timeout", "60000")
-        .json(&body)
-        .send()
-        .with_context(|| format!("Saldeo generate upload URL {}", path.display()))?
-        .error_for_status()?
-        .json()?;
-    if response.get("status").and_then(|v| v.as_str()) != Some("SUCCESS") {
-        return Err(anyhow!("Saldeo generate upload URL failed: {}", response));
-    }
-    let upload = response
-        .get("data")
-        .and_then(|v| v.get(file_name))
-        .ok_or_else(|| anyhow!("Saldeo response missing file entry for {file_name}: {response}"))?;
-    let doc_upload_id = upload
-        .get("docUploadId")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| anyhow!("Saldeo response missing docUploadId: {upload}"))?;
-    let signed_url = upload
-        .get("url")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("Saldeo response missing upload url: {upload}"))?;
-    let download_filename = upload
-        .get("downloadFilename")
-        .and_then(|v| v.as_str())
-        .unwrap_or(file_name);
-    let local_storage = upload
-        .get("localStorage")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    let upload_result = if local_storage {
-        let part =
-            reqwest::blocking::multipart::Part::bytes(bytes).file_name(file_name.to_string());
-        let form = reqwest::blocking::multipart::Form::new().part("file", part);
-        client.put(signed_url).multipart(form).send()
-    } else {
-        client
-            .put(signed_url)
-            .header("Content-Type", content_type)
-            .header(
-                "Content-Disposition",
-                format!("attachment; filename=\"{download_filename}\""),
-            )
-            .body(bytes)
-            .send()
-    };
-
-    if let Err(err) = upload_result.and_then(|r| r.error_for_status()) {
-        let _ = saldeo_reject_upload(client, session, doc_upload_id, &err.to_string());
-        return Err(anyhow!("Saldeo signed upload failed: {err}"));
-    }
-
-    let confirm_url =
-        format!("https://saldeo.brainshare.pl/rest/doc-upload/{doc_upload_id}/confirm");
-    let confirm = client
-        .post(&confirm_url)
-        .header("Cookie", &session.cookie_header)
-        .header("X-SALDEO-XSRF-H-TOKEN", &session.xsrf)
-        .header("saldeoApp", "angularApp")
-        .header("timeout", "60000")
-        .json(&serde_json::json!({}))
-        .send()
-        .with_context(|| format!("Saldeo confirm upload {doc_upload_id}"))?;
-    let status = confirm.status().as_u16();
-    let text = confirm.text().unwrap_or_default();
-    if !(200..300).contains(&status) {
-        let _ = saldeo_reject_upload(client, session, doc_upload_id, &text);
-        return Err(anyhow!("Saldeo confirm failed HTTP {status}: {text}"));
-    }
-    Ok((status, text.chars().take(2000).collect()))
-}
-
-fn saldeo_reject_upload(
-    client: &Client,
-    session: &SaldeoSession,
-    doc_upload_id: i64,
-    reason: &str,
-) -> Result<()> {
-    let url = format!("https://saldeo.brainshare.pl/rest/doc-upload/{doc_upload_id}/reject");
-    client
-        .post(url)
-        .header("Cookie", &session.cookie_header)
-        .header("X-SALDEO-XSRF-H-TOKEN", &session.xsrf)
-        .header("saldeoApp", "angularApp")
-        .header("timeout", "60000")
-        .body(reason.to_string())
-        .send()?
-        .error_for_status()?;
-    Ok(())
-}
-
-fn content_type_for_path(path: &Path) -> &'static str {
-    match path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("pdf") => "application/pdf",
-        Some("xml") => "application/xml",
-        Some("json") => "application/json",
-        Some("txt") => "text/plain",
-        _ => "application/octet-stream",
-    }
-}
-
-fn write_saldeo_sync_csv(plan: &SaldeoSyncPlan, path: &Path) -> Result<()> {
-    let mut writer =
-        csv::Writer::from_path(path).with_context(|| format!("zapis CSV {}", path.display()))?;
-    writer.write_record([
-        "upload_status",
-        "status",
-        "source",
-        "related_sources",
-        "invoice_number",
-        "issue_date",
-        "gross_amount_minor",
-        "currency",
-        "contractor",
-        "source_path",
-        "can_upload",
-        "saldeo_response_status",
-        "error",
-    ])?;
-    for item in &plan.items {
-        writer.write_record([
-            item.upload_status.clone(),
-            item.status.clone(),
-            item.source.clone(),
-            item.related_sources.join("+"),
-            item.invoice_number.clone().unwrap_or_default(),
-            item.issue_date.map(|d| d.to_string()).unwrap_or_default(),
-            item.gross_amount_minor
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            item.currency.clone().unwrap_or_default(),
-            item.contractor.clone().unwrap_or_default(),
-            item.source_path.clone().unwrap_or_default(),
-            item.can_upload.to_string(),
-            item.saldeo_response_status
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            item.error.clone().unwrap_or_default(),
-        ])?;
-    }
-    writer.flush()?;
-    Ok(())
-}
-
-fn default_saldeo_storage_state_path() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let lab_path = home
-        .join(".config")
-        .join("lab")
-        .join("saldeo-storage-state.json");
-    if lab_path.exists() {
-        return lab_path;
-    }
-    home.join(".config")
-        .join("ksef-mail-reconcile")
-        .join("saldeo-storage-state.json")
-}
-
-fn saldeo_fetch(year: i32, storage_state: &Path, out_dir: &Path) -> Result<SaldeoFetchResult> {
-    fs::create_dir_all(out_dir).with_context(|| format!("mkdir {}", out_dir.display()))?;
-    let storage: Value = serde_json::from_str(&read_saldeo_storage_state(storage_state)?)?;
-    let cookies = storage
-        .get("cookies")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("storage-state Saldeo nie zawiera cookies"))?;
-    let cookie_header = cookies
-        .iter()
-        .filter_map(|cookie| {
-            let name = cookie.get("name")?.as_str()?;
-            let value = cookie.get("value")?.as_str()?;
-            Some(format!("{name}={value}"))
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    let xsrf = cookies
-        .iter()
-        .find(|cookie| cookie.get("name").and_then(|v| v.as_str()) == Some("X-SALDEO-XSRF-C-TOKEN"))
-        .and_then(|cookie| cookie.get("value"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            anyhow!("brak X-SALDEO-XSRF-C-TOKEN w storage-state; odśwież sesję Saldeo")
-        })?;
-
-    let client = Client::builder().build()?;
-    let mut documents = Vec::new();
-    for month in 1..=12 {
-        let body = serde_json::json!({
-            "pagination": {
-                "pageNumber": 0,
-                "pageSize": -1,
-                "totalCount": 0,
-                "columnSorted": { "sortColumn": "DOCUMENT_CREATE_DATE", "sortDirection": "ASC" }
-            },
-            "filter": {
-                "period": { "partOfYear": month, "year": year, "selectionType": "selectedMonth" },
-                "duplicatesEnable": false,
-                "duplicates": false,
-                "splitPayment": false,
-                "types": [],
-                "contractors": [],
-                "stages": [],
-                "categories": [],
-                "registers": [],
-                "tags": [],
-                "assignUsers": [],
-                "addedBy": [],
-                "added": [],
-                "paymentStatuses": [],
-                "accountingPaymentTypes": [],
-                "searchQuery": "",
-                "selectKsefDocumentsYesCheckbox": false,
-                "selectKsefDocumentsNoCheckbox": false,
-                "ksefNumber": "",
-                "ksefMiniWorkflowStatus": null,
-                "ksefBoId": null,
-                "dimensionReportDocumentIds": [],
-                "dimensions": null
-            }
-        });
-        let value: Value = client
-            .post("https://saldeo.brainshare.pl/rest/client/document/list/search")
-            .header("Cookie", &cookie_header)
-            .header("X-SALDEO-XSRF-H-TOKEN", xsrf)
-            .header("saldeoApp", "angularApp")
-            .header("timeout", "60000")
-            .json(&body)
-            .send()?
-            .error_for_status()
-            .map_err(|e| {
-                if e.status() == Some(reqwest::StatusCode::UNAUTHORIZED) {
-                    anyhow!(
-                        "Sesja Saldeo wygasła (401). Odśwież Playwright storage state:\n  {}",
-                        default_saldeo_storage_state_path().display()
-                    )
-                } else {
-                    anyhow!("Saldeo document/list/search month={month}: {e}")
-                }
-            })?
-            .json()?;
-        let items = value
-            .get("data")
-            .and_then(|d| d.get("resultCollection"))
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        for mut item in items {
-            if let Value::Object(ref mut map) = item {
-                map.insert("saldeoMonth".to_string(), serde_json::json!(month));
-            }
-            documents.push(item);
-        }
-    }
-
-    let mut records = saldeo_documents_to_records(&documents);
-    saldeo_enrich_records_from_ksef(&mut records, year)?;
-    saldeo_enrich_records_from_downloads(
-        &client,
-        &cookie_header,
-        out_dir,
-        &documents,
-        &mut records,
-    )?;
-    let raw_output = out_dir.join("documents.json");
-    let records_output = out_dir.join("records.jsonl");
-    fs::write(&raw_output, serde_json::to_vec_pretty(&documents)?)?;
-    let mut jsonl = Vec::new();
-    for record in &records {
-        serde_json::to_writer(&mut jsonl, record)?;
-        jsonl.push(b'\n');
-    }
-    fs::write(&records_output, jsonl)?;
-
-    Ok(SaldeoFetchResult {
-        summary: SaldeoFetchSummary {
-            year,
-            documents_count: documents.len(),
-            records_count: records.len(),
-            raw_output: raw_output.display().to_string(),
-            records_output: records_output.display().to_string(),
-        },
-        records,
-    })
-}
-
-fn load_saldeo_records(input: &Path) -> Result<Vec<InvoiceRecord>> {
-    if input.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-        return load_records(SourceKind::Saldeo, input);
-    }
-    let text =
-        fs::read_to_string(input).with_context(|| format!("odczyt Saldeo {}", input.display()))?;
-    if let Ok(mut records) = serde_json::from_str::<Vec<InvoiceRecord>>(&text) {
-        for record in &mut records {
-            record.source = SourceKind::Saldeo;
-        }
-        return Ok(records);
-    }
-    let value: Value = serde_json::from_str(&text)?;
-    let docs = value
-        .as_array()
-        .ok_or_else(|| anyhow!("Saldeo input musi być tablicą documents albo InvoiceRecord[]"))?;
-    Ok(saldeo_documents_to_records(docs))
-}
-
-fn saldeo_documents_to_records(documents: &[Value]) -> Vec<InvoiceRecord> {
-    documents
-        .iter()
-        .filter_map(saldeo_document_to_record)
-        .collect()
-}
-
-fn saldeo_enrich_records_from_ksef(records: &mut [InvoiceRecord], year: i32) -> Result<()> {
-    let ksef_path = configured_ksef_out_path(year);
-    if !ksef_path.exists() {
-        return Ok(());
-    }
-    let ksef_records = load_records(SourceKind::Ksef, &ksef_path)
-        .with_context(|| format!("odczyt lokalnych metadanych KSeF {}", ksef_path.display()))?;
-    let by_ksef = ksef_records
-        .iter()
-        .filter_map(|record| {
-            record
-                .ksef_reference
-                .as_ref()
-                .map(|ksef| (ksef.clone(), record))
-        })
-        .collect::<HashMap<_, _>>();
-    let mut enriched = 0usize;
-    for record in records.iter_mut() {
-        let Some(ksef_reference) = record.ksef_reference.as_ref() else {
-            continue;
-        };
-        let Some(ksef_record) = by_ksef.get(ksef_reference) else {
-            continue;
-        };
-        if merge_missing_invoice_metadata(record, ksef_record) {
-            enriched += 1;
-            record
-                .warnings
-                .push("saldeo enriched from ksef metadata".to_string());
-        }
-    }
-    if enriched > 0 {
-        eprintln!("  [Saldeo] uzupełniono z KSeF: {enriched} rekordów");
-    }
-    Ok(())
-}
-
-fn saldeo_enrich_records_from_downloads(
-    client: &Client,
-    cookie_header: &str,
-    out_dir: &Path,
-    documents: &[Value],
-    records: &mut [InvoiceRecord],
-) -> Result<()> {
-    let mut by_hash = records
-        .iter()
-        .enumerate()
-        .map(|(idx, record)| (record.content_hash.clone(), idx))
-        .collect::<HashMap<_, _>>();
-    let mut enriched = 0usize;
-    for doc in documents {
-        let Some(document_id) = saldeo_document_id_from_value(doc) else {
-            continue;
-        };
-        let key = format!("saldeo:{document_id}");
-        let Some(record_idx) = by_hash.get(&key).copied() else {
-            continue;
-        };
-        if record_has_counterparty(&records[record_idx])
-            && records[record_idx].issue_date.is_some()
-            && records[record_idx].gross_amount_minor.is_some()
-        {
-            continue;
-        }
-        let Some(download_url) = json_string(doc, "downloadUrl") else {
-            continue;
-        };
-        let local_path = saldeo_cached_document_path(out_dir, doc, &document_id);
-        if let Err(err) =
-            saldeo_download_document(client, cookie_header, &download_url, &local_path)
-        {
-            records[record_idx]
-                .warnings
-                .push(format!("saldeo download fallback failed: {err}"));
-            continue;
-        }
-        match parse_file(SourceKind::Saldeo, &local_path) {
-            Ok(parsed) => {
-                if merge_missing_invoice_metadata(&mut records[record_idx], &parsed) {
-                    records[record_idx]
-                        .warnings
-                        .push("saldeo enriched from downloaded document".to_string());
-                    enriched += 1;
-                }
-            }
-            Err(err) => records[record_idx]
-                .warnings
-                .push(format!("saldeo parse fallback failed: {err}")),
-        }
-    }
-    if enriched > 0 {
-        eprintln!("  [Saldeo] uzupełniono z pobranych plików: {enriched} rekordów");
-    }
-    by_hash.clear();
-    Ok(())
-}
-
-fn saldeo_document_id_from_value(doc: &Value) -> Option<String> {
-    json_scalar_string(doc, "documentId")
-}
-
-fn saldeo_cached_document_path(out_dir: &Path, doc: &Value, document_id: &str) -> PathBuf {
-    let filename = json_string(doc, "filename")
-        .or_else(|| json_string(doc, "name"))
-        .unwrap_or_else(|| format!("{document_id}.bin"));
-    out_dir
-        .join("files")
-        .join(format!("{}_{}", document_id, sanitize_filename(&filename)))
-}
-
-fn saldeo_download_document(
-    client: &Client,
-    cookie_header: &str,
-    download_url: &str,
-    local_path: &Path,
-) -> Result<()> {
-    if local_path.is_file() && local_path.metadata().map(|m| m.len()).unwrap_or(0) > 0 {
-        return Ok(());
-    }
-    if let Some(parent) = local_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-    }
-    let bytes = client
-        .get(download_url)
-        .header("Cookie", cookie_header)
-        .send()
-        .with_context(|| format!("Saldeo download {download_url}"))?
-        .error_for_status()
-        .with_context(|| format!("Saldeo download status {download_url}"))?
-        .bytes()
-        .with_context(|| format!("Saldeo download body {download_url}"))?;
-    fs::write(local_path, &bytes).with_context(|| format!("zapis {}", local_path.display()))?;
-    Ok(())
-}
-
-fn record_has_counterparty(record: &InvoiceRecord) -> bool {
-    record
-        .seller_name
-        .as_ref()
-        .or(record.buyer_name.as_ref())
-        .is_some_and(|name| !name.trim().is_empty())
-}
-
-fn merge_missing_invoice_metadata(target: &mut InvoiceRecord, source: &InvoiceRecord) -> bool {
-    let mut changed = false;
-    macro_rules! fill_clone {
-        ($field:ident) => {
-            if target.$field.is_none() {
-                if let Some(value) = source.$field.clone() {
-                    target.$field = Some(value);
-                    changed = true;
-                }
-            }
-        };
-    }
-    macro_rules! fill_copy {
-        ($field:ident) => {
-            if target.$field.is_none() {
-                if let Some(value) = source.$field {
-                    target.$field = Some(value);
-                    changed = true;
-                }
-            }
-        };
-    }
-    if target.invoice_number.is_none()
-        || target
-            .invoice_number
-            .as_deref()
-            .is_some_and(looks_like_filename_invoice_number)
-    {
-        if let Some(value) = source.invoice_number.clone() {
-            if !looks_like_filename_invoice_number(&value) {
-                target.invoice_number = Some(value);
-                changed = true;
-            }
-        }
-    }
-    fill_clone!(seller_tax_id);
-    fill_clone!(buyer_tax_id);
-    fill_clone!(seller_name);
-    fill_clone!(buyer_name);
-    fill_copy!(issue_date);
-    fill_copy!(sale_date);
-    fill_copy!(due_date);
-    fill_copy!(gross_amount_minor);
-    fill_copy!(net_amount_minor);
-    fill_copy!(vat_amount_minor);
-    fill_clone!(currency);
-    fill_clone!(ksef_reference);
-    changed
-}
-
-fn saldeo_document_to_record(doc: &Value) -> Option<InvoiceRecord> {
-    let invoice_number = json_string(doc, "number").or_else(|| json_string(doc, "name"));
-    let ksef_reference = json_string(doc, "ksefNumber");
-    if invoice_number.is_none() && ksef_reference.is_none() {
-        return None;
-    }
-    let mut record = empty_record(SourceKind::Saldeo);
-    record.invoice_number = invoice_number.map(|v| clean_invoice_number(&v));
-    record.issue_date =
-        json_string(doc, "issueDate").and_then(|v| parse_date(v.get(0..10).unwrap_or(&v)));
-    record.sale_date =
-        json_string(doc, "saleDate").and_then(|v| parse_date(v.get(0..10).unwrap_or(&v)));
-    record.due_date =
-        json_string(doc, "paymentDate").and_then(|v| parse_date(v.get(0..10).unwrap_or(&v)));
-    record.gross_amount_minor = money_value_to_minor(doc.get("grossPrice"));
-    record.net_amount_minor = money_value_to_minor(doc.get("netPrice"));
-    record.vat_amount_minor = money_value_to_minor(doc.get("vatPrice"));
-    record.currency = json_string(doc, "currency")
-        .or_else(|| {
-            doc.get("grossPrice")
-                .and_then(|v| v.get("currency"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        })
-        .and_then(|v| normalize_currency(&v));
-    record.ksef_reference = ksef_reference;
-    record.seller_name = json_string(doc, "contractorDescription")
-        .or_else(|| json_string(doc, "contractorName"))
-        .and_then(|v| clean_name(&v));
-    record.source_path = json_string(doc, "downloadUrl").or_else(|| json_string(doc, "filename"));
-    record.content_hash = saldeo_document_id_from_value(doc)
-        .map(|id| format!("saldeo:{id}"))
-        .or_else(|| record.ksef_reference.clone())
-        .unwrap_or_else(|| {
-            let raw = serde_json::to_string(doc).unwrap_or_default();
-            hex::encode(Sha256::digest(raw.as_bytes()))
-        });
-    Some(record)
-}
-
-fn looks_like_filename_invoice_number(value: &str) -> bool {
-    let upper = value.trim().to_ascii_uppercase();
-    upper.ends_with(".PDF")
-        || upper.ends_with(".XML")
-        || upper.ends_with(".JPG")
-        || upper.ends_with(".JPEG")
-        || upper.ends_with(".PNG")
-}
-
-fn json_scalar_string(value: &Value, key: &str) -> Option<String> {
-    value.get(key).and_then(|v| match v {
-        Value::String(s) => Some(s.trim().to_string()).filter(|s| !s.is_empty()),
-        Value::Number(n) => Some(n.to_string()),
-        _ => None,
-    })
-}
-
-fn json_string(value: &Value, key: &str) -> Option<String> {
-    value
-        .get(key)
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-fn money_value_to_minor(value: Option<&Value>) -> Option<i64> {
-    let value = value?;
-    let amount = value
-        .get("value")
-        .and_then(|v| v.as_f64())
-        .or_else(|| value.as_f64())?;
-    Some((amount * 100.0).round() as i64)
-}
-
-fn tri_reconcile(
-    mail_records: Vec<InvoiceRecord>,
-    ksef_records: Vec<InvoiceRecord>,
-    saldeo_records: Vec<InvoiceRecord>,
-    review_score: u8,
-) -> TriReconcileReport {
-    let mut rows = Vec::new();
-    let mut used_ksef = HashSet::new();
-    let mut used_saldeo = HashSet::new();
-
-    for mail in &mail_records {
-        let best_ksef = best_match(mail, &ksef_records, &used_ksef, review_score);
-        let best_saldeo = best_match(mail, &saldeo_records, &used_saldeo, review_score);
-        if let Some((idx, _)) = best_ksef {
-            used_ksef.insert(idx);
-        }
-        if let Some((idx, _)) = best_saldeo {
-            used_saldeo.insert(idx);
-        }
-        let ksef = best_ksef.map(|(idx, _)| ksef_records[idx].clone());
-        let saldeo = best_saldeo.map(|(idx, _)| saldeo_records[idx].clone());
-        let ksef_score_to_saldeo = match (&ksef, &saldeo) {
-            (Some(k), Some(s)) => Some(score_pair(k, s).0),
-            _ => None,
-        };
-        rows.push(TriRow {
-            status: tri_status(true, ksef.is_some(), saldeo.is_some()).to_string(),
-            mail_score_to_ksef: best_ksef.map(|(_, score)| score),
-            mail_score_to_saldeo: best_saldeo.map(|(_, score)| score),
-            ksef_score_to_saldeo,
-            mail: Some(mail.clone()),
-            ksef,
-            saldeo,
-        });
-    }
-
-    let mut used_ksef_extra = HashSet::new();
-    for (ksef_idx, ksef) in ksef_records.iter().enumerate() {
-        if used_ksef.contains(&ksef_idx) {
-            continue;
-        }
-        if let Some((saldeo_idx, score)) =
-            best_match(ksef, &saldeo_records, &used_saldeo, review_score)
-        {
-            used_ksef.insert(ksef_idx);
-            used_ksef_extra.insert(ksef_idx);
-            used_saldeo.insert(saldeo_idx);
-            rows.push(TriRow {
-                status: tri_status(false, true, true).to_string(),
-                mail_score_to_ksef: None,
-                mail_score_to_saldeo: None,
-                ksef_score_to_saldeo: Some(score),
-                mail: None,
-                ksef: Some(ksef.clone()),
-                saldeo: Some(saldeo_records[saldeo_idx].clone()),
-            });
-        }
-    }
-
-    for (idx, ksef) in ksef_records.iter().enumerate() {
-        if !used_ksef.contains(&idx) && !used_ksef_extra.contains(&idx) {
-            rows.push(TriRow {
-                status: tri_status(false, true, false).to_string(),
-                mail_score_to_ksef: None,
-                mail_score_to_saldeo: None,
-                ksef_score_to_saldeo: None,
-                mail: None,
-                ksef: Some(ksef.clone()),
-                saldeo: None,
-            });
-        }
-    }
-    for (idx, saldeo) in saldeo_records.iter().enumerate() {
-        if !used_saldeo.contains(&idx) {
-            rows.push(TriRow {
-                status: tri_status(false, false, true).to_string(),
-                mail_score_to_ksef: None,
-                mail_score_to_saldeo: None,
-                ksef_score_to_saldeo: None,
-                mail: None,
-                ksef: None,
-                saldeo: Some(saldeo.clone()),
-            });
-        }
-    }
-
-    let summary = TriSummary {
-        mail_count: mail_records.len(),
-        ksef_count: ksef_records.len(),
-        saldeo_count: saldeo_records.len(),
-        in_all_three: rows.iter().filter(|r| r.status == "in_all_three").count(),
-        gmail_ksef_missing_saldeo: rows
-            .iter()
-            .filter(|r| r.status == "gmail_ksef_missing_saldeo")
-            .count(),
-        gmail_saldeo_missing_ksef: rows
-            .iter()
-            .filter(|r| r.status == "gmail_saldeo_missing_ksef")
-            .count(),
-        gmail_only: rows.iter().filter(|r| r.status == "gmail_only").count(),
-        ksef_saldeo_missing_gmail: rows
-            .iter()
-            .filter(|r| r.status == "ksef_saldeo_missing_gmail")
-            .count(),
-        ksef_only: rows.iter().filter(|r| r.status == "ksef_only").count(),
-        saldeo_only: rows.iter().filter(|r| r.status == "saldeo_only").count(),
-    };
-    TriReconcileReport {
-        generated_at: Utc::now(),
-        review_score,
-        summary,
-        rows,
-    }
-}
-
-fn best_match(
-    needle: &InvoiceRecord,
-    haystack: &[InvoiceRecord],
-    used: &HashSet<usize>,
-    min_score: u8,
-) -> Option<(usize, u8)> {
-    haystack
-        .iter()
-        .enumerate()
-        .filter(|(idx, _)| !used.contains(idx))
-        .map(|(idx, candidate)| (idx, score_pair(needle, candidate).0))
-        .filter(|(_, score)| *score >= min_score)
-        .max_by_key(|(_, score)| *score)
-}
-
-fn tri_status(has_mail: bool, has_ksef: bool, has_saldeo: bool) -> &'static str {
-    match (has_mail, has_ksef, has_saldeo) {
-        (true, true, true) => "in_all_three",
-        (true, true, false) => "gmail_ksef_missing_saldeo",
-        (true, false, true) => "gmail_saldeo_missing_ksef",
-        (true, false, false) => "gmail_only",
-        (false, true, true) => "ksef_saldeo_missing_gmail",
-        (false, true, false) => "ksef_only",
-        (false, false, true) => "saldeo_only",
-        (false, false, false) => "empty",
-    }
-}
-
-fn tri_row_primary_record(row: &TriRow) -> Option<&InvoiceRecord> {
-    row.mail
-        .as_ref()
-        .or(row.ksef.as_ref())
-        .or(row.saldeo.as_ref())
-}
-
-fn tri_row_display_record(row: &TriRow) -> Option<InvoiceRecord> {
-    let mut record = tri_row_primary_record(row)?.clone();
-    let metadata_sources = [row.ksef.as_ref(), row.saldeo.as_ref(), row.mail.as_ref()];
-
-    if record.invoice_number.is_none() {
-        record.invoice_number = metadata_sources
-            .iter()
-            .find_map(|source| source.and_then(|r| r.invoice_number.clone()));
-    }
-    if record.ksef_reference.is_none() {
-        record.ksef_reference = metadata_sources
-            .iter()
-            .find_map(|source| source.and_then(|r| r.ksef_reference.clone()));
-    }
-
-    if let Some(value) = metadata_sources
-        .iter()
-        .find_map(|source| source.and_then(|r| r.seller_name.clone()))
-    {
-        record.seller_name = Some(value);
-    }
-    if let Some(value) = metadata_sources
-        .iter()
-        .find_map(|source| source.and_then(|r| r.buyer_name.clone()))
-    {
-        record.buyer_name = Some(value);
-    }
-    if let Some(value) = metadata_sources
-        .iter()
-        .find_map(|source| source.and_then(|r| r.seller_tax_id.clone()))
-    {
-        record.seller_tax_id = Some(value);
-    }
-    if let Some(value) = metadata_sources
-        .iter()
-        .find_map(|source| source.and_then(|r| r.buyer_tax_id.clone()))
-    {
-        record.buyer_tax_id = Some(value);
-    }
-    if let Some(value) = metadata_sources
-        .iter()
-        .find_map(|source| source.and_then(|r| r.issue_date))
-    {
-        record.issue_date = Some(value);
-    }
-    if let Some(value) = metadata_sources
-        .iter()
-        .find_map(|source| source.and_then(|r| r.sale_date))
-    {
-        record.sale_date = Some(value);
-    }
-    if let Some(value) = metadata_sources
-        .iter()
-        .find_map(|source| source.and_then(|r| r.due_date))
-    {
-        record.due_date = Some(value);
-    }
-    if let Some(value) = metadata_sources
-        .iter()
-        .find_map(|source| source.and_then(|r| r.gross_amount_minor))
-    {
-        record.gross_amount_minor = Some(value);
-    }
-    if let Some(value) = metadata_sources
-        .iter()
-        .find_map(|source| source.and_then(|r| r.net_amount_minor))
-    {
-        record.net_amount_minor = Some(value);
-    }
-    if let Some(value) = metadata_sources
-        .iter()
-        .find_map(|source| source.and_then(|r| r.vat_amount_minor))
-    {
-        record.vat_amount_minor = Some(value);
-    }
-    if let Some(value) = metadata_sources
-        .iter()
-        .find_map(|source| source.and_then(|r| r.currency.clone()))
-    {
-        record.currency = Some(value);
-    }
-
-    Some(record)
-}
-
-fn write_reconcile_human(
-    report: &TriReconcileReport,
-    temporal_diff: Option<&TemporalDiffSummary>,
-) -> Result<()> {
-    let mut out = String::new();
-    out.push_str("LAB reconcile\n");
-    out.push_str(&format!(
-        "generated: {} | review_score: {}\n\n",
-        report.generated_at, report.review_score
-    ));
-    out.push_str(&format!(
-        "Źródła: Gmail {} | KSeF {} | Saldeo {}\n",
-        report.summary.mail_count, report.summary.ksef_count, report.summary.saldeo_count
-    ));
-    out.push_str("Statusy:\n");
-    for (label, count) in reconcile_status_counts(&report.summary) {
-        out.push_str(&format!("  {:30} {}\n", label, count));
-    }
-    if let Some(diff) = temporal_diff {
-        out.push_str(&format!(
-            "\nDiff vs poprzedni run: +{} -{} ~{} (run #{})\n",
-            diff.added_count, diff.removed_count, diff.changed_count, diff.run_id
-        ));
-    }
-
-    let missing_rows = report
-        .rows
-        .iter()
-        .filter(|row| row.status != "in_all_three")
-        .collect::<Vec<_>>();
-    out.push_str(&format!(
-        "\nBraki / do sprawdzenia: {} pozycji",
-        missing_rows.len()
-    ));
-    if !missing_rows.is_empty() {
-        out.push('\n');
-        out.push_str(&format!(
-            "{:<30} {:<28} {:<30} {:<12} {:>12} {:<4} {:<18}\n",
-            "status", "faktura", "kontrahent", "data", "brutto", "wal", "źródła"
-        ));
-        out.push_str(&format!("{}\n", "-".repeat(142)));
-        for row in missing_rows {
-            let primary = tri_row_display_record(row);
-            let primary = primary.as_ref();
-            out.push_str(&format!(
-                "{:<30} {:<28} {:<30} {:<12} {:>12} {:<4} {:<18}\n",
-                truncate(&row.status, 30),
-                truncate(
-                    &primary
-                        .and_then(|r| r.invoice_number.clone())
-                        .unwrap_or_else(|| "-".to_string()),
-                    28,
-                ),
-                truncate(&counterparty_name(primary), 30),
-                primary
-                    .and_then(|r| r.issue_date)
-                    .map(|d| d.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-                primary
-                    .and_then(|r| r.gross_amount_minor)
-                    .map(format_minor_money)
-                    .unwrap_or_else(|| "-".to_string()),
-                primary
-                    .and_then(|r| r.currency.clone())
-                    .unwrap_or_else(|| "-".to_string()),
-                row_sources(row),
-            ));
-        }
-    } else {
-        out.push('\n');
-    }
-    out.push_str("\nPełny JSON: lab reconcile --raw\n");
-    print!("{out}");
-    Ok(())
-}
-
-fn reconcile_status_counts(summary: &TriSummary) -> Vec<(&'static str, usize)> {
-    vec![
-        ("in_all_three", summary.in_all_three),
-        (
-            "gmail_ksef_missing_saldeo",
-            summary.gmail_ksef_missing_saldeo,
-        ),
-        (
-            "gmail_saldeo_missing_ksef",
-            summary.gmail_saldeo_missing_ksef,
-        ),
-        ("gmail_only", summary.gmail_only),
-        (
-            "ksef_saldeo_missing_gmail",
-            summary.ksef_saldeo_missing_gmail,
-        ),
-        ("ksef_only", summary.ksef_only),
-        ("saldeo_only", summary.saldeo_only),
-    ]
-}
-
-fn counterparty_name(record: Option<&InvoiceRecord>) -> String {
-    record
-        .and_then(|r| r.seller_name.clone().or_else(|| r.buyer_name.clone()))
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| "-".to_string())
-}
-
-fn row_sources(row: &TriRow) -> String {
-    [
-        ("G", row.mail.is_some()),
-        ("K", row.ksef.is_some()),
-        ("S", row.saldeo.is_some()),
-    ]
-    .into_iter()
-    .filter_map(|(label, present)| present.then_some(label))
-    .collect::<Vec<_>>()
-    .join("+")
-}
-
-fn format_minor_money(value: i64) -> String {
-    format!("{}.{:02}", value / 100, value.abs() % 100)
-}
-
-fn truncate(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_string();
-    }
-    let mut out = value
-        .chars()
-        .take(max_chars.saturating_sub(1))
-        .collect::<String>();
-    out.push('…');
-    out
-}
-
-fn write_tri_csv(report: &TriReconcileReport, path: &Path) -> Result<()> {
-    let mut writer =
-        csv::Writer::from_path(path).with_context(|| format!("zapis CSV {}", path.display()))?;
-    writer.write_record([
-        "status",
-        "mail_invoice_number",
-        "ksef_invoice_number",
-        "saldeo_invoice_number",
-        "ksef_number",
-        "saldeo_ksef_number",
-        "issue_date",
-        "gross_amount_minor",
-        "currency",
-        "mail_score_to_ksef",
-        "mail_score_to_saldeo",
-        "ksef_score_to_saldeo",
-    ])?;
-    for row in &report.rows {
-        let primary = tri_row_display_record(row);
-        let primary = primary.as_ref();
-        writer.write_record([
-            row.status.clone(),
-            row.mail
-                .as_ref()
-                .and_then(|r| r.invoice_number.clone())
-                .unwrap_or_default(),
-            row.ksef
-                .as_ref()
-                .and_then(|r| r.invoice_number.clone())
-                .unwrap_or_default(),
-            row.saldeo
-                .as_ref()
-                .and_then(|r| r.invoice_number.clone())
-                .unwrap_or_default(),
-            row.ksef
-                .as_ref()
-                .and_then(|r| r.ksef_reference.clone())
-                .unwrap_or_default(),
-            row.saldeo
-                .as_ref()
-                .and_then(|r| r.ksef_reference.clone())
-                .unwrap_or_default(),
-            primary
-                .and_then(|r| r.issue_date)
-                .map(|d| d.to_string())
-                .unwrap_or_default(),
-            primary
-                .and_then(|r| r.gross_amount_minor)
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            primary.and_then(|r| r.currency.clone()).unwrap_or_default(),
-            row.mail_score_to_ksef
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            row.mail_score_to_saldeo
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            row.ksef_score_to_saldeo
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-        ])?;
-    }
-    writer.flush()?;
-    Ok(())
-}
-
-#[derive(Debug, Clone)]
-struct OnboardStatus {
-    db_exists: bool,
-    token_exists: bool,
-    gmail_authed: bool,
-    saldeo_exists: bool,
-    saldeo_valid: bool,
-    pdftotext_ok: bool,
-    python_ok: bool,
-    openssl_ok: bool,
-    year: i32,
-    ksef_dir: PathBuf,
-    ksef_data_exists: bool,
-    ksef_cert: Option<String>,
-    ksef_cert_ok: bool,
-    ksef_key: Option<String>,
-    ksef_key_ok: bool,
-    ksef_password_ok: bool,
-    ksef_token_ok: bool,
-    ksef_api_ok: bool,
-}
-
-fn onboard(db_path: &Path, check: bool, gmail_client_secret: Option<&Path>) -> Result<()> {
-    let mut gmail_client_secret = gmail_client_secret.map(Path::to_path_buf);
-    let mut status = collect_onboard_status(db_path)?;
-
-    eprintln!("LAB — konfiguracja środowiska\n");
-    print_onboard_status(&status, db_path);
-
-    if check {
-        return write_onboard_check_json(&status);
-    }
-
-    let theme = ColorfulTheme::default();
-    loop {
-        let items = onboard_menu_items(&status, db_path, gmail_client_secret.as_deref());
-        let exit_index = items.len() - 1;
-        let selection = Select::with_theme(&theme)
-            .with_prompt("Wszystkie parametry LAB — wybierz pozycję do edycji")
-            .items(&items)
-            .default(exit_index)
-            .interact()?;
-
-        match selection {
-            0 => onboard_configure_gmail(&mut gmail_client_secret, status.gmail_authed)?,
-            1 => onboard_configure_gmail(&mut gmail_client_secret, status.gmail_authed)?,
-            2 => onboard_configure_saldeo()?,
-            3 => onboard_edit_env_path("KSEF_CERT_PATH")?,
-            4 => onboard_edit_env_path("KSEF_KEY_PATH")?,
-            5 => onboard_edit_env_secret("KSEF_CERT_PASSWORD")?,
-            6 => onboard_edit_env_secret("KSEF_TOKEN")?,
-            7 => onboard_configure_ksef_data(status.year)?,
-            8 => {
-                open_db(db_path)?;
-                eprintln!("✓ Baza gotowa: {}\n", db_path.display());
-            }
-            9 => run_saldeo_auth_script()?,
-            10 => {}
-            11 => break,
-            _ => unreachable!(),
-        }
-
-        status = collect_onboard_status(db_path)?;
-        eprintln!();
-        print_onboard_status(&status, db_path);
-    }
-
-    write_json(&serde_json::json!({"all_ok": status.all_ok()}), None)
-}
-
-impl OnboardStatus {
-    fn all_ok(&self) -> bool {
-        self.pdftotext_ok
-            && self.python_ok
-            && self.openssl_ok
-            && self.gmail_authed
-            && self.saldeo_valid
-            && self.ksef_api_ok
-            && self.ksef_data_exists
-    }
-}
-
-fn onboard_menu_items(
-    status: &OnboardStatus,
-    db_path: &Path,
-    gmail_client_secret: Option<&Path>,
-) -> Vec<String> {
-    vec![
-        format!(
-            "GOOGLE_CLIENT_SECRET_PATH — {}",
-            gmail_client_secret
-                .map(|p| p.display().to_string())
-                .or_else(|| lab_config_var("GOOGLE_CLIENT_SECRET_PATH"))
-                .unwrap_or_else(|| "(puste; potrzebne do auto-refresh Gmail)".to_string())
-        ),
-        format!(
-            "GMAIL_TOKEN_FILE — {} {}",
-            if status.gmail_authed { "✓" } else { "✗" },
-            default_gmail_token_path().display()
-        ),
-        format!(
-            "SALDEO_STORAGE_STATE — {} {}",
-            if status.saldeo_valid { "✓" } else { "✗" },
-            default_saldeo_storage_state_path().display()
-        ),
-        format!(
-            "KSEF_CERT_PATH — {}",
-            display_path_value(status.ksef_cert.as_deref(), status.ksef_cert_ok)
-        ),
-        format!(
-            "KSEF_KEY_PATH — {}",
-            display_path_value(status.ksef_key.as_deref(), status.ksef_key_ok)
-        ),
-        format!(
-            "KSEF_CERT_PASSWORD — {}",
-            display_secret_value(status.ksef_password_ok)
-        ),
-        format!(
-            "KSEF_TOKEN — {}",
-            display_secret_value(status.ksef_token_ok)
-        ),
-        format!(
-            "KSEF_DATA_DIR — {} {}",
-            if status.ksef_data_exists {
-                "✓"
-            } else {
-                "✗"
-            },
-            status.ksef_dir.display()
-        ),
-        format!(
-            "DB_PATH — {} {}",
-            if status.db_exists {
-                "✓"
-            } else {
-                "✓ (nowa)"
-            },
-            db_path.display()
-        ),
-        "SALDEO_AUTH_SCRIPT — uruchom pobieranie auth".to_string(),
-        "Odśwież status".to_string(),
-        if status.all_ok() {
-            "Zakończ — wszystko gotowe".to_string()
-        } else {
-            "Zakończ — wrócę później".to_string()
-        },
-    ]
-}
-
-fn display_path_value(value: Option<&str>, exists: bool) -> String {
-    match value {
-        Some(value) if exists => format!("✓ {value}"),
-        Some(value) => format!("✗ {value}"),
-        None => "✗ (puste)".to_string(),
-    }
-}
-
-fn display_secret_value(is_set: bool) -> &'static str {
-    if is_set {
-        "✓ ********"
-    } else {
-        "✗ (puste)"
-    }
-}
-
-fn collect_onboard_status(db_path: &Path) -> Result<OnboardStatus> {
-    let token_file = default_gmail_token_path();
-    let token_exists = token_file.exists()
-        || keychain_get_secret(KEYCHAIN_ACCOUNT_GMAIL_TOKEN)
-            .map(|v| v.is_some())
-            .unwrap_or(false);
-    let gmail_authed = token_exists
-        && read_gmail_token(&token_file)
-            .map(|t| {
-                t.expires_at
-                    .map(|exp| exp > Utc::now() + chrono::Duration::seconds(60))
-                    .unwrap_or(true)
-            })
-            .unwrap_or(false);
-
-    let saldeo_state = default_saldeo_storage_state_path();
-    let saldeo_exists = saldeo_state.exists()
-        || keychain_get_secret(KEYCHAIN_ACCOUNT_SALDEO_STORAGE_STATE)
-            .map(|v| v.is_some())
-            .unwrap_or(false);
-    let saldeo_valid = saldeo_exists && saldeo_session_valid(&saldeo_state);
-
-    let pdftotext_ok = Command::new("pdftotext").arg("-v").output().is_ok();
-    let python_ok = Command::new("python3")
-        .arg("-c")
-        .arg("import shutil, subprocess, sys; pp=shutil.which('ppmlx'); sys.exit(1 if not pp else 0)")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    let openssl_ok = Command::new("openssl")
-        .arg("version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    let db_exists = db_path.exists();
-    if !db_exists {
-        open_db(db_path)?;
-    }
-
-    let year = Utc::now().year();
-    let ksef_dir = configured_ksef_out_path(year);
-    let ksef_data_exists = ksef_dir.exists()
-        && std::fs::read_dir(&ksef_dir)
-            .map(|mut d| d.any(|e| e.is_ok()))
-            .unwrap_or(false);
-
-    let ksef_cert = lab_config_var("KSEF_CERT_PATH");
-    let ksef_cert_ok = ksef_cert
-        .as_ref()
-        .map(|p| Path::new(p).exists())
-        .unwrap_or(false);
-    let ksef_key = lab_config_var("KSEF_KEY_PATH");
-    let ksef_key_ok = ksef_key
-        .as_ref()
-        .map(|p| Path::new(p).exists())
-        .unwrap_or(false);
-    let ksef_password_ok = lab_config_var("KSEF_CERT_PASSWORD")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    let ksef_token_ok = lab_config_var("KSEF_TOKEN")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    let ksef_api_ok = ksef_token_ok;
-
-    Ok(OnboardStatus {
-        db_exists,
-        token_exists,
-        gmail_authed,
-        saldeo_exists,
-        saldeo_valid,
-        pdftotext_ok,
-        python_ok,
-        openssl_ok,
-        year,
-        ksef_dir,
-        ksef_data_exists,
-        ksef_cert,
-        ksef_cert_ok,
-        ksef_key,
-        ksef_key_ok,
-        ksef_password_ok,
-        ksef_token_ok,
-        ksef_api_ok,
-    })
-}
-
-fn print_onboard_status(status: &OnboardStatus, db_path: &Path) {
-    eprintln!(
-        "  Baza danych:     {} ({})",
-        if status.db_exists {
-            "✓"
-        } else {
-            "✓ (nowa)"
-        },
-        db_path.display()
-    );
-    eprintln!(
-        "  pdftotext:       {}",
-        if status.pdftotext_ok {
-            "✓"
-        } else {
-            "✗ (brew install poppler)"
-        }
-    );
-    eprintln!(
-        "  ppmlx/gemma:     {}",
-        if status.python_ok {
-            "✓"
-        } else {
-            "✗ (zainstaluj ppmlx i model gemma-4-e4b)"
-        }
-    );
-    eprintln!(
-        "  openssl:         {}",
-        if status.openssl_ok {
-            "✓"
-        } else {
-            "✗ (potrzebny do szyfrowania tokenu KSeF)"
-        }
-    );
-    eprintln!(
-        "  Gmail:           {}",
-        if status.gmail_authed {
-            "✓"
-        } else if status.token_exists {
-            "✗ (token wygasł)"
-        } else {
-            "✗"
-        }
-    );
-    eprintln!(
-        "  Saldeo:          {}",
-        if status.saldeo_valid {
-            "✓"
-        } else if status.saldeo_exists {
-            "✗ (sesja wygasła)"
-        } else {
-            "✗"
-        }
-    );
-    eprintln!(
-        "  KSeF certyfikat: {}",
-        if status.ksef_cert_ok {
-            format!("✓ ({})", status.ksef_cert.as_deref().unwrap_or(""))
-        } else {
-            "✗".to_string()
-        }
-    );
-    eprintln!(
-        "  KSeF klucz:      {}",
-        if status.ksef_key_ok {
-            format!("✓ ({})", status.ksef_key.as_deref().unwrap_or(""))
-        } else {
-            "✗".to_string()
-        }
-    );
-    eprintln!(
-        "  KSeF hasło:      {}",
-        if status.ksef_password_ok {
-            "✓"
-        } else {
-            "✗"
-        }
-    );
-    eprintln!(
-        "  KSeF token:      {}",
-        if status.ksef_token_ok { "✓" } else { "✗" }
-    );
-    eprintln!(
-        "  KSeF dane:       {}",
-        if status.ksef_data_exists {
-            format!("✓ ({})", status.ksef_dir.display())
-        } else {
-            format!("✗ ({})", status.ksef_dir.display())
-        }
-    );
-    eprintln!();
-}
-
-fn onboard_next_steps(status: &OnboardStatus, gmail_ok: bool) -> Vec<&'static str> {
-    let mut steps: Vec<&str> = Vec::new();
-    if !status.pdftotext_ok {
-        steps.push("brew install poppler");
-    }
-    if !status.python_ok {
-        steps.push("Zainstaluj ppmlx i pobierz model: ppmlx pull gemma-4-e4b");
-    }
-    if !status.openssl_ok {
-        steps.push("Zainstaluj openssl/libressl CLI potrzebny do szyfrowania tokenu KSeF");
-    }
-    if !gmail_ok {
-        steps.push("lab onboard --gmail-client-secret <ścieżka>");
-    }
-    if !status.saldeo_valid {
-        steps.push("Odśwież sesję Saldeo (~/.config/lab/saldeo-storage-state.json)");
-    }
-    if !status.ksef_api_ok {
-        steps.push("Ustaw KSEF_TOKEN z uprawnieniem InvoiceRead");
-    }
-    if !status.ksef_data_exists {
-        steps.push("Uruchom lab sync --ksef, żeby pobrać metadane KSeF online do lokalnego cache");
-    }
-    if steps.is_empty() {
-        steps.push("Wszystko gotowe. Uruchom: lab sync");
-    }
-    steps
-}
-
-fn write_onboard_check_json(status: &OnboardStatus) -> Result<()> {
-    let steps = onboard_next_steps(status, status.gmail_authed);
-    let status_json = serde_json::json!({
-        "prerequisites": { "pdftotext": status.pdftotext_ok, "ppmlx_gemma": status.python_ok, "openssl": status.openssl_ok },
-        "gmail": { "token_valid": status.gmail_authed },
-        "saldeo": { "session_valid": status.saldeo_valid },
-        "ksef": { "api_ok": status.ksef_api_ok, "data_exists": status.ksef_data_exists },
-        "database": { "exists": status.db_exists },
-        "next_steps": steps
-    });
-    write_json(&status_json, None)
-}
-
-fn onboard_configure_gmail(
-    gmail_client_secret: &mut Option<PathBuf>,
-    gmail_authed: bool,
-) -> Result<()> {
-    eprintln!("── Gmail ──");
-    if gmail_authed
-        && !Confirm::new()
-            .with_prompt("Token wygląda poprawnie. Odświeżyć/autoryzować ponownie?")
-            .default(false)
-            .interact()?
-    {
-        eprintln!("⏭ Pominięto.\n");
-        return Ok(());
-    }
-
-    eprintln!("Potrzebny plik Google OAuth Desktop Client JSON.");
-    eprintln!("Pobierz go z Google Cloud Console → APIs & Services → Credentials.\n");
-    let default = gmail_client_secret
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    let path: String = Input::new()
-        .with_prompt("Ścieżka do client_secret JSON")
-        .default(default)
-        .allow_empty(true)
-        .interact_text()?;
-    if path.trim().is_empty() {
-        eprintln!("⏭ Pominięto.\n");
-        return Ok(());
-    }
-    let secret = PathBuf::from(path.trim());
-    if !secret.exists() {
-        eprintln!("✗ Plik nie istnieje: {}\n", secret.display());
-        return Ok(());
-    }
-
-    *gmail_client_secret = Some(secret.clone());
-    let mut vars = read_lab_env_file().unwrap_or_default();
-    vars.insert(
-        "GOOGLE_CLIENT_SECRET_PATH".to_string(),
-        secret.display().to_string(),
-    );
-    write_lab_env_file(&vars)?;
-    match gmail_auth(&secret, &default_gmail_token_path(), false) {
-        Ok(result) => eprintln!(
-            "✓ Gmail skonfigurowany. Token: {}\n✓ GOOGLE_CLIENT_SECRET_PATH zapisany w {}\n",
-            result.token_file,
-            lab_env_file_path().display()
-        ),
-        Err(err) => eprintln!("✗ Błąd autoryzacji: {err}\n"),
-    }
-    Ok(())
-}
-
-fn onboard_configure_saldeo() -> Result<()> {
-    eprintln!("── Saldeo ──");
-    let target = preferred_saldeo_storage_state_path();
-    eprintln!("Domyślny plik sesji: {}", target.display());
-    eprintln!("Podaj plik Playwright storage state; zostanie skopiowany do domyślnej lokalizacji.");
-    let path: String = Input::new()
-        .with_prompt("Ścieżka storage state JSON")
-        .default(target.display().to_string())
-        .allow_empty(true)
-        .interact_text()?;
-    if path.trim().is_empty() {
-        eprintln!("⏭ Pominięto.\n");
-        return Ok(());
-    }
-    let source = PathBuf::from(path.trim());
-    if !source.exists() {
-        eprintln!("✗ Plik nie istnieje: {}\n", source.display());
-        return Ok(());
-    }
-    if source != target {
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-        }
-        fs::copy(&source, &target)
-            .with_context(|| format!("kopiowanie {} → {}", source.display(), target.display()))?;
-    }
-    save_saldeo_storage_state_secret(&target)?;
-    eprintln!(
-        "✓ Saldeo storage state zapisany: {}\n✓ Saldeo storage state zapisany w macOS Keychain (jeśli dostępny)\n",
-        target.display()
-    );
-    Ok(())
-}
-
-fn onboard_edit_env_path(name: &str) -> Result<()> {
-    if let Some(value) = prompt_env_path(name, lab_config_var(name))? {
-        let mut vars = read_lab_env_file().unwrap_or_default();
-        vars.insert(name.to_string(), value);
-        write_lab_env_file(&vars)?;
-        eprintln!("✓ Zapisano {name} w {}\n", lab_env_file_path().display());
-    } else {
-        eprintln!("⏭ Bez zmian.\n");
-    }
-    Ok(())
-}
-
-fn onboard_edit_env_secret(name: &str) -> Result<()> {
-    let current = lab_config_var(name).is_some();
-    let prompt = if current {
-        format!("{name} (ustawione; puste = bez zmian)")
-    } else {
-        format!("{name} (puste = bez zmian)")
-    };
-    let value = Password::new()
-        .with_prompt(prompt)
-        .allow_empty_password(true)
-        .interact()?;
-    if value.is_empty() {
-        eprintln!("⏭ Bez zmian.\n");
-        return Ok(());
-    }
-    let mut vars = read_lab_env_file().unwrap_or_default();
-    vars.insert(name.to_string(), value);
-    write_lab_env_file(&vars)?;
-    eprintln!("✓ Zapisano {name} w {}\n", lab_env_file_path().display());
-    Ok(())
-}
-
-fn ensure_saldeo_session_or_auth(progress: Option<Arc<Mutex<String>>>) -> Result<()> {
-    let storage_state = default_saldeo_storage_state_path();
-    if let Some(progress) = &progress {
-        set_progress(progress, "Saldeo: sprawdzam zapisane cookies...");
-    }
-    if saldeo_session_valid(&storage_state) {
-        return Ok(());
-    }
-
-    if let Some(progress) = &progress {
-        set_progress(
-            progress,
-            "Saldeo: sesja nieważna — zaloguj się w Helium; zapiszę auth automatycznie...",
-        );
-    }
-    saldeo_auth_noninteractive()?;
-
-    let storage_state = default_saldeo_storage_state_path();
-    if let Some(progress) = &progress {
-        set_progress(progress, "Saldeo: sprawdzam nowe cookies...");
-    }
-    if saldeo_session_valid(&storage_state) {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "Saldeo auth nie jest jeszcze poprawny; zaloguj się w Helium i spróbuj ponownie"
-        ))
-    }
-}
-
-fn saldeo_auth_noninteractive() -> Result<()> {
-    let target = preferred_saldeo_storage_state_path();
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-    }
-    let url =
-        std::env::var("SALDEO_URL").unwrap_or_else(|_| "https://saldeo.brainshare.pl/".to_string());
-    let helium = std::env::var("HELIUM_EXECUTABLE")
-        .unwrap_or_else(|_| "/Applications/Helium.app/Contents/MacOS/Helium".to_string());
-    if !Path::new(&helium).is_file() {
-        return Err(anyhow!("nie znalazłem Helium executable: {helium}"));
-    }
-    let node_script = r#"
-const { chromium } = require('playwright');
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function cookieHeader(cookies) {
-  return cookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; ');
-}
-
-function xsrfToken(cookies) {
-  const cookie = cookies.find(cookie => cookie.name === 'X-SALDEO-XSRF-C-TOKEN');
-  return cookie && cookie.value;
-}
-
-function authCheckBody() {
-  return {
-    pagination: { pageNumber: 0, pageSize: 1, totalCount: 0,
-      columnSorted: { sortColumn: 'DOCUMENT_CREATE_DATE', sortDirection: 'ASC' } },
-    filter: { period: { partOfYear: 1, year: new Date().getFullYear(), selectionType: 'selectedMonth' },
-      duplicatesEnable: false, duplicates: false, splitPayment: false,
-      types: [], contractors: [], stages: [], categories: [], registers: [],
-      tags: [], assignUsers: [], addedBy: [], added: [],
-      paymentStatuses: [], accountingPaymentTypes: [],
-      searchQuery: '', selectKsefDocumentsYesCheckbox: false,
-      selectKsefDocumentsNoCheckbox: false, ksefNumber: '',
-      ksefMiniWorkflowStatus: null, ksefBoId: null,
-      dimensionReportDocumentIds: [], dimensions: null }
-  };
-}
-
-async function storageAuthenticated(context) {
-  const state = await context.storageState();
-  const cookies = state.cookies || [];
-  const xsrf = xsrfToken(cookies);
-  if (!xsrf) return false;
-  try {
-    const response = await context.request.post('https://saldeo.brainshare.pl/rest/client/document/list/search', {
-      headers: {
-        Cookie: cookieHeader(cookies),
-        'X-SALDEO-XSRF-H-TOKEN': xsrf,
-        saldeoApp: 'angularApp',
-        timeout: '60000',
-      },
-      data: authCheckBody(),
-    });
-    return response.ok();
-  } catch (_) {
-    return false;
-  }
-}
-
-(async () => {
-  const out = process.env.LAB_SALDEO_STORAGE_STATE;
-  const url = process.env.SALDEO_URL || 'https://saldeo.brainshare.pl/';
-  const executablePath = process.env.HELIUM_EXECUTABLE;
-  const timeoutMs = Number.parseInt(process.env.SALDEO_AUTH_TIMEOUT_MS || '180000', 10);
-  const userDataDir = path.join(os.homedir(), '.config', 'lab', 'helium-profile');
-  fs.mkdirSync(userDataDir, { recursive: true });
-  const context = await chromium.launchPersistentContext(userDataDir, {
-    executablePath,
-    headless: false,
-    viewport: { width: 1400, height: 1000 },
-  });
-  let closed = false;
-  context.once('close', () => { closed = true; });
-  const page = context.pages()[0] || await context.newPage();
-  await page.goto(url, { waitUntil: 'domcontentloaded' });
-
-  const deadline = Date.now() + timeoutMs;
-  let authenticated = false;
-  while (!closed && Date.now() < deadline) {
-    await context.storageState({ path: out }).catch(() => {});
-    if (await storageAuthenticated(context)) {
-      authenticated = true;
-      break;
-    }
-    await sleep(2000);
-  }
-
-  if (!closed) {
-    await context.storageState({ path: out });
-    await context.close().catch(() => {});
-  }
-  if (!authenticated) {
-    console.error(`Saldeo auth timeout after ${Math.round(timeoutMs / 1000)}s`);
-    process.exit(2);
-  }
-})().catch(err => { console.error(err && err.stack ? err.stack : err); process.exit(1); });
-"#;
-    let output = Command::new("npx")
-        .arg("--yes")
-        .arg("-p")
-        .arg("playwright")
-        .arg("node")
-        .arg("-e")
-        .arg(node_script)
-        .env("LAB_SALDEO_STORAGE_STATE", &target)
-        .env("SALDEO_URL", &url)
-        .env("HELIUM_EXECUTABLE", &helium)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .output()
-        .context("uruchomienie npx playwright + Helium (noninteractive)")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "Playwright auth zakończył się błędem: {} (stderr: {})",
-            output.status,
-            stderr.trim()
-        ));
-    }
-    if !target.exists() {
-        return Err(anyhow!(
-            "storage state nie został zapisany: {}",
-            target.display()
-        ));
-    }
-    save_saldeo_storage_state_secret(&target)?;
-    Ok(())
-}
-
-fn run_saldeo_auth_script() -> Result<()> {
-    eprintln!("── Saldeo auth ──");
-    let target = preferred_saldeo_storage_state_path();
-    if !Confirm::new()
-        .with_prompt(format!(
-            "Uruchomić Playwright i zapisać auth do {}?",
-            target.display()
-        ))
-        .default(true)
-        .interact()?
-    {
-        eprintln!("⏭ Pominięto.\n");
-        return Ok(());
-    }
-
-    if let Some(script) = find_saldeo_auth_script() {
-        let status = Command::new(&script)
-            .arg(&target)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .with_context(|| format!("uruchomienie {}", script.display()))?;
-        if !status.success() {
-            return Err(anyhow!("skrypt Saldeo auth zakończył się błędem: {status}"));
-        }
-        save_saldeo_storage_state_secret(&target)?;
-        return Ok(());
-    }
-
-    eprintln!(
-        "Nie znalazłem scripts/saldeo-auth.sh — uruchamiam fallback przez npx playwright + Helium."
-    );
-    saldeo_auth_noninteractive()?;
-    eprintln!("✓ Zapisano Saldeo auth: {}\n", target.display());
-    Ok(())
-}
-
-fn find_saldeo_auth_script() -> Option<PathBuf> {
-    let mut roots = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        roots.extend(cwd.ancestors().map(Path::to_path_buf));
-    }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(parent) = exe.parent()
-    {
-        roots.extend(parent.ancestors().map(Path::to_path_buf));
-    }
-
-    for root in roots {
-        let script = root.join("scripts").join("saldeo-auth.sh");
-        if script.is_file() {
-            return Some(script);
-        }
-    }
-    None
-}
-
-fn prompt_env_path(name: &str, current: Option<String>) -> Result<Option<String>> {
-    let default = current.unwrap_or_default();
-    let value: String = Input::new()
-        .with_prompt(name)
-        .default(default)
-        .allow_empty(true)
-        .interact_text()?;
-    let value = value.trim().to_string();
-    if value.is_empty() {
-        return Ok(None);
-    }
-    if !Path::new(&value).exists() {
-        eprintln!("⚠ Plik nie istnieje: {value}");
-        if !Confirm::new()
-            .with_prompt("Zapisać mimo to?")
-            .default(false)
-            .interact()?
-        {
-            return Ok(None);
-        }
-    }
-    Ok(Some(value))
-}
-
-fn onboard_configure_ksef_data(current_year: i32) -> Result<()> {
-    eprintln!("── KSeF dane ──");
-    let year_text: String = Input::new()
-        .with_prompt("Rok eksportu KSeF")
-        .default(current_year.to_string())
-        .interact_text()?;
-    let year = year_text.trim().parse::<i32>().unwrap_or(current_year);
-    let default_dir = configured_ksef_out_path(year);
-    let dir_text: String = Input::new()
-        .with_prompt("Katalog eksportu KSeF XML/JSON")
-        .default(default_dir.display().to_string())
-        .interact_text()?;
-    let dir = PathBuf::from(dir_text.trim());
-    if !dir.exists()
-        && Confirm::new()
-            .with_prompt("Katalog nie istnieje. Utworzyć?")
-            .default(true)
-            .interact()?
-    {
-        fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
-        eprintln!("✓ Utworzono: {}", dir.display());
-    }
-    let mut vars = read_lab_env_file().unwrap_or_default();
-    vars.insert("KSEF_DATA_DIR".to_string(), dir.display().to_string());
-    write_lab_env_file(&vars)?;
-    eprintln!(
-        "✓ Zapisano KSEF_DATA_DIR w {}",
-        lab_env_file_path().display()
-    );
-    eprintln!("Umieść eksport KSeF w: {}", dir.display());
-    eprintln!(
-        "Synchronizacja: lab sync --ksef --year {year} --ksef-input {}\n",
-        dir.display()
-    );
-    Ok(())
-}
-
-fn lab_config_var(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| read_lab_env_file().ok()?.remove(name))
-}
-
-fn preferred_saldeo_storage_state_path() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config")
-        .join("lab")
-        .join("saldeo-storage-state.json")
-}
-
-fn lab_env_file_path() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config")
-        .join("lab")
-        .join("env")
-}
-
-fn read_lab_env_file() -> Result<HashMap<String, String>> {
-    let path = lab_env_file_path();
-    if !path.exists() {
-        return Ok(HashMap::new());
-    }
-    let text = fs::read_to_string(&path).with_context(|| format!("odczyt {}", path.display()))?;
-    let mut vars = HashMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let line = line.strip_prefix("export ").unwrap_or(line);
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        vars.insert(key.trim().to_string(), unquote_env_value(value.trim()));
-    }
-    Ok(vars)
-}
-
-fn write_lab_env_file(vars: &HashMap<String, String>) -> Result<()> {
-    let path = lab_env_file_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-    }
-    let mut keys = vars.keys().cloned().collect::<Vec<_>>();
-    keys.sort();
-    let mut out = String::from(
-        "# LAB local environment. Source it with: set -a; source ~/.config/lab/env; set +a\n",
-    );
-    for key in keys {
-        if let Some(value) = vars.get(&key) {
-            out.push_str(&format!("{}={}\n", key, quote_env_value(value)));
-        }
-    }
-    fs::write(&path, out).with_context(|| format!("zapis {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("chmod 600 {}", path.display()))?;
-    }
-    Ok(())
-}
-
-fn quote_env_value(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn unquote_env_value(value: &str) -> String {
-    if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
-        value[1..value.len() - 1].replace("'\\''", "'")
-    } else if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
-        value[1..value.len() - 1].to_string()
-    } else {
-        value.to_string()
-    }
-}
-
-fn save_saldeo_storage_state_secret(storage_state: &Path) -> Result<()> {
-    if let Ok(text) = fs::read_to_string(storage_state)
-        && keychain_set_secret(KEYCHAIN_ACCOUNT_SALDEO_STORAGE_STATE, &text)?
-    {
-        return Ok(());
-    }
-    Ok(())
-}
-
-fn read_saldeo_storage_state(storage_state: &Path) -> Result<String> {
-    if let Some(text) = keychain_get_secret(KEYCHAIN_ACCOUNT_SALDEO_STORAGE_STATE)? {
-        return Ok(text);
-    }
-    fs::read_to_string(storage_state)
-        .with_context(|| format!("odczyt sesji Saldeo {}", storage_state.display()))
-}
-
-fn saldeo_session_valid(storage_state: &Path) -> bool {
-    let Ok(text) = read_saldeo_storage_state(storage_state) else {
-        return false;
-    };
-    let Ok(storage): Result<Value, _> = serde_json::from_str(&text) else {
-        return false;
-    };
-    let Some(cookies) = storage.get("cookies").and_then(|v| v.as_array()) else {
-        return false;
-    };
-    let cookie_header = cookies
-        .iter()
-        .filter_map(|cookie| {
-            let name = cookie.get("name")?.as_str()?;
-            let value = cookie.get("value")?.as_str()?;
-            Some(format!("{name}={value}"))
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    let xsrf = cookies
-        .iter()
-        .find(|cookie| cookie.get("name").and_then(|v| v.as_str()) == Some("X-SALDEO-XSRF-C-TOKEN"))
-        .and_then(|cookie| cookie.get("value"))
-        .and_then(|v| v.as_str());
-    let Some(xsrf) = xsrf else {
-        return false;
-    };
-    let Ok(client) = Client::builder().build() else {
-        return false;
-    };
-    let body = serde_json::json!({
-        "pagination": { "pageNumber": 0, "pageSize": 1, "totalCount": 0,
-            "columnSorted": { "sortColumn": "DOCUMENT_CREATE_DATE", "sortDirection": "ASC" } },
-        "filter": { "period": { "partOfYear": 1, "year": Utc::now().year(), "selectionType": "selectedMonth" },
-            "duplicatesEnable": false, "duplicates": false, "splitPayment": false,
-            "types": [], "contractors": [], "stages": [], "categories": [], "registers": [],
-            "tags": [], "assignUsers": [], "addedBy": [], "added": [],
-            "paymentStatuses": [], "accountingPaymentTypes": [],
-            "searchQuery": "", "selectKsefDocumentsYesCheckbox": false,
-            "selectKsefDocumentsNoCheckbox": false, "ksefNumber": "",
-            "ksefMiniWorkflowStatus": null, "ksefBoId": null,
-            "dimensionReportDocumentIds": [], "dimensions": null }
-    });
-    match client
-        .post("https://saldeo.brainshare.pl/rest/client/document/list/search")
-        .header("Cookie", &cookie_header)
-        .header("X-SALDEO-XSRF-H-TOKEN", xsrf)
-        .header("saldeoApp", "angularApp")
-        .header("timeout", "60000")
-        .json(&body)
-        .send()
-    {
-        Ok(resp) => resp.status().is_success(),
-        Err(_) => false,
-    }
-}
-
-fn doctor(db_path: &Path, token_env: &str) -> Result<()> {
-    let gmail_env_present = std::env::var(token_env)
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false);
-    let status = collect_onboard_status(db_path)?;
-    let gmail_usable = gmail_env_present || status.gmail_authed;
-    let all_ok = status.pdftotext_ok
-        && status.python_ok
-        && status.openssl_ok
-        && gmail_usable
-        && status.saldeo_valid
-        && status.ksef_api_ok
-        && status.ksef_data_exists;
-    let year = status.year;
-    let mail_candidates = default_mail_candidates_path(year);
-    let ksef_records = configured_ksef_out_path(year);
-    let saldeo_records = default_saldeo_records_path(year);
-    let ksef_context_type =
-        lab_config_var("KSEF_CONTEXT_TYPE").unwrap_or_else(|| "Nip".to_string());
-    let raw_ksef_context = lab_config_var("KSEF_CONTEXT_NIP")
-        .or_else(|| lab_config_var("KSEF_NIP"))
-        .unwrap_or_else(|| DEFAULT_PRODUCTMESH_NIP.to_string());
-    let ksef_context_value = if ksef_context_type.eq_ignore_ascii_case("Nip") {
-        normalize_tax_id(&raw_ksef_context).unwrap_or(raw_ksef_context)
-    } else {
-        raw_ksef_context
-    };
-    let ksef_access_token_path = default_ksef_access_token_path();
-    let status_json = serde_json::json!({
-        "ok": all_ok,
-        "year": year,
-        "prerequisites": {
-            "pdftotext_present": status.pdftotext_ok,
-            "ppmlx_present": status.python_ok,
-            "openssl_present": status.openssl_ok
-        },
-        "gmail": {
-            "token_env": token_env,
-            "token_env_present": gmail_env_present,
-            "token_file": default_gmail_token_path().display().to_string(),
-            "token_file_or_keychain_present": status.token_exists,
-            "token_file_valid": status.gmail_authed,
-            "usable": gmail_usable,
-            "client_secret_path": lab_config_var("GOOGLE_CLIENT_SECRET_PATH")
-        },
-        "saldeo": {
-            "storage_state": default_saldeo_storage_state_path().display().to_string(),
-            "storage_state_present": status.saldeo_exists,
-            "session_valid": status.saldeo_valid,
-            "default_records": saldeo_records.display().to_string(),
-            "default_records_present": saldeo_records.exists()
-        },
-        "ksef": {
-            "base_url": ksef_base_url(),
-            "context_type": ksef_context_type,
-            "context_value": ksef_context_value,
-            "access_token_cache": ksef_access_token_path.display().to_string(),
-            "access_token_cache_present": ksef_access_token_path.exists(),
-            "data_dir": status.ksef_dir.display().to_string(),
-            "data_exists": status.ksef_data_exists,
-            "default_records": ksef_records.display().to_string(),
-            "default_records_present": ksef_records.exists(),
-            "cert_path": status.ksef_cert.clone(),
-            "cert_ok": status.ksef_cert_ok,
-            "key_path": status.ksef_key.clone(),
-            "key_ok": status.ksef_key_ok,
-            "password_present": status.ksef_password_ok,
-            "token_present": status.ksef_token_ok,
-            "api_config_ok": status.ksef_api_ok
-        },
-        "reconcile_defaults": {
-            "mail_candidates": mail_candidates.display().to_string(),
-            "mail_candidates_present": mail_candidates.exists(),
-            "ksef": ksef_records.display().to_string(),
-            "ksef_present": ksef_records.exists(),
-            "saldeo": saldeo_records.display().to_string(),
-            "saldeo_present": saldeo_records.exists()
-        },
-        "database": {
-            "path": db_path.display().to_string(),
-            "exists": status.db_exists
-        },
-        "notes": [
-            "GmailFetch wymaga tokenu OAuth z zakresem gmail.readonly.",
-            "PDF-y są parsowane przez pdftotext, potem PyMuPDF/pdfplumber/pypdf jako fallback.",
-            "lab reconcile bez własnych --ksef/--saldeo pobiera online metadane KSeF i Saldeo przed porównaniem.",
-            "KSeF online używa KSEF_TOKEN, KSEF_CONTEXT_NIP/KSEF_NIP i KSEF_BASE_URL/KSEF_ENV; metadane są cache'owane lokalnie w KSEF_DATA_DIR albo data/ksef-<rok>."
-        ],
-        "next_steps": onboard_next_steps(&status, gmail_usable)
-    });
-    write_json(&status_json, None)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn maps_ksef_online_metadata_to_invoice_record() {
-        let metadata = serde_json::json!({
-            "ksefNumber": "5242920020-20260501-ABCDEF1234-12",
-            "invoiceNumber": "FV/42/2026",
-            "issueDate": "2026-05-01",
-            "seller": {"nip": "521-000-00-01", "name": "Sprzedawca Sp. z o.o."},
-            "buyer": {"identifier": {"type": "Nip", "value": "5242920020"}, "name": "Productmesh"},
-            "netAmount": 100.0,
-            "grossAmount": 123.0,
-            "vatAmount": 23.0,
-            "currency": "pln"
-        });
-        let record = ksef_metadata_to_record(&metadata).unwrap();
-        assert_eq!(
-            record.content_hash,
-            "ksef:5242920020-20260501-ABCDEF1234-12"
-        );
-        assert_eq!(record.invoice_number.as_deref(), Some("FV/42/2026"));
-        assert_eq!(
-            record.ksef_reference.as_deref(),
-            Some("5242920020-20260501-ABCDEF1234-12")
-        );
-        assert_eq!(record.seller_tax_id.as_deref(), Some("5210000001"));
-        assert_eq!(record.buyer_tax_id.as_deref(), Some("5242920020"));
-        assert_eq!(record.gross_amount_minor, Some(12300));
-        assert_eq!(record.currency.as_deref(), Some("PLN"));
-    }
-
-    #[test]
-    fn ksef_year_ranges_are_quarterly() {
-        let ranges = ksef_year_quarter_ranges(2026);
-        assert_eq!(ranges.len(), 4);
-        assert_eq!(ranges[0].0, "2026-01-01T00:00:00+00:00");
-        assert_eq!(ranges[3].1, "2027-01-01T00:00:00+00:00");
-    }
-
-    #[test]
-    fn parses_ksef_like_xml() {
-        let xml = r#"
-        <Faktura>
-          <Podmiot1><DaneIdentyfikacyjne><NIP>521-000-00-01</NIP></DaneIdentyfikacyjne></Podmiot1>
-          <Podmiot2><DaneIdentyfikacyjne><NIP>5220000002</NIP></DaneIdentyfikacyjne></Podmiot2>
-          <Fa><P_1>2026-05-01</P_1><P_2>FV/12/2026</P_2><P_15>1 230,50</P_15><KodWaluty>PLN</KodWaluty></Fa>
-        </Faktura>"#;
-        let record = parse_xml_invoice(SourceKind::Ksef, xml);
-        assert_eq!(record.invoice_number.as_deref(), Some("FV/12/2026"));
-        assert_eq!(record.seller_tax_id.as_deref(), Some("5210000001"));
-        assert_eq!(record.buyer_tax_id.as_deref(), Some("5220000002"));
-        assert_eq!(record.gross_amount_minor, Some(123050));
-    }
-
-    #[test]
-    fn scores_strong_match() {
-        let mut ksef = empty_record(SourceKind::Ksef);
-        ksef.invoice_number = Some("FV/12/2026".into());
-        ksef.seller_tax_id = Some("5210000001".into());
-        ksef.gross_amount_minor = Some(123050);
-        ksef.issue_date = NaiveDate::from_ymd_opt(2026, 5, 1);
-        ksef.currency = Some("PLN".into());
-        let mut mail = empty_record(SourceKind::Mail);
-        mail.invoice_number = Some("FV_12_2026".into());
-        mail.seller_tax_id = Some("5210000001".into());
-        mail.gross_amount_minor = Some(123050);
-        mail.issue_date = NaiveDate::from_ymd_opt(2026, 5, 1);
-        mail.currency = Some("PLN".into());
-        let (score, reasons) = score_pair(&ksef, &mail);
-        assert!(score >= 95, "score={score}, reasons={reasons:?}");
-    }
-
-    #[test]
-    fn parses_text_invoice() {
-        let text = "Subject: Faktura FV/9/2026\nFrom: billing@example.com\nNIP 521-000-00-01\nData: 01.05.2026\nRazem do zapłaty: 99,90 zł";
-        let record = parse_text_invoice(SourceKind::Mail, text);
-        assert_eq!(record.invoice_number.as_deref(), Some("FV/9/2026"));
-        assert_eq!(record.seller_tax_id.as_deref(), Some("5210000001"));
-        assert_eq!(record.gross_amount_minor, Some(9990));
-        assert_eq!(record.currency.as_deref(), Some("PLN"));
-    }
-
-    #[test]
-    fn parses_stripe_style_invoice_counterparties() {
-        let text = r#"Invoice
-Invoice number 44871C26-0020
-Date of issue  January 5, 2026
-Date due       January 5, 2026
-
-
-Anthropic, PBC                                    Bill to
-548 Market Street                                 Rafal Wyderka
-PMB 90375                                         Mokra 33/49
-San Francisco, California 94104                   03-562 Warszawa
-United States                                     Poland
-support@anthropic.com                             wyderkarafal@gmail.com
-                                                  PL VAT PL5242920020
-
-€12.91 due January 5, 2026
-Subtotal                                              €12.91
-Total                                                 €12.91
-Amount due                                           €12.91
-"#;
-        let record = parse_text_invoice(SourceKind::Saldeo, text);
-        assert_eq!(record.invoice_number.as_deref(), Some("44871C26-0020"));
-        assert_eq!(record.seller_name.as_deref(), Some("Anthropic, PBC"));
-        assert_eq!(record.buyer_name.as_deref(), Some("Rafal Wyderka"));
-        assert_eq!(record.buyer_tax_id.as_deref(), Some("5242920020"));
-        assert_eq!(record.gross_amount_minor, Some(1291));
-        assert_eq!(record.currency.as_deref(), Some("EUR"));
-    }
-
-    #[test]
-    fn normalizes_invoice_currency_variants() {
-        assert_eq!(normalize_currency("zł"), Some("PLN".to_string()));
-        assert_eq!(normalize_currency("waluta: euro"), Some("EUR".to_string()));
-        assert_eq!(normalize_currency("Currency: usd"), Some("USD".to_string()));
-        assert_eq!(
-            currency_from_text("Total due: 42.00 €"),
-            Some("EUR".to_string())
-        );
-    }
-
-    #[test]
-    fn parses_llm_json_from_markdown() {
-        let value = parse_json_from_llm("```json\n{\"ok\":true}\n```").unwrap();
-        assert_eq!(value["ok"], true);
-    }
-
-    #[test]
-    fn parses_llm_json_after_reasoning_and_invalid_template() {
-        let content = r#"
-<|channel>thought
-Template:
-{
-  "currency": "PLN" | "EUR" | null
-}
-<|channel>final
-{"invoice_number":"FV/1/2026","currency":"PLN"}
-"#;
-        let value = parse_json_from_llm(content).unwrap();
-        assert_eq!(value["invoice_number"], "FV/1/2026");
-        assert_eq!(value["currency"], "PLN");
-    }
-
-    #[test]
-    fn final_channel_wins_over_valid_json_in_thought() {
-        let content = r#"
-<|channel>thought
-{"invoice_number":"WRONG","currency":"EUR"}
-<|channel>final
-{"invoice_number":"RIGHT","currency":"PLN"}
-"#;
-        let value = parse_json_from_llm(content).unwrap();
-        assert_eq!(value["invoice_number"], "RIGHT");
-        assert_eq!(value["currency"], "PLN");
-    }
-
-    #[test]
-    fn rejects_thought_only_json() {
-        let content = r#"
-<|channel>thought
-{"invoice_number":"WRONG","currency":"EUR"}
-"#;
-        assert!(parse_json_from_llm(content).is_err());
-    }
-
-    #[test]
-    fn productmesh_filter_normalizes_input_nip() {
-        let mut record = empty_record(SourceKind::Mail);
-        record.invoice_number = Some("FV/1/2026".into());
-        record.buyer_tax_id = Some("5242920020".into());
-        let candidates = productmesh_invoice_candidates(&[record], "PL 524-292-00-20");
-        assert_eq!(candidates.len(), 1);
     }
 }
