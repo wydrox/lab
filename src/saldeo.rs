@@ -1,4 +1,5 @@
 use crate::*;
+use dialoguer::{Confirm, Input};
 
 pub(crate) struct SaldeoSyncPlanConfig<'a> {
     pub(crate) year: i32,
@@ -421,6 +422,280 @@ pub(crate) fn default_saldeo_storage_state_path() -> PathBuf {
         .join("saldeo-storage-state.json")
 }
 
+pub(crate) const SALDEO_OVERRIDE_WARNING_PREFIX: &str = "lab override applied";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SaldeoRecordOverride {
+    pub content_hash: String,
+    pub invoice_number: Option<String>,
+    pub seller_tax_id: Option<String>,
+    pub buyer_tax_id: Option<String>,
+    pub seller_name: Option<String>,
+    pub buyer_name: Option<String>,
+    pub issue_date: Option<NaiveDate>,
+    pub gross_amount_minor: Option<i64>,
+    pub currency: Option<String>,
+}
+
+pub(crate) fn default_saldeo_record_overrides_path() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".config")
+        .join("lab")
+        .join("saldeo-overrides.json")
+}
+
+fn load_saldeo_record_overrides() -> Result<HashMap<String, SaldeoRecordOverride>> {
+    let path = default_saldeo_record_overrides_path();
+    if !path.is_file() {
+        return Ok(HashMap::new());
+    }
+    let text = fs::read_to_string(&path).with_context(|| format!("odczyt {}", path.display()))?;
+    let overrides = serde_json::from_str::<Vec<SaldeoRecordOverride>>(&text)
+        .with_context(|| format!("niepoprawny override Saldeo {}", path.display()))?;
+    Ok(overrides
+        .into_iter()
+        .map(|override_row| (override_row.content_hash.clone(), override_row))
+        .collect())
+}
+
+fn save_saldeo_record_overrides(overrides: &HashMap<String, SaldeoRecordOverride>) -> Result<()> {
+    let path = default_saldeo_record_overrides_path();
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    let mut rows = overrides.values().cloned().collect::<Vec<_>>();
+    rows.sort_by(|a, b| a.content_hash.cmp(&b.content_hash));
+    fs::write(&path, serde_json::to_vec_pretty(&rows)?)
+        .with_context(|| format!("zapis {}", path.display()))
+}
+
+pub(crate) fn saldeo_record_has_override(record: &InvoiceRecord) -> bool {
+    record.source == SourceKind::Saldeo
+        && record
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with(SALDEO_OVERRIDE_WARNING_PREFIX))
+}
+
+pub(crate) fn apply_saldeo_record_overrides(records: &mut [InvoiceRecord]) -> Result<usize> {
+    let overrides = load_saldeo_record_overrides()?;
+    let mut applied = 0usize;
+    for record in records.iter_mut() {
+        if record.source != SourceKind::Saldeo {
+            continue;
+        }
+        if let Some(override_row) = overrides.get(&record.content_hash) {
+            apply_saldeo_record_override(record, override_row);
+            applied += 1;
+        }
+    }
+    Ok(applied)
+}
+
+fn apply_saldeo_record_override(
+    record: &mut InvoiceRecord,
+    override_row: &SaldeoRecordOverride,
+) -> bool {
+    let mut changed_fields = Vec::new();
+    macro_rules! set_field {
+        ($field:ident, $name:literal) => {
+            if record.$field != override_row.$field {
+                changed_fields.push($name);
+                record.$field = override_row.$field.clone();
+            }
+        };
+    }
+    set_field!(invoice_number, "invoice_number");
+    set_field!(seller_tax_id, "seller_tax_id");
+    set_field!(buyer_tax_id, "buyer_tax_id");
+    set_field!(seller_name, "seller_name");
+    set_field!(buyer_name, "buyer_name");
+    set_field!(issue_date, "issue_date");
+    set_field!(gross_amount_minor, "gross_amount_minor");
+    set_field!(currency, "currency");
+
+    record
+        .warnings
+        .retain(|warning| !warning.starts_with(SALDEO_OVERRIDE_WARNING_PREFIX));
+    if changed_fields.is_empty() {
+        record
+            .warnings
+            .push(SALDEO_OVERRIDE_WARNING_PREFIX.to_string());
+    } else {
+        record.warnings.push(format!(
+            "{}: {}",
+            SALDEO_OVERRIDE_WARNING_PREFIX,
+            changed_fields.join(",")
+        ));
+    }
+    true
+}
+
+pub(crate) fn edit_saldeo_record_override(record: &InvoiceRecord) -> Result<bool> {
+    if record.source != SourceKind::Saldeo {
+        return Err(anyhow!("poprawa działa tylko dla rekordów Saldeo"));
+    }
+
+    eprintln!(
+        "\nPoprawiam rekord Saldeo: {} ({})",
+        record.invoice_number.as_deref().unwrap_or("bez numeru"),
+        record.content_hash
+    );
+    eprintln!(
+        "  kontrahent: {}",
+        record
+            .seller_name
+            .as_deref()
+            .or(record.buyer_name.as_deref())
+            .unwrap_or("-")
+    );
+
+    let invoice_number = prompt_string_value(
+        "Numer faktury",
+        record.invoice_number.as_deref(),
+        clean_invoice_number,
+    )?;
+    let seller_name = prompt_string_value(
+        "Sprzedawca / kontrahent",
+        record.seller_name.as_deref(),
+        |value| Some(clean_name(value).unwrap_or_else(|| value.trim().to_string())),
+    )?;
+    let buyer_name = prompt_string_value(
+        "Nabywca",
+        record.buyer_name.as_deref(),
+        |value| Some(clean_name(value).unwrap_or_else(|| value.trim().to_string())),
+    )?;
+    let seller_tax_id = prompt_string_value(
+        "NIP sprzedawcy",
+        record.seller_tax_id.as_deref(),
+        normalize_tax_id,
+    )?;
+    let buyer_tax_id = prompt_string_value(
+        "NIP nabywcy",
+        record.buyer_tax_id.as_deref(),
+        normalize_tax_id,
+    )?;
+    let issue_date = prompt_value(
+        "Data wystawienia",
+        record.issue_date.as_ref(),
+        |date| date.to_string(),
+        parse_date,
+    )?;
+    let gross_amount_minor = prompt_value(
+        "Kwota brutto",
+        record.gross_amount_minor.as_ref(),
+        |amount| format_minor_money(*amount),
+        parse_money_minor,
+    )?;
+    let currency = prompt_string_value(
+        "Waluta",
+        record.currency.as_deref(),
+        normalize_currency,
+    )?;
+
+    let override_row = SaldeoRecordOverride {
+        content_hash: record.content_hash.clone(),
+        invoice_number,
+        seller_tax_id,
+        buyer_tax_id,
+        seller_name,
+        buyer_name,
+        issue_date,
+        gross_amount_minor,
+        currency,
+    };
+
+    let mut overrides = load_saldeo_record_overrides()?;
+    if overrides.get(&override_row.content_hash) == Some(&override_row) {
+        eprintln!("⏭ Bez zmian.\n");
+        return Ok(false);
+    }
+
+    let confirm = Confirm::new()
+        .with_prompt(format!(
+            "Zapisać poprawki do {}?",
+            default_saldeo_record_overrides_path().display()
+        ))
+        .default(true)
+        .interact()?;
+    if !confirm {
+        eprintln!("⏭ Anulowano.\n");
+        return Ok(false);
+    }
+
+    overrides.insert(override_row.content_hash.clone(), override_row);
+    save_saldeo_record_overrides(&overrides)?;
+    eprintln!(
+        "✓ Zapisano poprawki Saldeo: {}\n",
+        default_saldeo_record_overrides_path().display()
+    );
+    Ok(true)
+}
+
+fn prompt_string_value(
+    label: &str,
+    current: Option<&str>,
+    parser: fn(&str) -> Option<String>,
+) -> Result<Option<String>> {
+    let current_text = current.unwrap_or("-");
+    loop {
+        let input = Input::<String>::new()
+            .with_prompt(format!(
+                "{} [{}] (Enter=bez zmian, '-'=wyczyść)",
+                label, current_text
+            ))
+            .allow_empty(true)
+            .interact_text()?;
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Ok(current.map(|value| value.to_string()));
+        }
+        if trimmed == "-" {
+            return Ok(None);
+        }
+        if let Some(value) = parser(trimmed) {
+            return Ok(Some(value));
+        }
+        eprintln!("✗ Niepoprawna wartość dla {label}: {trimmed}");
+    }
+}
+
+fn prompt_value<T, F, G>(
+    label: &str,
+    current: Option<&T>,
+    format_current: G,
+    parser: F,
+) -> Result<Option<T>>
+where
+    T: Clone,
+    F: Fn(&str) -> Option<T>,
+    G: Fn(&T) -> String,
+{
+    let current_text = current.map(&format_current).unwrap_or_else(|| "-".to_string());
+    loop {
+        let input = Input::<String>::new()
+            .with_prompt(format!(
+                "{} [{}] (Enter=bez zmian, '-'=wyczyść)",
+                label, current_text
+            ))
+            .allow_empty(true)
+            .interact_text()?;
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Ok(current.cloned());
+        }
+        if trimmed == "-" {
+            return Ok(None);
+        }
+        if let Some(value) = parser(trimmed) {
+            return Ok(Some(value));
+        }
+        eprintln!("✗ Niepoprawna wartość dla {label}: {trimmed}");
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) fn saldeo_fetch(
     year: i32,
@@ -580,6 +855,10 @@ pub(crate) fn saldeo_fetch_with_progress(
         &mut records,
         progress.clone(),
     )?;
+    let overridden_count = apply_saldeo_record_overrides(&mut records)?;
+    if overridden_count > 0 {
+        eprintln!("  [Saldeo] zastosowano lokalne poprawki: {overridden_count} rekordów");
+    }
     if let Some(progress) = &progress {
         set_progress(
             progress,
@@ -609,22 +888,29 @@ pub(crate) fn saldeo_fetch_with_progress(
 }
 
 pub(crate) fn load_saldeo_records(input: &Path) -> Result<Vec<InvoiceRecord>> {
-    if input.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-        return load_records(SourceKind::Saldeo, input);
-    }
-    let text =
-        fs::read_to_string(input).with_context(|| format!("odczyt Saldeo {}", input.display()))?;
-    if let Ok(mut records) = serde_json::from_str::<Vec<InvoiceRecord>>(&text) {
-        for record in &mut records {
-            record.source = SourceKind::Saldeo;
+    let mut records = if input.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+        load_records(SourceKind::Saldeo, input)?
+    } else {
+        let text =
+            fs::read_to_string(input).with_context(|| format!("odczyt Saldeo {}", input.display()))?;
+        if let Ok(mut records) = serde_json::from_str::<Vec<InvoiceRecord>>(&text) {
+            for record in &mut records {
+                record.source = SourceKind::Saldeo;
+            }
+            records
+        } else {
+            let value: Value = serde_json::from_str(&text)?;
+            let docs = value
+                .as_array()
+                .ok_or_else(|| anyhow!("Saldeo input musi być tablicą documents albo InvoiceRecord[]"))?;
+            saldeo_documents_to_records(docs)
         }
-        return Ok(records);
+    };
+    let overridden_count = apply_saldeo_record_overrides(&mut records)?;
+    if overridden_count > 0 {
+        eprintln!("  [Saldeo] zastosowano lokalne poprawki: {overridden_count} rekordów");
     }
-    let value: Value = serde_json::from_str(&text)?;
-    let docs = value
-        .as_array()
-        .ok_or_else(|| anyhow!("Saldeo input musi być tablicą documents albo InvoiceRecord[]"))?;
-    Ok(saldeo_documents_to_records(docs))
+    Ok(records)
 }
 
 pub(crate) fn saldeo_documents_to_records(documents: &[Value]) -> Vec<InvoiceRecord> {

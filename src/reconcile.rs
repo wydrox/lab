@@ -239,9 +239,26 @@ pub(crate) fn tri_row_primary_record(row: &TriRow) -> Option<&InvoiceRecord> {
 }
 
 pub(crate) fn tri_row_display_record(row: &TriRow) -> Option<InvoiceRecord> {
-    let mut record = tri_row_primary_record(row)?.clone();
-    let metadata_sources = [row.ksef.as_ref(), row.saldeo.as_ref(), row.mail.as_ref()];
-    let name_sources = [row.mail.as_ref(), row.ksef.as_ref(), row.saldeo.as_ref()];
+    let saldeo_corrected = row.saldeo.as_ref().is_some_and(saldeo_record_has_override);
+    let mut record = if saldeo_corrected {
+        row.saldeo
+            .as_ref()
+            .or(row.mail.as_ref())
+            .or(row.ksef.as_ref())?
+            .clone()
+    } else {
+        tri_row_primary_record(row)?.clone()
+    };
+    let metadata_sources = if saldeo_corrected {
+        [row.saldeo.as_ref(), row.ksef.as_ref(), row.mail.as_ref()]
+    } else {
+        [row.ksef.as_ref(), row.saldeo.as_ref(), row.mail.as_ref()]
+    };
+    let name_sources = if saldeo_corrected {
+        [row.saldeo.as_ref(), row.mail.as_ref(), row.ksef.as_ref()]
+    } else {
+        [row.mail.as_ref(), row.ksef.as_ref(), row.saldeo.as_ref()]
+    };
 
     if record.invoice_number.is_none() {
         record.invoice_number = metadata_sources
@@ -429,7 +446,7 @@ pub(crate) fn counterparty_name(record: Option<&InvoiceRecord>) -> String {
 }
 
 pub(crate) fn row_sources(row: &TriRow) -> String {
-    [
+    let mut sources = [
         ("G", row.mail.is_some()),
         ("K", row.ksef.is_some()),
         ("S", row.saldeo.is_some()),
@@ -437,7 +454,15 @@ pub(crate) fn row_sources(row: &TriRow) -> String {
     .into_iter()
     .filter_map(|(label, present)| present.then_some(label))
     .collect::<Vec<_>>()
-    .join("+")
+    .join("+");
+    if row
+        .saldeo
+        .as_ref()
+        .is_some_and(saldeo_record_has_override)
+    {
+        sources.push('*');
+    }
+    sources
 }
 
 pub(crate) fn format_minor_money(value: i64) -> String {

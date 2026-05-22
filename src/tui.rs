@@ -20,6 +20,11 @@ pub(crate) fn interactive_reconcile_actions(db_path: &Path) -> Result<()> {
                 eprintln!("  [LAB] konfiguracja...");
                 onboard(db_path, false, None)?;
             }
+            TuiResult::Correct(record) => {
+                if edit_saldeo_record_override(&record)? {
+                    rows = build_invoice_table_rows(year, review_score)?;
+                }
+            }
         }
     }
 }
@@ -28,6 +33,7 @@ pub(crate) enum TuiResult {
     Cancel,
     Doctor,
     Onboard,
+    Correct(InvoiceRecord),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -160,6 +166,7 @@ pub(crate) struct InvoiceTableRow {
     selected: bool,
     sources: String,
     record: InvoiceRecord,
+    saldeo_record: Option<InvoiceRecord>,
     upload_item: Option<SaldeoSyncItem>,
     ksef_document_id: Option<i64>,
     ksef_accounting: Option<bool>,
@@ -173,7 +180,7 @@ impl InvoiceTableRow {
     }
 
     fn needs_attention(&self) -> bool {
-        self.is_actionable() || self.sources.contains('-') || self.updated
+        self.is_actionable() || self.sources.contains('-') || self.updated || self.sources.ends_with('*')
     }
 
     fn can_upload(&self) -> bool {
@@ -288,6 +295,11 @@ pub(crate) fn invoice_table_row_from_reconcile_row(
     ksef_statuses: Option<&HashMap<i64, Option<bool>>>,
 ) -> Option<InvoiceTableRow> {
     let record = tri_row_display_record(row)?;
+    let saldeo_record = row.saldeo.clone();
+    let mut sources = row_source_mask(row);
+    if saldeo_record.as_ref().is_some_and(saldeo_record_has_override) {
+        sources.push('*');
+    }
     let upload_item = row.mail.as_ref().and_then(|mail| {
         if row.saldeo.is_some() {
             return None;
@@ -324,8 +336,9 @@ pub(crate) fn invoice_table_row_from_reconcile_row(
         .unwrap_or((None, None));
     Some(InvoiceTableRow {
         selected: false,
-        sources: row_source_mask(row),
+        sources,
         record,
+        saldeo_record,
         upload_item,
         ksef_document_id,
         ksef_accounting,
@@ -681,8 +694,9 @@ pub(crate) fn run_invoice_table_tui(
     const MI_REJECT: usize = 5;
     const MI_CLEAR: usize = 6;
     const MI_COMMIT: usize = 7;
-    const MI_MENU: usize = 8;
-    const MAIN_COUNT: usize = 9;
+    const MI_EDIT: usize = 8;
+    const MI_MENU: usize = 9;
+    const MAIN_COUNT: usize = 10;
     // Submenu (when menu_open)
     const SM_DOCTOR: usize = 0;
     const SM_ONBOARD: usize = 1;
@@ -957,6 +971,7 @@ pub(crate) fn run_invoice_table_tui(
                     mkbtn("Odrzuć", MI_REJECT, false),
                     mkbtn("Wyczyść", MI_CLEAR, false),
                     mkbtn("Akceptuj", MI_COMMIT, false),
+                    mkbtn("Popraw", MI_EDIT, false),
                     mkbtn("☰ Menu", MI_MENU, false),
                 ];
                 let mut main_constraints = vec![];
@@ -1036,7 +1051,7 @@ pub(crate) fn run_invoice_table_tui(
                 visible.len(),
                 rows.len()
             );
-            let help = "f=braki/zmiany  spc=toggle  ⏎=select  ⌘c=commit  q=wyjdź".to_string();
+            let help = "f=braki/zmiany  e=popraw  spc=toggle  ⏎=select  ⌘c=commit  q=wyjdź".to_string();
             let stats_span = ratatui::text::Span::styled(
                 stats_text,
                 theme.muted().add_modifier(Modifier::ITALIC),
