@@ -57,6 +57,7 @@ lab                      # interaktywna tabela faktur: akcje upload / zatwierdź
 lab sync                 # synchronizuje wszystkie trzy źródła
 lab sync --ksef          # tylko KSeF online; zapisuje metadane także do lokalnej SQLite
 lab sync --mail          # tylko Gmail/PDF (pobiera, parsuje, filtruje)
+lab sync --amazon-mail   # tylko Amazon.it / Amazon.es z osobnym cache
 lab sync --saldeo        # tylko Saldeo
 
 lab reconcile              # odświeża KSeF/Saldeo i porównuje domyślne wyniki dla roku 2026
@@ -71,10 +72,10 @@ lab reconcile \
 lab reconcile --status --year 2026   # ostatni raport z bazy
 
 lab upload                 # plan brakujących załączników Gmail → Saldeo
-lab upload --confirm       # faktyczny upload brakujących załączników
+lab upload --confirm       # faktyczny upload brakujących załączników; po nim LAB odświeża Saldeo cache
 ```
 
-Puste `lab` otwiera interaktywną tabelę faktur z tri-reconcile. Skróty: `j/k` lub strzałki — ruch, `u` — upload do Saldeo, `a` — zatwierdź KSeF, `r` — odrzuć KSeF, `n` — wyczyść, `f` — filtr pozycji z możliwymi akcjami, `c` — wykonaj, `q` — wyjdź. `Akceptuj` wykonuje wybrane operacje bez wychodzenia z tabeli i odświeża status/tabelę na bieżąco.
+Puste `lab` otwiera interaktywną tabelę faktur z tri-reconcile. Skróty: `j/k` lub strzałki — ruch, `u` — upload do Saldeo, `a` — zatwierdź KSeF, `r` — odrzuć KSeF, `n` — wyczyść, `f` — filtr pozycji z możliwymi akcjami, `e` — lokalna poprawka Saldeo, `c` — wykonaj, `q` — wyjdź. Zmiana roku w menu uruchamia pełny sync dla tego roku. `Akceptuj` wykonuje wybrane operacje bez wychodzenia z tabeli i odświeża status/tabelę na bieżąco. Poprawione rekordy Saldeo mają `*` w kolumnie źródeł.
 
 ## Automatyzacja macOS
 

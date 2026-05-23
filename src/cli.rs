@@ -34,6 +34,9 @@ pub(crate) enum Commands {
         /// Tylko Gmail/PDF (pobiera załączniki, parsuje, filtruje).
         #[arg(long)]
         mail: bool,
+        /// Tylko Gmail/PDF z filtrem Amazon.it / Amazon.es.
+        #[arg(long, conflicts_with = "mail")]
+        amazon_mail: bool,
         /// Tylko Saldeo.
         #[arg(long)]
         saldeo: bool,

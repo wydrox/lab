@@ -214,22 +214,26 @@ fn run_sync_sources(
     year: i32,
     ksef: bool,
     mail: bool,
+    amazon_mail: bool,
     saldeo: bool,
     ksef_input: Option<&Path>,
     gmail_client_secret: Option<&Path>,
     gmail_token_file: Option<&Path>,
     productmesh_nip: &str,
+    db_path: Option<&Path>,
     conn: Option<&Connection>,
 ) -> Result<SyncRunSummary> {
     run_sync_sources_with_progress(
         year,
         ksef,
         mail,
+        amazon_mail,
         saldeo,
         ksef_input,
         gmail_client_secret,
         gmail_token_file,
         productmesh_nip,
+        db_path,
         conn,
         None,
     )
@@ -240,15 +244,17 @@ fn run_sync_sources_with_progress(
     year: i32,
     ksef: bool,
     mail: bool,
+    amazon_mail: bool,
     saldeo: bool,
     ksef_input: Option<&Path>,
     gmail_client_secret: Option<&Path>,
     gmail_token_file: Option<&Path>,
     productmesh_nip: &str,
+    db_path: Option<&Path>,
     conn: Option<&Connection>,
     progress: Option<Arc<Mutex<String>>>,
 ) -> Result<SyncRunSummary> {
-    let all = !ksef && !mail && !saldeo;
+    let all = !ksef && !mail && !amazon_mail && !saldeo;
     if all {
         eprintln!("Sync: wszystkie źródła (KSeF + Gmail/PDF + Saldeo)");
     }
@@ -291,27 +297,41 @@ fn run_sync_sources_with_progress(
         synced.push(format!("ksef ({})", result.summary.records_count));
     }
 
-    if mail || all {
-        eprintln!("  [Gmail] sprawdzanie wiadomości i cache załączników...");
+    if mail || amazon_mail || all {
+        let mail_source_label = if amazon_mail { "Amazon" } else { "Gmail" };
+        let mail_cache = if amazon_mail {
+            default_amazon_mail_out_path(year)
+        } else {
+            default_mail_out_path(year)
+        };
+        let mail_query = if amazon_mail {
+            amazon_gmail_query(year)
+        } else {
+            default_gmail_query(year)
+        };
+        let mail_candidates_path = mail_cache.join("candidates.jsonl");
+        eprintln!("  [{mail_source_label}] sprawdzanie wiadomości i cache załączników...");
         if let Some(progress) = &progress {
-            set_progress(progress, "Gmail: sprawdzanie tokena...");
+            set_progress(
+                progress,
+                format!("{mail_source_label}: sprawdzanie tokena..."),
+            );
         }
         let token_path = gmail_token_file
             .map(PathBuf::from)
             .unwrap_or_else(default_gmail_token_path);
         let token = gmail_access_token("GMAIL_ACCESS_TOKEN", &token_path, gmail_client_secret)?;
-        let mail_out = default_mail_out_path(year);
         let gmail_result = gmail_fetch(
             &token,
             "me",
-            &default_gmail_query(year),
-            &mail_out,
-            500,
+            &mail_query,
+            &mail_cache,
+            usize::MAX,
             &["pdf".to_string()],
             progress.clone(),
         )?;
         eprintln!(
-            "  [Gmail] wiadomości: {} znalezionych, {} z cache, {} pobranych z API; nowe pliki: {} metadane, {} załączniki",
+            "  [{mail_source_label}] wiadomości: {} znalezionych, {} z cache, {} pobranych z API; nowe pliki: {} metadane, {} załączniki",
             gmail_result.messages_seen,
             gmail_result.messages_cached,
             gmail_result.messages_fetched,
@@ -322,7 +342,7 @@ fn run_sync_sources_with_progress(
             set_progress(
                 progress,
                 format!(
-                    "Gmail: {} wiadomości, cache {}, API {}, załączniki {}",
+                    "{mail_source_label}: {} wiadomości, cache {}, API {}, załączniki {}",
                     gmail_result.messages_seen,
                     gmail_result.messages_cached,
                     gmail_result.messages_fetched,
@@ -330,56 +350,76 @@ fn run_sync_sources_with_progress(
                 ),
             );
         }
-        eprintln!("  [Gmail] skanowanie nowych PDF...");
+        eprintln!("  [{mail_source_label}] skanowanie nowych PDF...");
         if let Some(progress) = &progress {
-            set_progress(progress, "Gmail: skanowanie nowych PDF...");
+            set_progress(
+                progress,
+                format!("{mail_source_label}: skanowanie nowych PDF..."),
+            );
         }
-        let (mail_records, parsed_count) = sync_mail_records(&mail_out, &gmail_result.saved_files)?;
-        eprintln!("  [Gmail] sparsowano {} nowych PDF", parsed_count);
+        let (mail_records, parsed_count) =
+            sync_mail_records(&mail_cache, &gmail_result.saved_files)?;
+        eprintln!(
+            "  [{mail_source_label}] sparsowano {} nowych PDF",
+            parsed_count
+        );
         if let Some(progress) = &progress {
             set_progress(
                 progress,
                 format!(
-                    "Gmail: sparsowano {parsed_count} nowych PDF, razem {}",
+                    "{mail_source_label}: sparsowano {parsed_count} nowych PDF, razem {}",
                     mail_records.len()
                 ),
             );
         }
         if let Some(progress) = &progress {
-            set_progress(progress, "Gmail: wybór kandydatów ProductMesh...");
+            set_progress(
+                progress,
+                format!("{mail_source_label}: wybór kandydatów ProductMesh..."),
+            );
         }
         let mut candidates = productmesh_invoice_candidates(&mail_records, productmesh_nip);
         if let Some(progress) = &progress {
             set_progress(
                 progress,
-                format!("Gmail: cache kandydatów ({} faktur)...", candidates.len()),
+                format!(
+                    "{mail_source_label}: cache kandydatów ({} faktur)...",
+                    candidates.len()
+                ),
             );
         }
-        let cached_candidates = apply_cached_mail_candidates(year, &mut candidates)?;
+        let cached_candidates =
+            apply_cached_mail_candidates(&mail_candidates_path, &mut candidates)?;
         enrich_candidates_with_gemma(&mut candidates, &cached_candidates, progress.clone())?;
         if let Some(progress) = &progress {
             set_progress(
                 progress,
-                format!("Gmail: zapis {} kandydatów...", candidates.len()),
+                format!(
+                    "{mail_source_label}: zapis {} kandydatów...",
+                    candidates.len()
+                ),
             );
         }
         write_records(
             &candidates,
             OutputFormat::Jsonl,
-            Some(&default_mail_candidates_path(year)),
+            Some(&mail_candidates_path),
         )?;
         records_count += candidates.len();
         if let Some(progress) = &progress {
             set_progress(
                 progress,
-                format!("Gmail: zapis do bazy ({} rekordów)...", candidates.len()),
+                format!(
+                    "{mail_source_label}: zapis do bazy ({} rekordów)...",
+                    candidates.len()
+                ),
             );
         }
         if let Some(conn) = conn {
             store_records(conn, &candidates)?;
         }
         eprintln!(
-            "  [Gmail] gotowe: {} PDF, {} faktur",
+            "  [{mail_source_label}] gotowe: {} PDF, {} faktur",
             mail_records.len(),
             candidates.len()
         );
@@ -387,14 +427,15 @@ fn run_sync_sources_with_progress(
             set_progress(
                 progress,
                 format!(
-                    "Gmail: gotowe — {} PDF, {} faktur",
+                    "{mail_source_label}: gotowe — {} PDF, {} faktur",
                     mail_records.len(),
                     candidates.len()
                 ),
             );
         }
         synced.push(format!(
-            "mail ({} new attachments, {} pdfs, {} candidates)",
+            "{} ({} new attachments, {} pdfs, {} candidates)",
+            if amazon_mail { "amazon-mail" } else { "mail" },
             gmail_result.attachments_saved,
             mail_records.len(),
             candidates.len()
@@ -407,6 +448,7 @@ fn run_sync_sources_with_progress(
             year,
             &default_saldeo_storage_state_path(),
             &default_saldeo_out_path(year),
+            db_path,
             progress.clone(),
         )?;
         records_count += result.records.len();
@@ -486,6 +528,7 @@ fn sync_reconcile_metadata_with_progress(
             year,
             &default_saldeo_storage_state_path(),
             &default_saldeo_out_path(year),
+            Some(db_path),
             progress.clone(),
         )?;
         if let Some(progress) = &progress {
@@ -523,6 +566,7 @@ fn handle_command(db_path: &Path, command: Commands) -> Result<()> {
         Commands::Sync {
             ksef,
             mail,
+            amazon_mail,
             saldeo,
             year,
             ksef_input,
@@ -535,6 +579,7 @@ fn handle_command(db_path: &Path, command: Commands) -> Result<()> {
             year,
             ksef,
             mail,
+            amazon_mail,
             saldeo,
             ksef_input,
             gmail_client_secret,
@@ -577,6 +622,7 @@ fn handle_command(db_path: &Path, command: Commands) -> Result<()> {
             csv,
             confirm,
         } => handle_upload_command(
+            db_path,
             year,
             tri_report,
             mail,
@@ -599,6 +645,7 @@ fn handle_sync_command(
     year: i32,
     ksef: bool,
     mail: bool,
+    amazon_mail: bool,
     saldeo: bool,
     ksef_input: Option<PathBuf>,
     gmail_client_secret: Option<PathBuf>,
@@ -606,7 +653,8 @@ fn handle_sync_command(
     productmesh_nip: String,
     store: bool,
 ) -> Result<()> {
-    let auto_store_online_ksef = ksef_input.is_none() && (ksef || (!ksef && !mail && !saldeo));
+    let auto_store_online_ksef =
+        ksef_input.is_none() && (ksef || (!ksef && !mail && !amazon_mail && !saldeo));
     let conn = if store || auto_store_online_ksef {
         Some(open_db(db_path)?)
     } else {
@@ -616,11 +664,13 @@ fn handle_sync_command(
         year,
         ksef,
         mail,
+        amazon_mail,
         saldeo,
         ksef_input.as_deref(),
         gmail_client_secret.as_deref(),
         gmail_token_file.as_deref(),
         &productmesh_nip,
+        Some(db_path),
         conn.as_ref(),
     )?;
     write_json(&summary, None)
@@ -658,7 +708,7 @@ fn handle_reconcile_command(
     let saldeo_path = saldeo.unwrap_or_else(|| default_saldeo_records_path(year));
     let mail_records = load_records(SourceKind::Mail, &mail_path)?;
     let ksef_records = load_records(SourceKind::Ksef, &ksef_path)?;
-    let saldeo_records = load_saldeo_records(&saldeo_path)?;
+    let saldeo_records = load_saldeo_records(&saldeo_path, Some(db_path))?;
     let report = tri_reconcile(mail_records, ksef_records, saldeo_records, review_score);
 
     let temporal_diff = if store {
@@ -688,6 +738,7 @@ fn handle_reconcile_command(
 
 #[allow(clippy::too_many_arguments)]
 fn handle_upload_command(
+    db_path: &Path,
     year: i32,
     tri_report: Option<PathBuf>,
     mail: Option<PathBuf>,
@@ -704,6 +755,7 @@ fn handle_upload_command(
         mail: mail.as_deref(),
         ksef: ksef.as_deref(),
         saldeo: saldeo.as_deref(),
+        db_path: Some(db_path),
         review_score,
         confirm,
         upload_url: None,
@@ -715,7 +767,19 @@ fn handle_upload_command(
     if let Some(csv_path) = csv {
         write_saldeo_sync_csv(&plan, &csv_path)?;
     }
-    write_json(&plan, output.as_deref())
+    write_json(&plan, output.as_deref())?;
+    if confirm && plan.summary.uploaded_count > 0 {
+        if let Err(err) = saldeo_fetch_with_progress(
+            year,
+            &default_saldeo_storage_state_path(),
+            &default_saldeo_out_path(year),
+            Some(db_path),
+            None,
+        ) {
+            eprintln!("  [Saldeo] refresh po uploadzie nie powiódł się: {err}");
+        }
+    }
+    Ok(())
 }
 
 fn write_records(
@@ -872,6 +936,20 @@ fn open_db(path: &Path) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_invoices_source ON invoices(source);
         CREATE INDEX IF NOT EXISTS idx_invoices_invoice_number ON invoices(invoice_number);
         CREATE INDEX IF NOT EXISTS idx_invoices_tax_ids ON invoices(seller_tax_id, buyer_tax_id);
+        CREATE TABLE IF NOT EXISTS saldeo_overrides (
+            content_hash TEXT PRIMARY KEY,
+            invoice_number TEXT,
+            seller_tax_id TEXT,
+            buyer_tax_id TEXT,
+            seller_name TEXT,
+            buyer_name TEXT,
+            issue_date TEXT,
+            gross_amount_minor INTEGER,
+            currency TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_saldeo_overrides_updated_at ON saldeo_overrides(updated_at);
         CREATE TABLE IF NOT EXISTS reconcile_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             generated_at TEXT NOT NULL,
@@ -1051,6 +1129,7 @@ fn upsert_invoice(conn: &Connection, record: &InvoiceRecord) -> Result<i64> {
 
 fn load_records_from_db(
     conn: &Connection,
+    db_path: &Path,
     source: Option<SourceKind>,
     limit: Option<usize>,
 ) -> Result<Vec<InvoiceRecord>> {
@@ -1084,6 +1163,9 @@ fn load_records_from_db(
         for row in rows {
             records.push(row?);
         }
+    }
+    if source.is_none() || matches!(source, Some(SourceKind::Saldeo)) {
+        let _ = apply_saldeo_record_overrides(&mut records, Some(db_path))?;
     }
     Ok(records)
 }
@@ -1268,7 +1350,7 @@ fn handle_db_command(path: &Path, command: DbCommands) -> Result<()> {
         ),
         DbCommands::Stats => write_json(&db_stats(&conn)?, None),
         DbCommands::List { source, limit } => {
-            let records = load_records_from_db(&conn, source, Some(limit))?;
+            let records = load_records_from_db(&conn, path, source, Some(limit))?;
             write_json(&records, None)
         }
         DbCommands::TriRuns { limit } => write_json(&list_tri_runs(&conn, limit)?, None),
@@ -3210,8 +3292,19 @@ fn default_mail_out_path(year: i32) -> PathBuf {
     PathBuf::from(format!("data/mail-all-pdf-{year}-pdfs"))
 }
 
+fn default_amazon_mail_out_path(year: i32) -> PathBuf {
+    PathBuf::from(format!("data/mail-amazon-{year}-pdfs"))
+}
+
 fn default_mail_candidates_path(year: i32) -> PathBuf {
     default_mail_out_path(year).join("candidates.jsonl")
+}
+
+fn amazon_gmail_query(year: i32) -> String {
+    format!(
+        "after:{year}/01/01 before:{}/01/01 (from:amazon.it OR from:amazon.es) has:attachment filename:pdf",
+        year + 1
+    )
 }
 
 fn default_saldeo_out_path(year: i32) -> PathBuf {
@@ -3313,14 +3406,13 @@ fn record_quality_score(record: &InvoiceRecord) -> usize {
 }
 
 fn apply_cached_mail_candidates(
-    year: i32,
+    path: &Path,
     candidates: &mut [InvoiceRecord],
 ) -> Result<HashSet<String>> {
-    let path = default_mail_candidates_path(year);
     if !path.exists() {
         return Ok(HashSet::new());
     }
-    let cached = load_records(SourceKind::Mail, &path)?;
+    let cached = load_records(SourceKind::Mail, path)?;
     let by_hash = cached
         .into_iter()
         .map(|record| (record.content_hash.clone(), record))

@@ -1,4 +1,5 @@
 use crate::*;
+use chrono::Datelike;
 
 pub(crate) fn interactive_tui(db_path: &Path) -> Result<()> {
     interactive_reconcile_actions(db_path)
@@ -7,7 +8,7 @@ pub(crate) fn interactive_tui(db_path: &Path) -> Result<()> {
 pub(crate) fn interactive_reconcile_actions(db_path: &Path) -> Result<()> {
     let mut year: i32 = 2026;
     let mut review_score: u8 = 70;
-    let mut rows = build_invoice_table_rows(year, review_score)?;
+    let mut rows = build_invoice_table_rows(year, review_score, db_path)?;
 
     loop {
         match run_invoice_table_tui(&mut rows, &mut year, &mut review_score, db_path)? {
@@ -21,8 +22,8 @@ pub(crate) fn interactive_reconcile_actions(db_path: &Path) -> Result<()> {
                 onboard(db_path, false, None)?;
             }
             TuiResult::Correct(record) => {
-                if edit_saldeo_record_override(&record)? {
-                    rows = build_invoice_table_rows(year, review_score)?;
+                if edit_saldeo_record_override(&record, db_path)? {
+                    rows = build_invoice_table_rows(year, review_score, db_path)?;
                 }
             }
         }
@@ -163,15 +164,15 @@ pub(crate) enum InvoiceTableAction {
 
 #[derive(Debug, Clone)]
 pub(crate) struct InvoiceTableRow {
-    selected: bool,
-    sources: String,
-    record: InvoiceRecord,
-    saldeo_record: Option<InvoiceRecord>,
-    upload_item: Option<SaldeoSyncItem>,
-    ksef_document_id: Option<i64>,
-    ksef_accounting: Option<bool>,
-    action: InvoiceTableAction,
-    updated: bool,
+    pub(crate) selected: bool,
+    pub(crate) sources: String,
+    pub(crate) record: InvoiceRecord,
+    pub(crate) saldeo_record: Option<InvoiceRecord>,
+    pub(crate) upload_item: Option<SaldeoSyncItem>,
+    pub(crate) ksef_document_id: Option<i64>,
+    pub(crate) ksef_accounting: Option<bool>,
+    pub(crate) action: InvoiceTableAction,
+    pub(crate) updated: bool,
 }
 
 impl InvoiceTableRow {
@@ -180,7 +181,10 @@ impl InvoiceTableRow {
     }
 
     fn needs_attention(&self) -> bool {
-        self.is_actionable() || self.sources.contains('-') || self.updated || self.sources.ends_with('*')
+        self.is_actionable()
+            || self.sources.contains('-')
+            || self.updated
+            || self.sources.ends_with('*')
     }
 
     fn can_upload(&self) -> bool {
@@ -195,13 +199,15 @@ impl InvoiceTableRow {
 pub(crate) fn build_invoice_table_rows(
     year: i32,
     review_score: u8,
+    db_path: &Path,
 ) -> Result<Vec<InvoiceTableRow>> {
-    build_invoice_table_rows_with_progress(year, review_score, None)
+    build_invoice_table_rows_with_progress(year, review_score, db_path, None)
 }
 
 pub(crate) fn build_invoice_table_rows_with_progress(
     year: i32,
     review_score: u8,
+    db_path: &Path,
     progress: Option<Arc<Mutex<String>>>,
 ) -> Result<Vec<InvoiceTableRow>> {
     if let Some(progress) = &progress {
@@ -210,21 +216,24 @@ pub(crate) fn build_invoice_table_rows_with_progress(
     let mail = default_mail_candidates_path(year);
     let ksef = configured_ksef_out_path(year);
     let saldeo = default_saldeo_records_path(year);
-    let mail_records = load_records(SourceKind::Mail, &mail)?;
+    let mail_records =
+        filter_invoice_records_for_year(load_records(SourceKind::Mail, &mail)?, year);
     if let Some(progress) = &progress {
         set_progress(
             progress,
             format!("Tabela: Gmail {} rekordów...", mail_records.len()),
         );
     }
-    let ksef_records = load_records(SourceKind::Ksef, &ksef)?;
+    let ksef_records =
+        filter_invoice_records_for_year(load_records(SourceKind::Ksef, &ksef)?, year);
     if let Some(progress) = &progress {
         set_progress(
             progress,
             format!("Tabela: KSeF {} rekordów...", ksef_records.len()),
         );
     }
-    let saldeo_records = load_saldeo_records(&saldeo)?;
+    let saldeo_records =
+        filter_invoice_records_for_year(load_saldeo_records(&saldeo, Some(db_path))?, year);
     if let Some(progress) = &progress {
         set_progress(
             progress,
@@ -286,8 +295,30 @@ pub(crate) fn build_invoice_table_rows_with_progress(
         .rows
         .iter()
         .filter_map(|row| invoice_table_row_from_reconcile_row(row, ksef_statuses.as_ref()))
+        .filter(|row| invoice_table_row_matches_year(row, year))
         .collect::<Vec<_>>();
     Ok(rows)
+}
+
+pub(crate) fn invoice_record_matches_year(record: &InvoiceRecord, year: i32) -> bool {
+    record
+        .issue_date
+        .or(record.sale_date)
+        .is_some_and(|date| date.year() == year)
+}
+
+pub(crate) fn filter_invoice_records_for_year(
+    records: Vec<InvoiceRecord>,
+    year: i32,
+) -> Vec<InvoiceRecord> {
+    records
+        .into_iter()
+        .filter(|record| invoice_record_matches_year(record, year))
+        .collect()
+}
+
+pub(crate) fn invoice_table_row_matches_year(row: &InvoiceTableRow, year: i32) -> bool {
+    invoice_record_matches_year(&row.record, year)
 }
 
 pub(crate) fn invoice_table_row_from_reconcile_row(
@@ -297,7 +328,10 @@ pub(crate) fn invoice_table_row_from_reconcile_row(
     let record = tri_row_display_record(row)?;
     let saldeo_record = row.saldeo.clone();
     let mut sources = row_source_mask(row);
-    if saldeo_record.as_ref().is_some_and(saldeo_record_has_override) {
+    if saldeo_record
+        .as_ref()
+        .is_some_and(saldeo_record_has_override)
+    {
         sources.push('*');
     }
     let upload_item = row.mail.as_ref().and_then(|mail| {
@@ -311,29 +345,32 @@ pub(crate) fn invoice_table_row_from_reconcile_row(
         let item = saldeo_sync_item_from_record(&row.status, mail, related_sources);
         item.can_upload.then_some(item)
     });
-    let (ksef_document_id, ksef_accounting) = row
-        .saldeo
-        .as_ref()
-        .filter(|record| {
-            record
-                .ksef_reference
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-        })
-        .and_then(saldeo_document_id)
-        .map(|document_id| {
-            let Some(ksef_statuses) = ksef_statuses else {
-                return (None, None);
-            };
-            let accounting = ksef_statuses.get(&document_id).copied().flatten();
-            let actionable_id = if accounting.is_none() {
-                Some(document_id)
-            } else {
-                None
-            };
-            (actionable_id, accounting)
-        })
-        .unwrap_or((None, None));
+    let (ksef_document_id, ksef_accounting) = if row.ksef.is_some() {
+        row.saldeo
+            .as_ref()
+            .filter(|record| {
+                record
+                    .ksef_reference
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+            })
+            .and_then(saldeo_document_id)
+            .map(|document_id| {
+                let Some(ksef_statuses) = ksef_statuses else {
+                    return (None, None);
+                };
+                let accounting = ksef_statuses.get(&document_id).copied().flatten();
+                let actionable_id = if accounting.is_none() {
+                    Some(document_id)
+                } else {
+                    None
+                };
+                (actionable_id, accounting)
+            })
+            .unwrap_or((None, None))
+    } else {
+        (None, None)
+    };
     Some(InvoiceTableRow {
         selected: false,
         sources,
@@ -516,6 +553,7 @@ pub(crate) fn begin_invoice_table_commit(
     rows: &[InvoiceTableRow],
     year: i32,
     review_score: u8,
+    db_path: PathBuf,
 ) -> PendingActionStart {
     let (upload_items, approve_ids, reject_ids) = collect_invoice_table_actions(rows);
     if upload_items.is_empty() && approve_ids.is_empty() && reject_ids.is_empty() {
@@ -539,8 +577,13 @@ pub(crate) fn begin_invoice_table_commit(
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         redirect_stderr_to_log();
-        let result =
-            execute_invoice_table_actions(year, review_score, rows_snapshot, progress_clone);
+        let result = execute_invoice_table_actions(
+            year,
+            review_score,
+            rows_snapshot,
+            progress_clone,
+            db_path,
+        );
         let _ = tx.send(result);
     });
 
@@ -554,11 +597,74 @@ pub(crate) fn begin_invoice_table_commit(
     })
 }
 
+pub(crate) fn begin_invoice_table_refresh(
+    year: i32,
+    review_score: u8,
+    db_path: PathBuf,
+    description: String,
+) -> PendingAction {
+    let progress = Arc::new(Mutex::new(format!(
+        "{}: przygotowanie pełnego sync...",
+        description
+    )));
+    let progress_clone = progress.clone();
+    let description_clone = description.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        redirect_stderr_to_log();
+        let result = (|| -> Result<Vec<InvoiceTableRow>> {
+            set_progress(
+                &progress_clone,
+                format!(
+                    "{}: start dla roku {year} (KSeF + Gmail/PDF + Saldeo)...",
+                    description_clone
+                ),
+            );
+            let conn = open_db(&db_path)?;
+            run_sync_sources_with_progress(
+                year,
+                false,
+                false,
+                false,
+                false,
+                None,
+                None,
+                None,
+                DEFAULT_PRODUCTMESH_NIP,
+                Some(&db_path),
+                Some(&conn),
+                Some(progress_clone.clone()),
+            )?;
+            set_progress(
+                &progress_clone,
+                format!("{}: budowanie tabeli...", description_clone),
+            );
+            build_invoice_table_rows_with_progress(
+                year,
+                review_score,
+                &db_path,
+                Some(progress_clone.clone()),
+            )
+        })();
+        let _ = tx.send(result);
+    });
+
+    PendingAction {
+        receiver: rx,
+        description,
+        new_year: Some(year),
+        new_review_score: Some(review_score),
+        progress,
+        record_updates: None,
+    }
+}
+
 pub(crate) fn execute_invoice_table_actions(
     year: i32,
     review_score: u8,
     rows: Vec<InvoiceTableRow>,
     progress: Arc<Mutex<String>>,
+    db_path: PathBuf,
 ) -> Result<Vec<InvoiceTableRow>> {
     let (selected_upload_items, selected_approve_ids, selected_reject_ids) =
         collect_invoice_table_actions(&rows);
@@ -642,10 +748,11 @@ pub(crate) fn execute_invoice_table_actions(
         year,
         &storage_state,
         &default_saldeo_out_path(year),
+        Some(&db_path),
         Some(progress.clone()),
     )?;
     set_progress(&progress, "Akceptuj: przebudowuję tabelę...");
-    build_invoice_table_rows_with_progress(year, review_score, Some(progress.clone()))
+    build_invoice_table_rows_with_progress(year, review_score, &db_path, Some(progress.clone()))
 }
 
 /// Redirect stderr to a log file for the current thread.
@@ -663,6 +770,16 @@ pub(crate) fn redirect_stderr_to_log() {
             libc::close(fd);
         }
     }
+}
+
+pub(crate) fn wrap_menu_selection(current: usize, delta: isize, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let count_usize = count;
+    let count = count_usize as isize;
+    let current = (current % count_usize) as isize;
+    (current + delta).rem_euclid(count) as usize
 }
 
 pub(crate) fn run_invoice_table_tui(
@@ -705,6 +822,12 @@ pub(crate) fn run_invoice_table_tui(
     const SM_SALDEO: usize = 4;
     const SM_BACK: usize = 5;
     const SUB_COUNT: usize = 6;
+
+    let selected_saldeo_record =
+        |rows: &Vec<InvoiceTableRow>, visible: &[usize], table_sel: usize| {
+            let row_idx = *visible.get(table_sel)?;
+            rows.get(row_idx)?.saldeo_record.clone()
+        };
 
     let tick_rate = std::time::Duration::from_millis(100);
     let mut last_tick = std::time::Instant::now();
@@ -1051,7 +1174,8 @@ pub(crate) fn run_invoice_table_tui(
                 visible.len(),
                 rows.len()
             );
-            let help = "f=braki/zmiany  e=popraw  spc=toggle  ⏎=select  ⌘c=commit  q=wyjdź".to_string();
+            let help =
+                "f=braki/zmiany  e=popraw  spc=toggle  ⏎=select  ⌘c=commit  q=wyjdź".to_string();
             let stats_span = ratatui::text::Span::styled(
                 stats_text,
                 theme.muted().add_modifier(Modifier::ITALIC),
@@ -1112,31 +1236,18 @@ pub(crate) fn run_invoice_table_tui(
                         if let Some(val) = editing_year.take() {
                             if let Ok(y) = val.parse::<i32>() {
                                 let score = *review_score;
-                                let (tx, rx) = std::sync::mpsc::channel();
-                                let progress =
-                                    Arc::new(Mutex::new(format!("Przebudowa (rok {y})...")));
-                                let progress_clone = progress.clone();
-                                std::thread::spawn(move || {
-                                    redirect_stderr_to_log();
-                                    let _ = tx.send(build_invoice_table_rows_with_progress(
-                                        y,
-                                        score,
-                                        Some(progress_clone),
-                                    ));
-                                });
-                                pending_action = Some(PendingAction {
-                                    receiver: rx,
-                                    description: "Rebuild".to_string(),
-                                    new_year: Some(y),
-                                    new_review_score: Some(score),
-                                    progress,
-                                    record_updates: None,
-                                });
+                                pending_action = Some(begin_invoice_table_refresh(
+                                    y,
+                                    score,
+                                    db_path.to_path_buf(),
+                                    "Sync".to_string(),
+                                ));
                             }
                         } else if let Some(val) = editing_threshold.take()
                             && let Ok(t) = val.parse::<u8>()
                         {
                             let y = *year;
+                            let db = db_path.to_path_buf();
                             let (tx, rx) = std::sync::mpsc::channel();
                             let progress =
                                 Arc::new(Mutex::new(format!("Przebudowa (próg {t})...")));
@@ -1146,6 +1257,7 @@ pub(crate) fn run_invoice_table_tui(
                                 let _ = tx.send(build_invoice_table_rows_with_progress(
                                     y,
                                     t,
+                                    &db,
                                     Some(progress_clone),
                                 ));
                             });
@@ -1176,6 +1288,16 @@ pub(crate) fn run_invoice_table_tui(
 
             match key.code {
                 KeyCode::Char('q') => break,
+                KeyCode::Char('e') if !menu_open => {
+                    if pending_action.is_some() {
+                        status_message = "Trwa operacja — poczekaj na zakończenie".to_string();
+                    } else if let Some(record) = selected_saldeo_record(rows, &visible, table_sel) {
+                        loop_result = Ok(TuiResult::Correct(record));
+                        break;
+                    } else {
+                        status_message = "Popraw: wybrany wiersz nie ma rekordu Saldeo".to_string();
+                    }
+                }
                 KeyCode::Esc => {
                     if menu_open {
                         menu_open = false;
@@ -1187,7 +1309,12 @@ pub(crate) fn run_invoice_table_tui(
                     if pending_action.is_some() {
                         status_message = "Trwa operacja — poczekaj na zakończenie".to_string();
                     } else {
-                        match begin_invoice_table_commit(rows, *year, *review_score) {
+                        match begin_invoice_table_commit(
+                            rows,
+                            *year,
+                            *review_score,
+                            db_path.to_path_buf(),
+                        ) {
                             PendingActionStart::Started(action) => pending_action = Some(action),
                             PendingActionStart::Noop(message) => status_message = message,
                         }
@@ -1197,7 +1324,12 @@ pub(crate) fn run_invoice_table_tui(
                     if pending_action.is_some() {
                         status_message = "Trwa operacja — poczekaj na zakończenie".to_string();
                     } else {
-                        match begin_invoice_table_commit(rows, *year, *review_score) {
+                        match begin_invoice_table_commit(
+                            rows,
+                            *year,
+                            *review_score,
+                            db_path.to_path_buf(),
+                        ) {
                             PendingActionStart::Started(action) => pending_action = Some(action),
                             PendingActionStart::Noop(message) => status_message = message,
                         }
@@ -1253,6 +1385,7 @@ pub(crate) fn run_invoice_table_tui(
                                         build_invoice_table_rows_with_progress(
                                             y,
                                             score,
+                                            &db,
                                             Some(progress_clone.clone()),
                                         )
                                     })();
@@ -1278,51 +1411,12 @@ pub(crate) fn run_invoice_table_tui(
                             MI_SYNC => {
                                 let y = *year;
                                 let score = *review_score;
-                                let db = db_path.to_path_buf();
-                                let (tx, rx) = std::sync::mpsc::channel();
-                                let progress = Arc::new(Mutex::new(format!(
-                                    "Pełny sync dla roku {y} (KSeF + Gmail/PDF + Saldeo)..."
-                                )));
-                                let progress_clone = progress.clone();
-                                std::thread::spawn(move || {
-                                    redirect_stderr_to_log();
-                                    let result = (|| -> Result<Vec<InvoiceTableRow>> {
-                                        set_progress(
-                                            &progress_clone,
-                                            format!(
-                                                "Sync: start dla roku {y} (KSeF → Gmail/PDF → Saldeo)..."
-                                            ),
-                                        );
-                                        let conn = open_db(&db)?;
-                                        run_sync_sources_with_progress(
-                                            y,
-                                            false,
-                                            false,
-                                            false,
-                                            None,
-                                            None,
-                                            None,
-                                            DEFAULT_PRODUCTMESH_NIP,
-                                            Some(&conn),
-                                            Some(progress_clone.clone()),
-                                        )?;
-                                        set_progress(&progress_clone, "Sync: budowanie tabeli...");
-                                        build_invoice_table_rows_with_progress(
-                                            y,
-                                            score,
-                                            Some(progress_clone.clone()),
-                                        )
-                                    })();
-                                    let _ = tx.send(result);
-                                });
-                                pending_action = Some(PendingAction {
-                                    receiver: rx,
-                                    description: "Sync".to_string(),
-                                    new_year: Some(y),
-                                    new_review_score: Some(score),
-                                    progress,
-                                    record_updates: None,
-                                });
+                                pending_action = Some(begin_invoice_table_refresh(
+                                    y,
+                                    score,
+                                    db_path.to_path_buf(),
+                                    "Sync".to_string(),
+                                ));
                             }
                             MI_RECONCILE => {
                                 let y = *year;
@@ -1354,6 +1448,7 @@ pub(crate) fn run_invoice_table_tui(
                                         build_invoice_table_rows_with_progress(
                                             y,
                                             t,
+                                            &db,
                                             Some(progress_clone.clone()),
                                         )
                                     })();
@@ -1474,7 +1569,7 @@ pub(crate) fn run_invoice_table_tui(
                                                 }
                                             } else {
                                                 let cached = apply_cached_mail_candidates(
-                                                    y,
+                                                    &default_mail_candidates_path(y),
                                                     &mut candidates,
                                                 )?;
                                                 *progress_clone.lock().unwrap() =
@@ -1516,6 +1611,7 @@ pub(crate) fn run_invoice_table_tui(
                                         build_invoice_table_rows_with_progress(
                                             y,
                                             score,
+                                            &db,
                                             Some(progress_clone.clone()),
                                         )
                                     })();
@@ -1598,11 +1694,27 @@ pub(crate) fn run_invoice_table_tui(
                                 }
                             }
                             MI_COMMIT => {
-                                match begin_invoice_table_commit(rows, *year, *review_score) {
+                                match begin_invoice_table_commit(
+                                    rows,
+                                    *year,
+                                    *review_score,
+                                    db_path.to_path_buf(),
+                                ) {
                                     PendingActionStart::Started(action) => {
                                         pending_action = Some(action)
                                     }
                                     PendingActionStart::Noop(message) => status_message = message,
+                                }
+                            }
+                            MI_EDIT => {
+                                if let Some(record) =
+                                    selected_saldeo_record(rows, &visible, table_sel)
+                                {
+                                    loop_result = Ok(TuiResult::Correct(record));
+                                    break;
+                                } else {
+                                    status_message =
+                                        "Popraw: wybrany wiersz nie ma rekordu Saldeo".to_string();
                                 }
                             }
                             MI_MENU => {
@@ -1635,10 +1747,11 @@ pub(crate) fn run_invoice_table_tui(
                 }
                 KeyCode::Right => {
                     let max = if menu_open { SUB_COUNT } else { MAIN_COUNT };
-                    menu_sel = (menu_sel + 1).min(max.saturating_sub(1));
+                    menu_sel = wrap_menu_selection(menu_sel, 1, max);
                 }
                 KeyCode::Left => {
-                    menu_sel = menu_sel.saturating_sub(1);
+                    let max = if menu_open { SUB_COUNT } else { MAIN_COUNT };
+                    menu_sel = wrap_menu_selection(menu_sel, -1, max);
                 }
                 KeyCode::Home => {
                     table_sel = 0;

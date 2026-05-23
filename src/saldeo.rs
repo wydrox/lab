@@ -7,6 +7,7 @@ pub(crate) struct SaldeoSyncPlanConfig<'a> {
     pub(crate) mail: Option<&'a Path>,
     pub(crate) ksef: Option<&'a Path>,
     pub(crate) saldeo: Option<&'a Path>,
+    pub(crate) db_path: Option<&'a Path>,
     pub(crate) review_score: u8,
     pub(crate) confirm: bool,
     pub(crate) upload_url: Option<String>,
@@ -31,7 +32,7 @@ pub(crate) fn saldeo_sync_plan(config: SaldeoSyncPlanConfig<'_>) -> Result<Salde
         tri_reconcile(
             load_records(SourceKind::Mail, &mail)?,
             load_records(SourceKind::Ksef, &ksef)?,
-            load_saldeo_records(&saldeo)?,
+            load_saldeo_records(&saldeo, config.db_path)?,
             config.review_score,
         )
     };
@@ -446,12 +447,49 @@ pub(crate) fn default_saldeo_record_overrides_path() -> PathBuf {
         .join("saldeo-overrides.json")
 }
 
-fn load_saldeo_record_overrides() -> Result<HashMap<String, SaldeoRecordOverride>> {
+fn saldeo_record_override_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<SaldeoRecordOverride> {
+    let issue_date_text: Option<String> = row.get(6)?;
+    Ok(SaldeoRecordOverride {
+        content_hash: row.get(0)?,
+        invoice_number: row.get(1)?,
+        seller_tax_id: row.get(2)?,
+        buyer_tax_id: row.get(3)?,
+        seller_name: row.get(4)?,
+        buyer_name: row.get(5)?,
+        issue_date: issue_date_text.as_deref().and_then(parse_date),
+        gross_amount_minor: row.get(7)?,
+        currency: row.get(8)?,
+    })
+}
+
+fn import_legacy_saldeo_record_overrides(conn: &Connection) -> Result<usize> {
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM saldeo_overrides", [], |row| {
+        row.get(0)
+    })?;
+    if count > 0 {
+        return Ok(0);
+    }
+    let legacy = load_saldeo_record_overrides_from_file()?;
+    if legacy.is_empty() {
+        return Ok(0);
+    }
+    for override_row in legacy.values() {
+        upsert_saldeo_record_override(conn, override_row)?;
+    }
+    Ok(legacy.len())
+}
+
+fn load_saldeo_record_overrides_from_file() -> Result<HashMap<String, SaldeoRecordOverride>> {
     let path = default_saldeo_record_overrides_path();
     if !path.is_file() {
         return Ok(HashMap::new());
     }
     let text = fs::read_to_string(&path).with_context(|| format!("odczyt {}", path.display()))?;
+    if text.trim().is_empty() {
+        return Ok(HashMap::new());
+    }
     let overrides = serde_json::from_str::<Vec<SaldeoRecordOverride>>(&text)
         .with_context(|| format!("niepoprawny override Saldeo {}", path.display()))?;
     Ok(overrides
@@ -460,15 +498,83 @@ fn load_saldeo_record_overrides() -> Result<HashMap<String, SaldeoRecordOverride
         .collect())
 }
 
-fn save_saldeo_record_overrides(overrides: &HashMap<String, SaldeoRecordOverride>) -> Result<()> {
-    let path = default_saldeo_record_overrides_path();
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+fn load_saldeo_record_overrides_from_db(
+    conn: &Connection,
+) -> Result<HashMap<String, SaldeoRecordOverride>> {
+    let _ = import_legacy_saldeo_record_overrides(conn)?;
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT content_hash, invoice_number, seller_tax_id, buyer_tax_id, seller_name, buyer_name,
+               issue_date, gross_amount_minor, currency
+        FROM saldeo_overrides ORDER BY updated_at DESC, content_hash ASC
+        "#,
+    )?;
+    let rows = stmt.query_map([], saldeo_record_override_from_row)?;
+    let mut overrides = HashMap::new();
+    for row in rows {
+        let override_row = row?;
+        overrides.insert(override_row.content_hash.clone(), override_row);
     }
-    let mut rows = overrides.values().cloned().collect::<Vec<_>>();
-    rows.sort_by(|a, b| a.content_hash.cmp(&b.content_hash));
-    fs::write(&path, serde_json::to_vec_pretty(&rows)?)
-        .with_context(|| format!("zapis {}", path.display()))
+    Ok(overrides)
+}
+
+pub(crate) fn load_saldeo_record_overrides(
+    db_path: Option<&Path>,
+) -> Result<HashMap<String, SaldeoRecordOverride>> {
+    match db_path {
+        Some(path) => {
+            let conn = open_db(path)?;
+            load_saldeo_record_overrides_from_db(&conn)
+        }
+        None => load_saldeo_record_overrides_from_file(),
+    }
+}
+
+fn upsert_saldeo_record_override(
+    conn: &Connection,
+    override_row: &SaldeoRecordOverride,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        r#"
+        INSERT INTO saldeo_overrides (
+            content_hash, invoice_number, seller_tax_id, buyer_tax_id, seller_name,
+            buyer_name, issue_date, gross_amount_minor, currency, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+        ON CONFLICT(content_hash) DO UPDATE SET
+            invoice_number = excluded.invoice_number,
+            seller_tax_id = excluded.seller_tax_id,
+            buyer_tax_id = excluded.buyer_tax_id,
+            seller_name = excluded.seller_name,
+            buyer_name = excluded.buyer_name,
+            issue_date = excluded.issue_date,
+            gross_amount_minor = excluded.gross_amount_minor,
+            currency = excluded.currency,
+            updated_at = excluded.updated_at
+        "#,
+        params![
+            override_row.content_hash,
+            override_row.invoice_number,
+            override_row.seller_tax_id,
+            override_row.buyer_tax_id,
+            override_row.seller_name,
+            override_row.buyer_name,
+            override_row.issue_date.map(|d| d.to_string()),
+            override_row.gross_amount_minor,
+            override_row.currency,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn save_saldeo_record_override(
+    db_path: &Path,
+    override_row: &SaldeoRecordOverride,
+) -> Result<()> {
+    let conn = open_db(db_path)?;
+    let _ = import_legacy_saldeo_record_overrides(&conn)?;
+    upsert_saldeo_record_override(&conn, override_row)
 }
 
 pub(crate) fn saldeo_record_has_override(record: &InvoiceRecord) -> bool {
@@ -479,25 +585,42 @@ pub(crate) fn saldeo_record_has_override(record: &InvoiceRecord) -> bool {
             .any(|warning| warning.starts_with(SALDEO_OVERRIDE_WARNING_PREFIX))
 }
 
-pub(crate) fn apply_saldeo_record_overrides(records: &mut [InvoiceRecord]) -> Result<usize> {
-    let overrides = load_saldeo_record_overrides()?;
+pub(crate) fn apply_saldeo_record_overrides(
+    records: &mut [InvoiceRecord],
+    db_path: Option<&Path>,
+) -> Result<usize> {
+    let overrides = load_saldeo_record_overrides(db_path)?;
     let mut applied = 0usize;
     for record in records.iter_mut() {
         if record.source != SourceKind::Saldeo {
             continue;
         }
-        if let Some(override_row) = overrides.get(&record.content_hash) {
-            apply_saldeo_record_override(record, override_row);
+        if let Some(override_row) = overrides.get(&record.content_hash)
+            && apply_saldeo_record_override(record, override_row)
+        {
             applied += 1;
         }
     }
     Ok(applied)
 }
 
-fn apply_saldeo_record_override(
+pub(crate) fn apply_saldeo_record_override(
     record: &mut InvoiceRecord,
     override_row: &SaldeoRecordOverride,
 ) -> bool {
+    if saldeo_record_has_override(record)
+        && record.invoice_number == override_row.invoice_number
+        && record.seller_tax_id == override_row.seller_tax_id
+        && record.buyer_tax_id == override_row.buyer_tax_id
+        && record.seller_name == override_row.seller_name
+        && record.buyer_name == override_row.buyer_name
+        && record.issue_date == override_row.issue_date
+        && record.gross_amount_minor == override_row.gross_amount_minor
+        && record.currency == override_row.currency
+    {
+        return false;
+    }
+
     let mut changed_fields = Vec::new();
     macro_rules! set_field {
         ($field:ident, $name:literal) => {
@@ -533,7 +656,7 @@ fn apply_saldeo_record_override(
     true
 }
 
-pub(crate) fn edit_saldeo_record_override(record: &InvoiceRecord) -> Result<bool> {
+pub(crate) fn edit_saldeo_record_override(record: &InvoiceRecord, db_path: &Path) -> Result<bool> {
     if record.source != SourceKind::Saldeo {
         return Err(anyhow!("poprawa działa tylko dla rekordów Saldeo"));
     }
@@ -552,21 +675,18 @@ pub(crate) fn edit_saldeo_record_override(record: &InvoiceRecord) -> Result<bool
             .unwrap_or("-")
     );
 
-    let invoice_number = prompt_string_value(
-        "Numer faktury",
-        record.invoice_number.as_deref(),
-        clean_invoice_number,
-    )?;
+    let invoice_number =
+        prompt_string_value("Numer faktury", record.invoice_number.as_deref(), |value| {
+            Some(clean_invoice_number(value))
+        })?;
     let seller_name = prompt_string_value(
         "Sprzedawca / kontrahent",
         record.seller_name.as_deref(),
         |value| Some(clean_name(value).unwrap_or_else(|| value.trim().to_string())),
     )?;
-    let buyer_name = prompt_string_value(
-        "Nabywca",
-        record.buyer_name.as_deref(),
-        |value| Some(clean_name(value).unwrap_or_else(|| value.trim().to_string())),
-    )?;
+    let buyer_name = prompt_string_value("Nabywca", record.buyer_name.as_deref(), |value| {
+        Some(clean_name(value).unwrap_or_else(|| value.trim().to_string()))
+    })?;
     let seller_tax_id = prompt_string_value(
         "NIP sprzedawcy",
         record.seller_tax_id.as_deref(),
@@ -589,11 +709,7 @@ pub(crate) fn edit_saldeo_record_override(record: &InvoiceRecord) -> Result<bool
         |amount| format_minor_money(*amount),
         parse_money_minor,
     )?;
-    let currency = prompt_string_value(
-        "Waluta",
-        record.currency.as_deref(),
-        normalize_currency,
-    )?;
+    let currency = prompt_string_value("Waluta", record.currency.as_deref(), normalize_currency)?;
 
     let override_row = SaldeoRecordOverride {
         content_hash: record.content_hash.clone(),
@@ -607,16 +723,29 @@ pub(crate) fn edit_saldeo_record_override(record: &InvoiceRecord) -> Result<bool
         currency,
     };
 
-    let mut overrides = load_saldeo_record_overrides()?;
+    let overrides = load_saldeo_record_overrides(Some(db_path))?;
     if overrides.get(&override_row.content_hash) == Some(&override_row) {
+        eprintln!("⏭ Bez zmian.\n");
+        return Ok(false);
+    }
+    if overrides.get(&override_row.content_hash).is_none()
+        && override_row.invoice_number == record.invoice_number
+        && override_row.seller_tax_id == record.seller_tax_id
+        && override_row.buyer_tax_id == record.buyer_tax_id
+        && override_row.seller_name == record.seller_name
+        && override_row.buyer_name == record.buyer_name
+        && override_row.issue_date == record.issue_date
+        && override_row.gross_amount_minor == record.gross_amount_minor
+        && override_row.currency == record.currency
+    {
         eprintln!("⏭ Bez zmian.\n");
         return Ok(false);
     }
 
     let confirm = Confirm::new()
         .with_prompt(format!(
-            "Zapisać poprawki do {}?",
-            default_saldeo_record_overrides_path().display()
+            "Zapisać poprawki do SQLite: {}?",
+            db_path.display()
         ))
         .default(true)
         .interact()?;
@@ -625,11 +754,10 @@ pub(crate) fn edit_saldeo_record_override(record: &InvoiceRecord) -> Result<bool
         return Ok(false);
     }
 
-    overrides.insert(override_row.content_hash.clone(), override_row);
-    save_saldeo_record_overrides(&overrides)?;
+    save_saldeo_record_override(db_path, &override_row)?;
     eprintln!(
-        "✓ Zapisano poprawki Saldeo: {}\n",
-        default_saldeo_record_overrides_path().display()
+        "✓ Zapisano poprawki Saldeo w SQLite: {}\n",
+        db_path.display()
     );
     Ok(true)
 }
@@ -673,7 +801,9 @@ where
     F: Fn(&str) -> Option<T>,
     G: Fn(&T) -> String,
 {
-    let current_text = current.map(&format_current).unwrap_or_else(|| "-".to_string());
+    let current_text = current
+        .map(|value| format_current(value))
+        .unwrap_or_else(|| "-".to_string());
     loop {
         let input = Input::<String>::new()
             .with_prompt(format!(
@@ -701,14 +831,16 @@ pub(crate) fn saldeo_fetch(
     year: i32,
     storage_state: &Path,
     out_dir: &Path,
+    db_path: Option<&Path>,
 ) -> Result<SaldeoFetchResult> {
-    saldeo_fetch_with_progress(year, storage_state, out_dir, None)
+    saldeo_fetch_with_progress(year, storage_state, out_dir, db_path, None)
 }
 
 pub(crate) fn saldeo_fetch_with_progress(
     year: i32,
     storage_state: &Path,
     out_dir: &Path,
+    _db_path: Option<&Path>,
     progress: Option<Arc<Mutex<String>>>,
 ) -> Result<SaldeoFetchResult> {
     if let Some(progress) = &progress {
@@ -855,10 +987,6 @@ pub(crate) fn saldeo_fetch_with_progress(
         &mut records,
         progress.clone(),
     )?;
-    let overridden_count = apply_saldeo_record_overrides(&mut records)?;
-    if overridden_count > 0 {
-        eprintln!("  [Saldeo] zastosowano lokalne poprawki: {overridden_count} rekordów");
-    }
     if let Some(progress) = &progress {
         set_progress(
             progress,
@@ -887,12 +1015,15 @@ pub(crate) fn saldeo_fetch_with_progress(
     })
 }
 
-pub(crate) fn load_saldeo_records(input: &Path) -> Result<Vec<InvoiceRecord>> {
+pub(crate) fn load_saldeo_records(
+    input: &Path,
+    db_path: Option<&Path>,
+) -> Result<Vec<InvoiceRecord>> {
     let mut records = if input.extension().and_then(|e| e.to_str()) == Some("jsonl") {
         load_records(SourceKind::Saldeo, input)?
     } else {
-        let text =
-            fs::read_to_string(input).with_context(|| format!("odczyt Saldeo {}", input.display()))?;
+        let text = fs::read_to_string(input)
+            .with_context(|| format!("odczyt Saldeo {}", input.display()))?;
         if let Ok(mut records) = serde_json::from_str::<Vec<InvoiceRecord>>(&text) {
             for record in &mut records {
                 record.source = SourceKind::Saldeo;
@@ -900,13 +1031,13 @@ pub(crate) fn load_saldeo_records(input: &Path) -> Result<Vec<InvoiceRecord>> {
             records
         } else {
             let value: Value = serde_json::from_str(&text)?;
-            let docs = value
-                .as_array()
-                .ok_or_else(|| anyhow!("Saldeo input musi być tablicą documents albo InvoiceRecord[]"))?;
+            let docs = value.as_array().ok_or_else(|| {
+                anyhow!("Saldeo input musi być tablicą documents albo InvoiceRecord[]")
+            })?;
             saldeo_documents_to_records(docs)
         }
     };
-    let overridden_count = apply_saldeo_record_overrides(&mut records)?;
+    let overridden_count = apply_saldeo_record_overrides(&mut records, db_path)?;
     if overridden_count > 0 {
         eprintln!("  [Saldeo] zastosowano lokalne poprawki: {overridden_count} rekordów");
     }
@@ -1001,9 +1132,7 @@ pub(crate) fn saldeo_enrich_records_from_downloads_with_progress(
             let Some(record_idx) = by_hash.get(&key).copied() else {
                 return false;
             };
-            !(record_has_counterparty(&records[record_idx])
-                && records[record_idx].issue_date.is_some()
-                && records[record_idx].gross_amount_minor.is_some())
+            saldeo_record_needs_document_fallback(&records[record_idx])
                 && json_string(doc, "downloadUrl").is_some()
         })
         .count();
@@ -1017,10 +1146,7 @@ pub(crate) fn saldeo_enrich_records_from_downloads_with_progress(
         let Some(record_idx) = by_hash.get(&key).copied() else {
             continue;
         };
-        if record_has_counterparty(&records[record_idx])
-            && records[record_idx].issue_date.is_some()
-            && records[record_idx].gross_amount_minor.is_some()
-        {
+        if !saldeo_record_needs_document_fallback(&records[record_idx]) {
             continue;
         }
         let Some(download_url) = json_string(doc, "downloadUrl") else {
@@ -1114,11 +1240,95 @@ pub(crate) fn saldeo_download_document(
 }
 
 pub(crate) fn record_has_counterparty(record: &InvoiceRecord) -> bool {
+    let seller = record.seller_name.as_deref();
+    let buyer = record.buyer_name.as_deref();
+    let seller_useful = seller.is_some_and(counterparty_name_is_useful);
+    let buyer_useful = buyer.is_some_and(counterparty_name_is_useful);
+    let seller_suspicious = seller.is_some_and(|value| !counterparty_name_is_useful(value));
+    let buyer_suspicious = buyer.is_some_and(|value| !counterparty_name_is_useful(value));
+    (seller_useful || buyer_useful) && !seller_suspicious && !buyer_suspicious
+}
+
+fn counterparty_name_is_useful(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().count() < 3
+        || !trimmed.chars().any(|c| c.is_alphabetic())
+    {
+        return false;
+    }
+    let normalized = trimmed
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect::<String>();
+    !matches!(
+        normalized.as_str(),
+        "nabywca"
+            | "buyer"
+            | "sprzedawca"
+            | "seller"
+            | "kontrahent"
+            | "contractor"
+            | "customer"
+            | "klient"
+            | "odbiorca"
+            | "supplier"
+            | "vendor"
+            | "wystawca"
+            | "dostawca"
+    )
+}
+
+fn replace_counterparty_name(target: &mut Option<String>, source: &Option<String>) -> bool {
+    let should_replace = target
+        .as_deref()
+        .map(|value| !counterparty_name_is_useful(value))
+        .unwrap_or(true);
+    if !should_replace {
+        return false;
+    }
+    let Some(value) = source
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| counterparty_name_is_useful(v))
+    else {
+        return false;
+    };
+    let value = value.to_string();
+    if target.as_ref() != Some(&value) {
+        *target = Some(value);
+        return true;
+    }
+    false
+}
+
+fn replace_tax_id(target: &mut Option<String>, source: &Option<String>) -> bool {
+    let should_replace = target
+        .as_deref()
+        .map(|value| normalize_tax_id(value).is_none())
+        .unwrap_or(true);
+    if !should_replace {
+        return false;
+    }
+    let Some(value) = source.as_deref().and_then(normalize_tax_id) else {
+        return false;
+    };
+    if target.as_ref() != Some(&value) {
+        *target = Some(value);
+        return true;
+    }
+    false
+}
+
+fn saldeo_record_needs_document_fallback(record: &InvoiceRecord) -> bool {
     record
-        .seller_name
-        .as_ref()
-        .or(record.buyer_name.as_ref())
-        .is_some_and(|name| !name.trim().is_empty())
+        .invoice_number
+        .as_deref()
+        .is_none_or(looks_like_filename_invoice_number)
+        || record.issue_date.is_none()
+        || record.gross_amount_minor.is_none()
+        || !record_has_counterparty(record)
 }
 
 pub(crate) fn merge_missing_invoice_metadata(
@@ -1159,10 +1369,18 @@ pub(crate) fn merge_missing_invoice_metadata(
             }
         }
     }
-    fill_clone!(seller_tax_id);
-    fill_clone!(buyer_tax_id);
-    fill_clone!(seller_name);
-    fill_clone!(buyer_name);
+    if replace_tax_id(&mut target.seller_tax_id, &source.seller_tax_id) {
+        changed = true;
+    }
+    if replace_tax_id(&mut target.buyer_tax_id, &source.buyer_tax_id) {
+        changed = true;
+    }
+    if replace_counterparty_name(&mut target.seller_name, &source.seller_name) {
+        changed = true;
+    }
+    if replace_counterparty_name(&mut target.buyer_name, &source.buyer_name) {
+        changed = true;
+    }
     fill_copy!(issue_date);
     fill_copy!(sale_date);
     fill_copy!(due_date);

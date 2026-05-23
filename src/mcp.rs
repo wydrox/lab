@@ -127,6 +127,7 @@ pub(crate) fn mcp_tools() -> Value {
             "inputSchema": {"type":"object","properties":{
                 "ksef":{"type":"boolean","description":"Sync only KSeF"},
                 "mail":{"type":"boolean","description":"Sync only Gmail/PDF (fetch attachments, parse, filter, store)"},
+                "amazon_mail":{"type":"boolean","description":"Sync only Amazon.it / Amazon.es mail via Gmail search preset"},
                 "saldeo":{"type":"boolean","description":"Sync only Saldeo"},
                 "year":{"type":"integer","default":2026},
                 "ksef_input":{"type":"string","description":"Path to KSeF export directory/file"},
@@ -202,11 +203,13 @@ pub(crate) fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<
                 year,
                 json_bool(args, "ksef", false),
                 json_bool(args, "mail", false),
+                json_bool(args, "amazon_mail", false),
                 json_bool(args, "saldeo", false),
                 json_path_arg(args, "ksef_input").as_deref(),
                 json_path_arg(args, "gmail_client_secret").as_deref(),
                 json_path_arg(args, "gmail_token_file").as_deref(),
                 &nip,
+                Some(db_path),
                 conn.as_ref(),
             )?;
             Ok(serde_json::to_value(summary)?)
@@ -223,7 +226,7 @@ pub(crate) fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<
             let report = tri_reconcile(
                 load_records(SourceKind::Mail, &mail)?,
                 load_records(SourceKind::Ksef, &ksef)?,
-                load_saldeo_records(&saldeo)?,
+                load_saldeo_records(&saldeo, Some(db_path))?,
                 json_u8(args, "review_score", 45),
             );
             if json_bool(args, "store", false) {
@@ -251,6 +254,7 @@ pub(crate) fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<
                 mail: mail.as_deref(),
                 ksef: ksef.as_deref(),
                 saldeo: saldeo.as_deref(),
+                db_path: Some(db_path),
                 review_score: json_u8(args, "review_score", 70),
                 confirm: true,
                 upload_url: None,

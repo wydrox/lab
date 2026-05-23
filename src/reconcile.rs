@@ -455,11 +455,7 @@ pub(crate) fn row_sources(row: &TriRow) -> String {
     .filter_map(|(label, present)| present.then_some(label))
     .collect::<Vec<_>>()
     .join("+");
-    if row
-        .saldeo
-        .as_ref()
-        .is_some_and(saldeo_record_has_override)
-    {
+    if row.saldeo.as_ref().is_some_and(saldeo_record_has_override) {
         sources.push('*');
     }
     sources
