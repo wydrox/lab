@@ -81,6 +81,14 @@ fn parses_text_invoice() {
 }
 
 #[test]
+fn ksef_pdf_reads_invoice_number_after_numer_faktury_label() {
+    let text = "Krajowy System e-Faktur\nNumer Faktury:\n\n2026/01/1\nFaktura podstawowa\nNumer KSeF:5242920020-20260904-7B4DFEC00001-B8\nNazwa: Olga Borovska";
+    let record = parse_text_invoice(SourceKind::Mail, text);
+    assert_eq!(record.invoice_number.as_deref(), Some("2026/01/1"));
+    assert!(!is_valid_invoice_number_candidate("FAKTURY"));
+}
+
+#[test]
 fn parses_stripe_style_invoice_counterparties() {
     let text = r#"Invoice
 Invoice number 44871C26-0020
@@ -325,6 +333,141 @@ fn tri_reconcile_dedupes_equivalent_saldeo_records() {
 }
 
 #[test]
+fn tri_reconcile_dedupes_same_invoice_number_on_different_dates() {
+    let mut mail = empty_record(SourceKind::Mail);
+    mail.content_hash = "mail:eleven".into();
+    mail.invoice_number = Some("E3C69EBD-0003".into());
+    mail.issue_date = NaiveDate::from_ymd_opt(2026, 4, 16);
+    mail.gross_amount_minor = Some(2200);
+    mail.currency = Some("USD".into());
+
+    let mut saldeo_a = mail.clone();
+    saldeo_a.source = SourceKind::Saldeo;
+    saldeo_a.content_hash = "saldeo:1".into();
+    let mut saldeo_b = saldeo_a.clone();
+    saldeo_b.content_hash = "saldeo:2".into();
+    saldeo_b.issue_date = NaiveDate::from_ymd_opt(2026, 4, 20);
+
+    let report = tri_reconcile(vec![mail], vec![], vec![saldeo_a, saldeo_b], 70);
+    assert_eq!(report.rows.len(), 1);
+    assert_eq!(report.summary.saldeo_only, 0);
+}
+
+#[test]
+fn own_buyer_nip_and_zero_amount_do_not_match_unrelated_invoices() {
+    let mut mail = empty_record(SourceKind::Mail);
+    mail.invoice_number = Some("405421-2026/IE".into());
+    mail.buyer_tax_id = Some("5242920020".into());
+    mail.issue_date = NaiveDate::from_ymd_opt(2026, 2, 28);
+    mail.gross_amount_minor = Some(0);
+    mail.currency = Some("PLN".into());
+
+    let mut ksef = empty_record(SourceKind::Ksef);
+    ksef.invoice_number = Some("PL6552160".into());
+    ksef.buyer_tax_id = Some("5242920020".into());
+    ksef.seller_tax_id = Some("8992520556".into());
+    ksef.issue_date = NaiveDate::from_ymd_opt(2026, 3, 1);
+    ksef.gross_amount_minor = Some(0);
+    ksef.currency = Some("PLN".into());
+
+    let (score, reasons) = score_pair(&ksef, &mail);
+    assert!(
+        score < 45,
+        "score={score}, reasons={reasons:?} — Ryanair nie może trafić w OVH"
+    );
+    assert!(!invoice_identity_match(&mail, &ksef));
+}
+
+#[test]
+fn display_prefers_ksef_name_over_mail_placeholder() {
+    let mut mail = empty_record(SourceKind::Mail);
+    mail.invoice_number = Some("17364/ELOCITY/FUL/03/2026".into());
+    mail.seller_name = Some("Nabywca".into());
+    mail.buyer_name = Some("Nabywca".into());
+    let mut ksef = empty_record(SourceKind::Ksef);
+    ksef.invoice_number = mail.invoice_number.clone();
+    ksef.seller_name = Some("Elocity sp. z o.o.".into());
+    ksef.buyer_name = Some("Productmesh".into());
+    let mut saldeo = empty_record(SourceKind::Saldeo);
+    saldeo.invoice_number = mail.invoice_number.clone();
+    saldeo.seller_name = Some("ELOCITY".into());
+    let row = TriRow {
+        status: "in_all_three".into(),
+        mail_score_to_ksef: Some(80),
+        mail_score_to_saldeo: Some(80),
+        ksef_score_to_saldeo: Some(80),
+        mail: Some(mail),
+        ksef: Some(ksef),
+        saldeo: Some(saldeo),
+    };
+    let table_row = invoice_table_row_from_reconcile_row(&row, None).unwrap();
+    assert_eq!(
+        counterparty_name(Some(&table_row.record)),
+        "Elocity sp. z o.o."
+    );
+}
+
+#[test]
+fn display_shows_buyer_when_seller_is_own_company() {
+    let mut ksef = empty_record(SourceKind::Ksef);
+    ksef.invoice_number = Some("2026/01/1".into());
+    ksef.seller_name = Some("productMesh - RAFAŁ WYDERKA".into());
+    ksef.seller_tax_id = Some("5242920020".into());
+    ksef.buyer_name = Some("Olga Borovska".into());
+    let row = TriRow {
+        status: "ksef_saldeo_missing_gmail".into(),
+        mail_score_to_ksef: None,
+        mail_score_to_saldeo: None,
+        ksef_score_to_saldeo: Some(100),
+        mail: None,
+        ksef: Some(ksef),
+        saldeo: None,
+    };
+    let table_row = invoice_table_row_from_reconcile_row(&row, None).unwrap();
+    assert_eq!(
+        counterparty_name(Some(&table_row.record)),
+        "Olga Borovska"
+    );
+}
+
+#[test]
+fn display_replaces_mail_heading_with_ksef_invoice_number() {
+    let mut mail = empty_record(SourceKind::Mail);
+    mail.invoice_number = Some("FAKTURY".into());
+    mail.ksef_reference = Some("5242920020-20260904-7B4DFEC00001-B8".into());
+    let mut ksef = empty_record(SourceKind::Ksef);
+    ksef.invoice_number = Some("2026/01/1".into());
+    ksef.ksef_reference = mail.ksef_reference.clone();
+    ksef.buyer_name = Some("Olga Borovska".into());
+    let row = TriRow {
+        status: "gmail_ksef_missing_saldeo".into(),
+        mail_score_to_ksef: Some(100),
+        mail_score_to_saldeo: None,
+        ksef_score_to_saldeo: None,
+        mail: Some(mail),
+        ksef: Some(ksef),
+        saldeo: None,
+    };
+    let table_row = invoice_table_row_from_reconcile_row(&row, None).unwrap();
+    assert_eq!(table_row.record.invoice_number.as_deref(), Some("2026/01/1"));
+}
+
+#[test]
+fn exact_invoice_number_matches_across_sources() {
+    let mut mail = empty_record(SourceKind::Mail);
+    mail.invoice_number = Some("PL6552160".into());
+    mail.currency = Some("PLN".into());
+    let mut saldeo = empty_record(SourceKind::Saldeo);
+    saldeo.invoice_number = Some("PL6552160".into());
+    saldeo.ksef_reference = Some("8992520556-20260301-537139000008-F4".into());
+    saldeo.currency = Some("PLN".into());
+    assert!(invoice_identity_match(&mail, &saldeo));
+    let report = tri_reconcile(vec![mail], vec![], vec![saldeo], 70);
+    assert_eq!(report.rows.len(), 1);
+    assert_eq!(report.summary.gmail_saldeo_missing_ksef, 1);
+}
+
+#[test]
 fn saldeo_without_ksef_reference_is_not_ksef_approvable_in_tui() {
     let mut mail = empty_record(SourceKind::Mail);
     mail.content_hash = "mail:anthropic".into();
@@ -501,4 +644,65 @@ fn missing_saldeo_statuses_do_not_make_ksef_rows_actionable() {
     };
     let table_row = invoice_table_row_from_reconcile_row(&row, None).unwrap();
     assert_eq!(invoice_table_action_ksef_label(&table_row), "—");
+}
+
+#[test]
+fn detects_closed_saldeo_month() {
+    let closed = serde_json::json!({
+        "status": "VALIDATION_ERROR",
+        "data": [{"field": "month", "message": "Miesiąc jest zamknięty"}]
+    });
+    assert!(saldeo_period_is_closed(&closed));
+    let success = serde_json::json!({"status": "SUCCESS", "data": {}});
+    assert!(!saldeo_period_is_closed(&success));
+    let other = serde_json::json!({
+        "status": "VALIDATION_ERROR",
+        "data": [{"field": "filename", "message": "Nieprawidłowa nazwa"}]
+    });
+    assert!(!saldeo_period_is_closed(&other));
+}
+
+#[test]
+fn fallback_upload_period_uses_current_open_month() {
+    let now = NaiveDate::from_ymd_opt(2026, 9, 16).unwrap();
+    assert_eq!(saldeo_fallback_upload_period(2026, 7, now), (2026, 9));
+    assert_eq!(saldeo_fallback_upload_period(2026, 9, now), (2026, 10));
+    assert_eq!(saldeo_fallback_upload_period(2026, 12, now), (2027, 1));
+    let now = NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
+    assert_eq!(saldeo_fallback_upload_period(2026, 7, now), (2026, 8));
+}
+
+#[test]
+fn filter_hides_approved_invoices_in_ksef_and_saldeo() {
+    let mut ksef = empty_record(SourceKind::Ksef);
+    ksef.ksef_reference = Some("KSEF-REF".into());
+    let mut saldeo = empty_record(SourceKind::Saldeo);
+    saldeo.content_hash = "saldeo:123".into();
+    saldeo.ksef_reference = Some("KSEF-REF".into());
+    let row = TriRow {
+        status: "ksef_saldeo_missing_gmail".into(),
+        mail_score_to_ksef: None,
+        mail_score_to_saldeo: None,
+        ksef_score_to_saldeo: Some(100),
+        mail: None,
+        ksef: Some(ksef),
+        saldeo: Some(saldeo),
+    };
+    let mut statuses = std::collections::HashMap::new();
+    statuses.insert(123, Some(true));
+    let approved = invoice_table_row_from_reconcile_row(&row, Some(&statuses)).unwrap();
+    assert_eq!(invoice_table_ksef_status(&approved), "zatw.");
+    assert!(approved.sources.contains('-'));
+    assert!(!invoice_table_row_passes_filter(&approved, true));
+    assert!(invoice_table_row_passes_filter(&approved, false));
+
+    statuses.insert(123, None);
+    let unmarked = invoice_table_row_from_reconcile_row(&row, Some(&statuses)).unwrap();
+    assert_eq!(invoice_table_ksef_status(&unmarked), "nieozn.");
+    assert!(invoice_table_row_passes_filter(&unmarked, true));
+
+    statuses.insert(123, Some(false));
+    let rejected = invoice_table_row_from_reconcile_row(&row, Some(&statuses)).unwrap();
+    assert_eq!(invoice_table_ksef_status(&rejected), "odrz.");
+    assert!(invoice_table_row_passes_filter(&rejected, true));
 }

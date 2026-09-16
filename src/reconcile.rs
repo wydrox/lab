@@ -95,6 +95,7 @@ pub(crate) fn tri_reconcile(
         }
     }
 
+    let rows = merge_duplicate_tri_rows(rows);
     let summary = TriSummary {
         mail_count: mail_records.len(),
         ksef_count: ksef_records.len(),
@@ -171,13 +172,18 @@ pub(crate) fn reconcile_dedupe_key(record: &InvoiceRecord) -> Option<String> {
     }
     let mut tax_ids = tax_ids;
     tax_ids.sort_unstable();
-    Some(format!(
-        "inv:{}|date:{}|gross:{}|cur:{}|tax:{}",
-        invoice,
+    let date = if record.gross_amount_minor.is_none() && tax_ids.is_empty() {
         record
             .issue_date
             .map(|date| date.to_string())
-            .unwrap_or_default(),
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "inv:{}|date:{}|gross:{}|cur:{}|tax:{}",
+        invoice,
+        date,
         record.gross_amount_minor.unwrap_or_default(),
         record.currency.as_deref().unwrap_or(""),
         tax_ids.join(",")
@@ -209,6 +215,16 @@ pub(crate) fn best_match(
     used: &HashSet<usize>,
     min_score: u8,
 ) -> Option<(usize, u8)> {
+    let identity = haystack
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| !used.contains(idx))
+        .filter(|(_, candidate)| invoice_identity_match(needle, candidate))
+        .map(|(idx, candidate)| (idx, score_pair(needle, candidate).0.max(100)))
+        .max_by_key(|(_, score)| *score);
+    if identity.is_some() {
+        return identity;
+    }
     haystack
         .iter()
         .enumerate()
@@ -216,6 +232,112 @@ pub(crate) fn best_match(
         .map(|(idx, candidate)| (idx, score_pair(needle, candidate).0))
         .filter(|(_, score)| *score >= min_score)
         .max_by_key(|(_, score)| *score)
+}
+
+fn invoice_number_is_mergeable(number: &str) -> bool {
+    number.chars().filter(|c| c.is_ascii_digit()).count() >= 3
+}
+
+fn tri_row_merge_key(row: &TriRow) -> Option<String> {
+    for record in [&row.ksef, &row.saldeo, &row.mail].into_iter().flatten() {
+        if let Some(ksef_reference) = record
+            .ksef_reference
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            return Some(format!("ksef:{ksef_reference}"));
+        }
+    }
+    let record = tri_row_primary_record(row)?;
+    let invoice = comparable_invoice_number(record.invoice_number.as_deref()?);
+    if !invoice_number_is_mergeable(&invoice) {
+        return None;
+    }
+    let mut taxes = scoring_tax_ids(record).into_iter().collect::<Vec<_>>();
+    taxes.sort();
+    Some(format!("inv:{invoice}|tax:{}", taxes.join(",")))
+}
+
+fn tri_row_amounts_compatible(left: &TriRow, right: &TriRow) -> bool {
+    let Some(left_record) = tri_row_primary_record(left) else {
+        return true;
+    };
+    let Some(right_record) = tri_row_primary_record(right) else {
+        return true;
+    };
+    match (
+        left_record.gross_amount_minor,
+        right_record.gross_amount_minor,
+    ) {
+        (Some(left_amount), Some(right_amount)) if left_amount > 0 && right_amount > 0 => {
+            (left_amount - right_amount).abs() <= 2
+        }
+        _ => true,
+    }
+}
+
+fn pick_better_record(
+    left: Option<InvoiceRecord>,
+    right: Option<InvoiceRecord>,
+) -> Option<InvoiceRecord> {
+    match (left, right) {
+        (None, record) | (record, None) => record,
+        (Some(left), Some(right)) => Some(
+            if record_completeness_score(&right) > record_completeness_score(&left) {
+                right
+            } else {
+                left
+            },
+        ),
+    }
+}
+
+fn merge_tri_row_pair(left: TriRow, right: TriRow) -> TriRow {
+    let mail = pick_better_record(left.mail, right.mail);
+    let ksef = pick_better_record(left.ksef, right.ksef);
+    let saldeo = pick_better_record(left.saldeo, right.saldeo);
+    let mail_score_to_ksef = match (&mail, &ksef) {
+        (Some(mail), Some(ksef)) => Some(score_pair(mail, ksef).0),
+        _ => None,
+    };
+    let mail_score_to_saldeo = match (&mail, &saldeo) {
+        (Some(mail), Some(saldeo)) => Some(score_pair(mail, saldeo).0),
+        _ => None,
+    };
+    let ksef_score_to_saldeo = match (&ksef, &saldeo) {
+        (Some(ksef), Some(saldeo)) => Some(score_pair(ksef, saldeo).0),
+        _ => None,
+    };
+    TriRow {
+        status: tri_status(mail.is_some(), ksef.is_some(), saldeo.is_some()).to_string(),
+        mail_score_to_ksef,
+        mail_score_to_saldeo,
+        ksef_score_to_saldeo,
+        mail,
+        ksef,
+        saldeo,
+    }
+}
+
+fn merge_duplicate_tri_rows(rows: Vec<TriRow>) -> Vec<TriRow> {
+    let mut out = Vec::<TriRow>::new();
+    let mut by_key = HashMap::<String, usize>::new();
+    for row in rows {
+        let Some(key) = tri_row_merge_key(&row) else {
+            out.push(row);
+            continue;
+        };
+        if let Some(existing_idx) = by_key.get(&key).copied()
+            && tri_row_amounts_compatible(&out[existing_idx], &row)
+        {
+            let existing = out[existing_idx].clone();
+            out[existing_idx] = merge_tri_row_pair(existing, row);
+            continue;
+        }
+        by_key.insert(key, out.len());
+        out.push(row);
+    }
+    out
 }
 
 pub(crate) fn tri_status(has_mail: bool, has_ksef: bool, has_saldeo: bool) -> &'static str {
@@ -255,15 +377,19 @@ pub(crate) fn tri_row_display_record(row: &TriRow) -> Option<InvoiceRecord> {
         [row.ksef.as_ref(), row.saldeo.as_ref(), row.mail.as_ref()]
     };
     let name_sources = if saldeo_corrected {
-        [row.saldeo.as_ref(), row.mail.as_ref(), row.ksef.as_ref()]
+        [row.saldeo.as_ref(), row.ksef.as_ref(), row.mail.as_ref()]
     } else {
-        [row.mail.as_ref(), row.ksef.as_ref(), row.saldeo.as_ref()]
+        [row.ksef.as_ref(), row.mail.as_ref(), row.saldeo.as_ref()]
     };
 
-    if record.invoice_number.is_none() {
-        record.invoice_number = metadata_sources
-            .iter()
-            .find_map(|source| source.and_then(|r| r.invoice_number.clone()));
+    if let Some(number) = first_useful_invoice_number(metadata_sources) {
+        record.invoice_number = Some(number);
+    } else if record
+        .invoice_number
+        .as_deref()
+        .is_some_and(|number| !is_valid_invoice_number_candidate(number))
+    {
+        record.invoice_number = None;
     }
     if record.ksef_reference.is_none() {
         record.ksef_reference = metadata_sources
@@ -271,18 +397,8 @@ pub(crate) fn tri_row_display_record(row: &TriRow) -> Option<InvoiceRecord> {
             .find_map(|source| source.and_then(|r| r.ksef_reference.clone()));
     }
 
-    if let Some(value) = name_sources
-        .iter()
-        .find_map(|source| source.and_then(|r| r.seller_name.clone()))
-    {
-        record.seller_name = Some(value);
-    }
-    if let Some(value) = name_sources
-        .iter()
-        .find_map(|source| source.and_then(|r| r.buyer_name.clone()))
-    {
-        record.buyer_name = Some(value);
-    }
+    record.seller_name = first_useful_party_name(name_sources, |record| record.seller_name.as_deref());
+    record.buyer_name = first_useful_party_name(name_sources, |record| record.buyer_name.as_deref());
     if let Some(value) = metadata_sources
         .iter()
         .find_map(|source| source.and_then(|r| r.seller_tax_id.clone()))
@@ -438,11 +554,67 @@ pub(crate) fn reconcile_status_counts(summary: &TriSummary) -> Vec<(&'static str
     ]
 }
 
+fn useful_party_name(name: &str) -> Option<&str> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || counterparty_name_is_placeholder(trimmed) {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn first_useful_party_name(
+    sources: [Option<&InvoiceRecord>; 3],
+    pick: impl Fn(&InvoiceRecord) -> Option<&str>,
+) -> Option<String> {
+    sources.into_iter().flatten().find_map(|record| {
+        pick(record)
+            .and_then(useful_party_name)
+            .map(str::to_string)
+    })
+}
+
+fn first_useful_invoice_number(sources: [Option<&InvoiceRecord>; 3]) -> Option<String> {
+    sources.into_iter().flatten().find_map(|record| {
+        record
+            .invoice_number
+            .as_deref()
+            .filter(|number| is_valid_invoice_number_candidate(number))
+            .map(str::to_string)
+    })
+}
+
+fn name_looks_like_own_company(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    let compact: String = lower.chars().filter(|c| c.is_alphanumeric()).collect();
+    compact.contains("productmesh")
+        || lower.contains("rafał wyderka")
+        || lower.contains("rafal wyderka")
+}
+
+fn party_is_own_company(name: Option<&str>, tax_id: Option<&str>) -> bool {
+    tax_id.and_then(normalize_tax_id).as_deref() == Some(DEFAULT_PRODUCTMESH_NIP)
+        || name.is_some_and(name_looks_like_own_company)
+}
+
 pub(crate) fn counterparty_name(record: Option<&InvoiceRecord>) -> String {
-    record
-        .and_then(|r| r.seller_name.clone().or_else(|| r.buyer_name.clone()))
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| "-".to_string())
+    let Some(record) = record else {
+        return "-".to_string();
+    };
+    let seller = record.seller_name.as_deref().and_then(useful_party_name);
+    let buyer = record.buyer_name.as_deref().and_then(useful_party_name);
+    if party_is_own_company(seller, record.seller_tax_id.as_deref())
+        && let Some(name) = buyer.filter(|name| !name_looks_like_own_company(name))
+    {
+        return name.to_string();
+    }
+    if let Some(name) = seller.filter(|name| !name_looks_like_own_company(name)) {
+        return name.to_string();
+    }
+    if let Some(name) = buyer.filter(|name| !name_looks_like_own_company(name)) {
+        return name.to_string();
+    }
+    "-".to_string()
 }
 
 pub(crate) fn row_sources(row: &TriRow) -> String {

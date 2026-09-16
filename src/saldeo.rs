@@ -228,6 +228,81 @@ pub(crate) fn read_saldeo_session(storage_state: &Path) -> Result<SaldeoSession>
     })
 }
 
+pub(crate) fn saldeo_period_is_closed(response: &Value) -> bool {
+    if response.get("status").and_then(Value::as_str) != Some("VALIDATION_ERROR") {
+        return false;
+    }
+    response
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|error| {
+            let field = error.get("field").and_then(Value::as_str).unwrap_or("");
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_lowercase();
+            field.eq_ignore_ascii_case("month")
+                && (message.contains("zamknięty") || message.contains("closed"))
+        })
+}
+
+pub(crate) fn saldeo_fallback_upload_period(
+    closed_year: i32,
+    closed_month: u32,
+    now: NaiveDate,
+) -> (i32, u32) {
+    let (next_year, next_month) = if closed_month >= 12 {
+        (closed_year + 1, 1)
+    } else {
+        (closed_year, closed_month.max(1) + 1)
+    };
+    let now_year = now.year();
+    let now_month = now.month();
+    if (next_year, next_month) >= (now_year, now_month) {
+        (next_year, next_month)
+    } else {
+        (now_year, now_month)
+    }
+}
+
+fn saldeo_generate_upload_urls(
+    client: &Client,
+    session: &SaldeoSession,
+    upload_url: &str,
+    file_name: &str,
+    content_type: &str,
+    size: usize,
+    year: i32,
+    month: u32,
+) -> Result<Value> {
+    let body = serde_json::json!({
+        "year": year,
+        "month": month,
+        "documentTypeId": -1,
+        "files": [{
+            "filename": file_name,
+            "contentType": content_type,
+            "size": size,
+        }],
+        "clientId": null,
+    });
+    client
+        .post(upload_url)
+        .header("Cookie", &session.cookie_header)
+        .header("X-SALDEO-XSRF-H-TOKEN", &session.xsrf)
+        .header("saldeoApp", "angularApp")
+        .header("timeout", "60000")
+        .json(&body)
+        .send()
+        .with_context(|| format!("Saldeo generate upload URL {file_name}"))?
+        .error_for_status()?
+        .json()
+        .map_err(Into::into)
+}
+
 pub(crate) fn saldeo_upload_file(
     client: &Client,
     session: &SaldeoSession,
@@ -242,28 +317,36 @@ pub(crate) fn saldeo_upload_file(
         .ok_or_else(|| anyhow!("brak nazwy pliku: {}", path.display()))?;
     let bytes = fs::read(path).with_context(|| format!("odczyt {}", path.display()))?;
     let content_type = content_type_for_path(path);
-    let body = serde_json::json!({
-        "year": year,
-        "month": month,
-        "documentTypeId": -1,
-        "files": [{
-            "filename": file_name,
-            "contentType": content_type,
-            "size": bytes.len(),
-        }],
-        "clientId": null,
-    });
-    let response: Value = client
-        .post(upload_url)
-        .header("Cookie", &session.cookie_header)
-        .header("X-SALDEO-XSRF-H-TOKEN", &session.xsrf)
-        .header("saldeoApp", "angularApp")
-        .header("timeout", "60000")
-        .json(&body)
-        .send()
-        .with_context(|| format!("Saldeo generate upload URL {}", path.display()))?
-        .error_for_status()?
-        .json()?;
+    let mut year = year;
+    let mut month = month;
+    let mut response = None;
+    for _ in 0..14 {
+        let generated = saldeo_generate_upload_urls(
+            client,
+            session,
+            upload_url,
+            file_name,
+            content_type,
+            bytes.len(),
+            year,
+            month,
+        )?;
+        if saldeo_period_is_closed(&generated) {
+            let (next_year, next_month) =
+                saldeo_fallback_upload_period(year, month, Utc::now().date_naive());
+            if (next_year, next_month) == (year, month) {
+                return Err(anyhow!("Saldeo generate upload URL failed: {generated}"));
+            }
+            year = next_year;
+            month = next_month;
+            continue;
+        }
+        response = Some(generated);
+        break;
+    }
+    let response = response.ok_or_else(|| {
+        anyhow!("Saldeo generate upload URL failed: brak otwartego miesiąca do zapisu")
+    })?;
     if response.get("status").and_then(|v| v.as_str()) != Some("SUCCESS") {
         return Err(anyhow!("Saldeo generate upload URL failed: {}", response));
     }

@@ -20,6 +20,11 @@ pub(crate) struct OnboardStatus {
     ksef_password_ok: bool,
     ksef_token_ok: bool,
     ksef_api_ok: bool,
+    gmail_token_source: SecretSource,
+    saldeo_state_source: SecretSource,
+    ksef_token_source: SecretSource,
+    ksef_password_source: SecretSource,
+    ksef_access_source: SecretSource,
 }
 
 pub(crate) fn onboard(
@@ -55,14 +60,15 @@ pub(crate) fn onboard(
             4 => onboard_edit_env_path("KSEF_KEY_PATH")?,
             5 => onboard_edit_env_secret("KSEF_CERT_PASSWORD")?,
             6 => onboard_edit_env_secret("KSEF_TOKEN")?,
-            7 => onboard_configure_ksef_data(status.year)?,
-            8 => {
+            7 => onboard_edit_env_secret("OPENROUTER_API_KEY")?,
+            8 => onboard_configure_ksef_data(status.year)?,
+            9 => {
                 open_db(db_path)?;
                 eprintln!("✓ Baza gotowa: {}\n", db_path.display());
             }
-            9 => run_saldeo_auth_script()?,
-            10 => {}
-            11 => break,
+            10 => run_saldeo_auth_script()?,
+            11 => {}
+            12 => break,
             _ => unreachable!(),
         }
 
@@ -126,6 +132,10 @@ pub(crate) fn onboard_menu_items(
             display_secret_value(status.ksef_token_ok)
         ),
         format!(
+            "OPENROUTER_API_KEY — {}",
+            display_secret_value(secret_is_set(Secret::OpenRouterApiKey))
+        ),
+        format!(
             "KSEF_DATA_DIR — {} {}",
             if status.ksef_data_exists {
                 "✓"
@@ -171,10 +181,8 @@ pub(crate) fn display_secret_value(is_set: bool) -> &'static str {
 
 pub(crate) fn collect_onboard_status(db_path: &Path) -> Result<OnboardStatus> {
     let token_file = default_gmail_token_path();
-    let token_exists = token_file.exists()
-        || keychain_get_secret(KEYCHAIN_ACCOUNT_GMAIL_TOKEN)
-            .map(|v| v.is_some())
-            .unwrap_or(false);
+    let gmail_token_source = secret_source(Secret::GmailToken);
+    let token_exists = gmail_token_source.is_set();
     let gmail_authed = token_exists
         && read_gmail_token(&token_file)
             .map(|t| {
@@ -185,24 +193,18 @@ pub(crate) fn collect_onboard_status(db_path: &Path) -> Result<OnboardStatus> {
             .unwrap_or(false);
 
     let saldeo_state = default_saldeo_storage_state_path();
-    let saldeo_exists = saldeo_state.exists()
-        || keychain_get_secret(KEYCHAIN_ACCOUNT_SALDEO_STORAGE_STATE)
-            .map(|v| v.is_some())
-            .unwrap_or(false);
+    let saldeo_state_source = secret_source(Secret::SaldeoStorageState);
+    let saldeo_exists = saldeo_state_source.is_set();
     let saldeo_valid = saldeo_exists && saldeo_session_valid(&saldeo_state);
 
-    let pdftotext_ok = Command::new("pdftotext").arg("-v").output().is_ok();
+    let pdftotext_ok = local_tool("pdftotext").is_ok();
     let python_ok = Command::new("python3")
         .arg("-c")
         .arg("import shutil, subprocess, sys; pp=shutil.which('ppmlx'); sys.exit(1 if not pp else 0)")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
-    let openssl_ok = Command::new("openssl")
-        .arg("version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let openssl_ok = local_tool("openssl").is_ok();
 
     let db_exists = db_path.exists();
     if !db_exists {
@@ -226,12 +228,11 @@ pub(crate) fn collect_onboard_status(db_path: &Path) -> Result<OnboardStatus> {
         .as_ref()
         .map(|p| Path::new(p).exists())
         .unwrap_or(false);
-    let ksef_password_ok = lab_config_var("KSEF_CERT_PASSWORD")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    let ksef_token_ok = lab_config_var("KSEF_TOKEN")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
+    let ksef_password_source = secret_source(Secret::KsefCertPassword);
+    let ksef_password_ok = ksef_password_source.is_set();
+    let ksef_token_source = secret_source(Secret::KsefToken);
+    let ksef_token_ok = ksef_token_source.is_set();
+    let ksef_access_source = secret_source(Secret::KsefAccessToken);
     let ksef_api_ok = ksef_token_ok;
 
     Ok(OnboardStatus {
@@ -253,7 +254,40 @@ pub(crate) fn collect_onboard_status(db_path: &Path) -> Result<OnboardStatus> {
         ksef_password_ok,
         ksef_token_ok,
         ksef_api_ok,
+        gmail_token_source,
+        saldeo_state_source,
+        ksef_token_source,
+        ksef_password_source,
+        ksef_access_source,
     })
+}
+
+/// Raport o sekretach: czy są ustawione i skąd pochodzą; bez wartości.
+pub(crate) fn secrets_status_json(status: &OnboardStatus) -> Value {
+    serde_json::json!({
+        "gmail_token": secret_status_entry(status.gmail_token_source),
+        "saldeo_storage_state": secret_status_entry(status.saldeo_state_source),
+        "saldeo_username": secret_status_entry(secret_source(Secret::SaldeoUsername)),
+        "saldeo_password": secret_status_entry(secret_source(Secret::SaldeoPassword)),
+        "ksef_token": secret_status_entry(status.ksef_token_source),
+        "ksef_cert_password": secret_status_entry(status.ksef_password_source),
+        "ksef_access_token": secret_status_entry(status.ksef_access_source),
+        "openrouter_api_key": secret_status_entry(secret_source(Secret::OpenRouterApiKey)),
+    })
+}
+
+fn secret_status_entry(source: SecretSource) -> Value {
+    serde_json::json!({ "set": source.is_set(), "source": source.as_str() })
+}
+
+/// Skąd LAB wziął sekret; do wydruku statusu, nigdy z wartością.
+pub(crate) fn secret_source_suffix(source: SecretSource) -> String {
+    match source {
+        SecretSource::Env => " (zmienna sesji)".to_string(),
+        SecretSource::Keychain => " (Keychain)".to_string(),
+        SecretSource::File => " (plik 600)".to_string(),
+        SecretSource::Missing => String::new(),
+    }
 }
 
 pub(crate) fn print_onboard_status(status: &OnboardStatus, db_path: &Path) {
@@ -291,23 +325,36 @@ pub(crate) fn print_onboard_status(status: &OnboardStatus, db_path: &Path) {
         }
     );
     eprintln!(
-        "  Gmail:           {}",
+        "  Gmail:           {}{}",
         if status.gmail_authed {
             "✓"
         } else if status.token_exists {
             "✗ (token wygasł)"
         } else {
             "✗"
-        }
+        },
+        secret_source_suffix(status.gmail_token_source)
     );
     eprintln!(
-        "  Saldeo:          {}",
+        "  Saldeo:          {}{}",
         if status.saldeo_valid {
             "✓"
         } else if status.saldeo_exists {
             "✗ (sesja wygasła)"
         } else {
             "✗"
+        },
+        secret_source_suffix(status.saldeo_state_source)
+    );
+    let saldeo_login =
+        secret_is_set(Secret::SaldeoUsername) && secret_is_set(Secret::SaldeoPassword);
+    eprintln!(
+        "  Saldeo login:    {}{}",
+        if saldeo_login { "✓" } else { "✗" },
+        if saldeo_login {
+            secret_source_suffix(secret_source(Secret::SaldeoUsername))
+        } else {
+            String::new()
         }
     );
     eprintln!(
@@ -327,16 +374,18 @@ pub(crate) fn print_onboard_status(status: &OnboardStatus, db_path: &Path) {
         }
     );
     eprintln!(
-        "  KSeF hasło:      {}",
+        "  KSeF hasło:      {}{}",
         if status.ksef_password_ok {
             "✓"
         } else {
             "✗"
-        }
+        },
+        secret_source_suffix(status.ksef_password_source)
     );
     eprintln!(
-        "  KSeF token:      {}",
-        if status.ksef_token_ok { "✓" } else { "✗" }
+        "  KSeF token:      {}{}",
+        if status.ksef_token_ok { "✓" } else { "✗" },
+        secret_source_suffix(status.ksef_token_source)
     );
     eprintln!(
         "  KSeF dane:       {}",
@@ -364,7 +413,9 @@ pub(crate) fn onboard_next_steps(status: &OnboardStatus, gmail_ok: bool) -> Vec<
         steps.push("lab onboard --gmail-client-secret <ścieżka>");
     }
     if !status.saldeo_valid {
-        steps.push("Odśwież sesję Saldeo (~/.config/lab/saldeo-storage-state.json)");
+        steps.push(
+            "Ustaw SALDEO_USERNAME i SALDEO_PASSWORD w lab onboard, albo odśwież sesję Helium",
+        );
     }
     if !status.ksef_api_ok {
         steps.push("Ustaw KSEF_TOKEN z uprawnieniem InvoiceRead");
@@ -386,6 +437,7 @@ pub(crate) fn write_onboard_check_json(status: &OnboardStatus) -> Result<()> {
         "saldeo": { "session_valid": status.saldeo_valid },
         "ksef": { "api_ok": status.ksef_api_ok, "data_exists": status.ksef_data_exists },
         "database": { "exists": status.db_exists },
+        "secrets": secrets_status_json(status),
         "next_steps": steps
     });
     write_json(&status_json, None)
@@ -447,6 +499,34 @@ pub(crate) fn onboard_configure_gmail(
 
 pub(crate) fn onboard_configure_saldeo() -> Result<()> {
     eprintln!("── Saldeo ──");
+    let login_ok = saldeo_login_pair()?.is_some();
+    if Confirm::new()
+        .with_prompt(if login_ok {
+            "Login Saldeo jest ustawiony. Zmienić login i hasło do automatycznego logowania?"
+        } else {
+            "Ustawić login i hasło Saldeo do automatycznego logowania (bez ręcznego Helium)?"
+        })
+        .default(!login_ok)
+        .interact()?
+    {
+        let username: String = Input::new()
+            .with_prompt("SALDEO_USERNAME")
+            .allow_empty(true)
+            .interact_text()?;
+        if !username.trim().is_empty() {
+            save_secret(Secret::SaldeoUsername, username.trim())?;
+            let password = Password::new()
+                .with_prompt("SALDEO_PASSWORD")
+                .allow_empty_password(true)
+                .interact()?;
+            if password.is_empty() {
+                eprintln!("⏭ Hasło puste; login zapisany, hasło bez zmian.\n");
+            } else {
+                save_secret(Secret::SaldeoPassword, &password)?;
+                eprintln!("✓ Zapisano SALDEO_USERNAME i SALDEO_PASSWORD w Keychain\n");
+            }
+        }
+    }
     let target = preferred_saldeo_storage_state_path();
     eprintln!("Domyślny plik sesji: {}", target.display());
     eprintln!("Podaj plik Playwright storage state; zostanie skopiowany do domyślnej lokalizacji.");
@@ -492,7 +572,9 @@ pub(crate) fn onboard_edit_env_path(name: &str) -> Result<()> {
 }
 
 pub(crate) fn onboard_edit_env_secret(name: &str) -> Result<()> {
-    let current = lab_config_var(name).is_some();
+    let secret = Secret::from_env_key(name)
+        .ok_or_else(|| anyhow!("{name} nie jest sekretem LAB; użyj edycji ścieżki"))?;
+    let current = secret_is_set(secret);
     let prompt = if current {
         format!("{name} (ustawione; puste = bez zmian)")
     } else {
@@ -502,14 +584,14 @@ pub(crate) fn onboard_edit_env_secret(name: &str) -> Result<()> {
         .with_prompt(prompt)
         .allow_empty_password(true)
         .interact()?;
-    if value.is_empty() {
+    if value.trim().is_empty() {
         eprintln!("⏭ Bez zmian.\n");
         return Ok(());
     }
-    let mut vars = read_lab_env_file().unwrap_or_default();
-    vars.insert(name.to_string(), value);
-    write_lab_env_file(&vars)?;
-    eprintln!("✓ Zapisano {name} w {}\n", lab_env_file_path().display());
+    match save_secret(secret, value.trim())? {
+        SecretSource::File => eprintln!("✓ Zapisano {name} w pliku 0600\n"),
+        _ => eprintln!("✓ Zapisano {name} w macOS Keychain (lab-cli)\n"),
+    }
     Ok(())
 }
 
@@ -523,10 +605,12 @@ pub(crate) fn ensure_saldeo_session_or_auth(progress: Option<Arc<Mutex<String>>>
     }
 
     if let Some(progress) = &progress {
-        set_progress(
-            progress,
-            "Saldeo: sesja nieważna — zaloguj się w Helium; zapiszę auth automatycznie...",
-        );
+        let message = if saldeo_login_pair()?.is_some() {
+            "Saldeo: sesja nieważna — loguję zapisanym hasłem..."
+        } else {
+            "Saldeo: sesja nieważna — zaloguj się w Helium; zapiszę auth automatycznie..."
+        };
+        set_progress(progress, message);
     }
     saldeo_auth_noninteractive()?;
 
@@ -538,7 +622,7 @@ pub(crate) fn ensure_saldeo_session_or_auth(progress: Option<Arc<Mutex<String>>>
         Ok(())
     } else {
         Err(anyhow!(
-            "Saldeo auth nie jest jeszcze poprawny; zaloguj się w Helium i spróbuj ponownie"
+            "Saldeo auth nie jest jeszcze poprawny; ustaw SALDEO_USERNAME i SALDEO_PASSWORD albo zaloguj się w Helium"
         ))
     }
 }
@@ -555,114 +639,49 @@ pub(crate) fn saldeo_auth_noninteractive() -> Result<()> {
     if !Path::new(&helium).is_file() {
         return Err(anyhow!("nie znalazłem Helium executable: {helium}"));
     }
-    let node_script = r#"
-const { chromium } = require('playwright');
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function cookieHeader(cookies) {
-  return cookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; ');
-}
-
-function xsrfToken(cookies) {
-  const cookie = cookies.find(cookie => cookie.name === 'X-SALDEO-XSRF-C-TOKEN');
-  return cookie && cookie.value;
-}
-
-function authCheckBody() {
-  return {
-    pagination: { pageNumber: 0, pageSize: 1, totalCount: 0,
-      columnSorted: { sortColumn: 'DOCUMENT_CREATE_DATE', sortDirection: 'ASC' } },
-    filter: { period: { partOfYear: 1, year: new Date().getFullYear(), selectionType: 'selectedMonth' },
-      duplicatesEnable: false, duplicates: false, splitPayment: false,
-      types: [], contractors: [], stages: [], categories: [], registers: [],
-      tags: [], assignUsers: [], addedBy: [], added: [],
-      paymentStatuses: [], accountingPaymentTypes: [],
-      searchQuery: '', selectKsefDocumentsYesCheckbox: false,
-      selectKsefDocumentsNoCheckbox: false, ksefNumber: '',
-      ksefMiniWorkflowStatus: null, ksefBoId: null,
-      dimensionReportDocumentIds: [], dimensions: null }
-  };
-}
-
-async function storageAuthenticated(context) {
-  const state = await context.storageState();
-  const cookies = state.cookies || [];
-  const xsrf = xsrfToken(cookies);
-  if (!xsrf) return false;
-  try {
-    const response = await context.request.post('https://saldeo.brainshare.pl/rest/client/document/list/search', {
-      headers: {
-        Cookie: cookieHeader(cookies),
-        'X-SALDEO-XSRF-H-TOKEN': xsrf,
-        saldeoApp: 'angularApp',
-        timeout: '60000',
-      },
-      data: authCheckBody(),
-    });
-    return response.ok();
-  } catch (_) {
-    return false;
-  }
-}
-
-(async () => {
-  const out = process.env.LAB_SALDEO_STORAGE_STATE;
-  const url = process.env.SALDEO_URL || 'https://saldeo.brainshare.pl/';
-  const executablePath = process.env.HELIUM_EXECUTABLE;
-  const timeoutMs = Number.parseInt(process.env.SALDEO_AUTH_TIMEOUT_MS || '180000', 10);
-  const userDataDir = path.join(os.homedir(), '.config', 'lab', 'helium-profile');
-  fs.mkdirSync(userDataDir, { recursive: true });
-  const context = await chromium.launchPersistentContext(userDataDir, {
-    executablePath,
-    headless: false,
-    viewport: { width: 1400, height: 1000 },
-  });
-  let closed = false;
-  context.once('close', () => { closed = true; });
-  const page = context.pages()[0] || await context.newPage();
-  await page.goto(url, { waitUntil: 'domcontentloaded' });
-
-  const deadline = Date.now() + timeoutMs;
-  let authenticated = false;
-  while (!closed && Date.now() < deadline) {
-    await context.storageState({ path: out }).catch(() => {});
-    if (await storageAuthenticated(context)) {
-      authenticated = true;
-      break;
-    }
-    await sleep(2000);
-  }
-
-  if (!closed) {
-    await context.storageState({ path: out });
-    await context.close().catch(() => {});
-  }
-  if (!authenticated) {
-    console.error(`Saldeo auth timeout after ${Math.round(timeoutMs / 1000)}s`);
-    process.exit(2);
-  }
-})().catch(err => { console.error(err && err.stack ? err.stack : err); process.exit(1); });
-"#;
-    let output = Command::new("npx")
+    let login = saldeo_login_pair()?;
+    let login_path = if let Some((username, password)) = &login {
+        let path =
+            std::env::temp_dir().join(format!("lab-saldeo-login-{}.json", std::process::id()));
+        write_private_file(
+            &path,
+            &serde_json::to_vec(&serde_json::json!({
+                "username": username,
+                "password": password
+            }))?,
+        )?;
+        Some(path)
+    } else {
+        None
+    };
+    let script_path =
+        std::env::temp_dir().join(format!("lab-saldeo-login-script-{}.js", std::process::id()));
+    write_private_file(
+        &script_path,
+        include_str!("../scripts/saldeo-login.js").as_bytes(),
+    )?;
+    let mut command = Command::new("npx");
+    command
         .arg("--yes")
         .arg("-p")
         .arg("playwright")
         .arg("node")
-        .arg("-e")
-        .arg(node_script)
+        .arg(&script_path)
         .env("LAB_SALDEO_STORAGE_STATE", &target)
         .env("SALDEO_URL", &url)
         .env("HELIUM_EXECUTABLE", &helium)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::null());
+    if let Some(path) = &login_path {
+        command.env("LAB_SALDEO_LOGIN_FILE", path);
+    }
+    let output = command
         .output()
-        .context("uruchomienie npx playwright + Helium (noninteractive)")?;
+        .context("uruchomienie npx playwright + Helium")?;
+    if let Some(path) = &login_path {
+        let _ = fs::remove_file(path);
+    }
+    let _ = fs::remove_file(&script_path);
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!(
@@ -801,6 +820,9 @@ pub(crate) fn onboard_configure_ksef_data(current_year: i32) -> Result<()> {
 }
 
 pub(crate) fn lab_config_var(name: &str) -> Option<String> {
+    if let Some(secret) = Secret::from_env_key(name) {
+        return secret_value(secret).ok().flatten();
+    }
     std::env::var(name)
         .ok()
         .filter(|v| !v.trim().is_empty())
@@ -817,6 +839,10 @@ pub(crate) fn preferred_saldeo_storage_state_path() -> PathBuf {
 }
 
 pub(crate) fn lab_env_file_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = credentials::test_env_file_path() {
+        return path;
+    }
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
@@ -847,6 +873,8 @@ pub(crate) fn read_lab_env_file() -> Result<HashMap<String, String>> {
 }
 
 pub(crate) fn write_lab_env_file(vars: &HashMap<String, String>) -> Result<()> {
+    let mut vars = vars.clone();
+    strip_secret_env_keys(&mut vars)?;
     let path = lab_env_file_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
@@ -861,14 +889,7 @@ pub(crate) fn write_lab_env_file(vars: &HashMap<String, String>) -> Result<()> {
             out.push_str(&format!("{}={}\n", key, quote_env_value(value)));
         }
     }
-    fs::write(&path, out).with_context(|| format!("zapis {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("chmod 600 {}", path.display()))?;
-    }
-    Ok(())
+    write_private_file(&path, out.as_bytes())
 }
 
 pub(crate) fn quote_env_value(value: &str) -> String {
@@ -886,20 +907,24 @@ pub(crate) fn unquote_env_value(value: &str) -> String {
 }
 
 pub(crate) fn save_saldeo_storage_state_secret(storage_state: &Path) -> Result<()> {
-    if let Ok(text) = fs::read_to_string(storage_state)
-        && keychain_set_secret(KEYCHAIN_ACCOUNT_SALDEO_STORAGE_STATE, &text)?
-    {
+    if !storage_state.is_file() {
         return Ok(());
     }
+    // Playwright zapisuje plik z prawami umask; zacieśniamy je przed odczytem.
+    crate::hardening::chmod_private(storage_state)?;
+    let text = read_secret_file(storage_state, "sesja Saldeo")?;
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    save_secret(Secret::SaldeoStorageState, &text)?;
     Ok(())
 }
 
 pub(crate) fn read_saldeo_storage_state(storage_state: &Path) -> Result<String> {
-    if let Some(text) = keychain_get_secret(KEYCHAIN_ACCOUNT_SALDEO_STORAGE_STATE)? {
+    if let Some(text) = secret_value(Secret::SaldeoStorageState).ok().flatten() {
         return Ok(text);
     }
-    fs::read_to_string(storage_state)
-        .with_context(|| format!("odczyt sesji Saldeo {}", storage_state.display()))
+    read_secret_file(storage_state, "sesja Saldeo")
 }
 
 pub(crate) fn saldeo_session_valid(storage_state: &Path) -> bool {
@@ -1000,6 +1025,7 @@ pub(crate) fn doctor(db_path: &Path, token_env: &str) -> Result<()> {
             "token_env_present": gmail_env_present,
             "token_file": default_gmail_token_path().display().to_string(),
             "token_file_or_keychain_present": status.token_exists,
+            "token_source": status.gmail_token_source.as_str(),
             "token_file_valid": status.gmail_authed,
             "usable": gmail_usable,
             "client_secret_path": lab_config_var("GOOGLE_CLIENT_SECRET_PATH")
@@ -1007,6 +1033,7 @@ pub(crate) fn doctor(db_path: &Path, token_env: &str) -> Result<()> {
         "saldeo": {
             "storage_state": default_saldeo_storage_state_path().display().to_string(),
             "storage_state_present": status.saldeo_exists,
+            "storage_state_source": status.saldeo_state_source.as_str(),
             "session_valid": status.saldeo_valid,
             "default_records": saldeo_records.display().to_string(),
             "default_records_present": saldeo_records.exists()
@@ -1016,7 +1043,8 @@ pub(crate) fn doctor(db_path: &Path, token_env: &str) -> Result<()> {
             "context_type": ksef_context_type,
             "context_value": ksef_context_value,
             "access_token_cache": ksef_access_token_path.display().to_string(),
-            "access_token_cache_present": ksef_access_token_path.exists(),
+            "access_token_cache_present": status.ksef_access_source.is_set(),
+            "access_token_source": status.ksef_access_source.as_str(),
             "data_dir": status.ksef_dir.display().to_string(),
             "data_exists": status.ksef_data_exists,
             "default_records": ksef_records.display().to_string(),
@@ -1026,7 +1054,9 @@ pub(crate) fn doctor(db_path: &Path, token_env: &str) -> Result<()> {
             "key_path": status.ksef_key.clone(),
             "key_ok": status.ksef_key_ok,
             "password_present": status.ksef_password_ok,
+            "password_source": status.ksef_password_source.as_str(),
             "token_present": status.ksef_token_ok,
+            "token_source": status.ksef_token_source.as_str(),
             "api_config_ok": status.ksef_api_ok
         },
         "reconcile_defaults": {
@@ -1041,11 +1071,13 @@ pub(crate) fn doctor(db_path: &Path, token_env: &str) -> Result<()> {
             "path": db_path.display().to_string(),
             "exists": status.db_exists
         },
+        "secrets": secrets_status_json(&status),
         "notes": [
             "GmailFetch wymaga tokenu OAuth z zakresem gmail.readonly.",
             "PDF-y są parsowane przez pdftotext, potem PyMuPDF/pdfplumber/pypdf jako fallback.",
             "lab reconcile bez własnych --ksef/--saldeo pobiera online metadane KSeF i Saldeo przed porównaniem.",
-            "KSeF online używa KSEF_TOKEN, KSEF_CONTEXT_NIP/KSEF_NIP i KSEF_BASE_URL/KSEF_ENV; metadane są cache'owane lokalnie w KSEF_DATA_DIR albo data/ksef-<rok>."
+            "KSeF online używa KSEF_TOKEN, KSEF_CONTEXT_NIP/KSEF_NIP i KSEF_BASE_URL/KSEF_ENV; metadane są cache'owane lokalnie w KSEF_DATA_DIR albo data/ksef-<rok>.",
+            "Sekrety trzyma macOS Keychain (usługa lab-cli); zmienna środowiskowa sesji ma pierwszeństwo, plik ~/.config/lab/env już ich nie przechowuje."
         ],
         "next_steps": onboard_next_steps(&status, gmail_usable)
     });

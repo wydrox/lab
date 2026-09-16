@@ -256,7 +256,7 @@ pub(crate) fn ksef_online_config() -> Result<KsefOnlineConfig> {
     } else {
         raw_context
     };
-    let ksef_token = lab_config_var("KSEF_TOKEN").ok_or_else(|| {
+    let ksef_token = secret_value(Secret::KsefToken)?.ok_or_else(|| {
         anyhow!("brak KSEF_TOKEN; potrzebny token KSeF z uprawnieniem InvoiceRead")
     })?;
     Ok(KsefOnlineConfig {
@@ -610,11 +610,12 @@ pub(crate) fn ksef_encrypt_token_with_certificate(
         let cert = STANDARD
             .decode(certificate_b64)
             .context("dekodowanie certyfikatu KSeF")?;
-        fs::write(&cert_path, cert).with_context(|| format!("zapis {}", cert_path.display()))?;
-        fs::write(&plain_path, plaintext.as_bytes())
-            .with_context(|| format!("zapis {}", plain_path.display()))?;
+        write_private_file(&cert_path, &cert)?;
+        write_private_file(&plain_path, plaintext.as_bytes())?;
 
-        let output = Command::new("openssl")
+        let mut openssl = Command::new(local_tool("openssl")?);
+        apply_isolated_env(&mut openssl);
+        let output = openssl
             .arg("x509")
             .arg("-inform")
             .arg("DER")
@@ -630,10 +631,11 @@ pub(crate) fn ksef_encrypt_token_with_certificate(
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
-        fs::write(&pub_path, output.stdout)
-            .with_context(|| format!("zapis {}", pub_path.display()))?;
+        write_private_file(&pub_path, &output.stdout)?;
 
-        let output = Command::new("openssl")
+        let mut openssl = Command::new(local_tool("openssl")?);
+        apply_isolated_env(&mut openssl);
+        let output = openssl
             .arg("pkeyutl")
             .arg("-encrypt")
             .arg("-pubin")
@@ -836,28 +838,20 @@ pub(crate) fn write_i64_json_array(path: &Path, values: &[i64]) -> Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
-    fs::write(path, serde_json::to_vec(values)?)
-        .with_context(|| format!("zapis {}", path.display()))
+    write_private_file(path, &serde_json::to_vec(values)?)
 }
 
 pub(crate) fn read_ksef_token_cache() -> Result<KsefTokenCache> {
-    let path = default_ksef_access_token_path();
-    let text = fs::read_to_string(&path).with_context(|| format!("odczyt {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("JSON {}", path.display()))
+    let text = secret_value(Secret::KsefAccessToken)?
+        .ok_or_else(|| anyhow!("brak cache tokenu dostępowego KSeF"))?;
+    serde_json::from_str(&text).context("niepoprawny cache tokenu dostępowego KSeF")
 }
 
 pub(crate) fn save_ksef_token_cache(cache: &KsefTokenCache) -> Result<()> {
-    let path = default_ksef_access_token_path();
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-    }
-    fs::write(&path, serde_json::to_vec_pretty(cache)?)
-        .with_context(|| format!("zapis {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-    }
+    save_secret(
+        Secret::KsefAccessToken,
+        &serde_json::to_string_pretty(cache)?,
+    )?;
     Ok(())
 }
 

@@ -30,6 +30,23 @@ use std::time::Duration;
 use walkdir::WalkDir;
 
 mod cli;
+mod document_text;
+use document_text::extract_document_text;
+mod hardening;
+pub(crate) use hardening::{
+    MAX_OCR_PDF_BYTES, apply_isolated_env, chmod_sqlite_files, local_llm_base_url, local_tool,
+    require_existing_file, write_private_file,
+};
+mod keychain;
+pub(crate) use keychain::{keychain_get_secret, keychain_set_secret};
+mod credentials;
+pub(crate) use credentials::*;
+#[cfg(test)]
+mod credentials_tests;
+mod invoice_validation;
+use invoice_validation::counterparty_name_is_placeholder;
+mod openrouter;
+pub(crate) use openrouter::*;
 #[cfg(test)]
 mod tests;
 
@@ -49,9 +66,7 @@ pub(crate) use reconcile::*;
 pub(crate) use saldeo::*;
 pub(crate) use tui::*;
 
-const KEYCHAIN_SERVICE: &str = "lab-cli";
-const KEYCHAIN_ACCOUNT_GMAIL_TOKEN: &str = "gmail_token";
-const KEYCHAIN_ACCOUNT_SALDEO_STORAGE_STATE: &str = "saldeo_storage_state";
+pub(crate) const KEYCHAIN_SERVICE: &str = "lab-cli";
 const DEFAULT_PRODUCTMESH_NIP: &str = "5242920020";
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
@@ -812,89 +827,11 @@ fn write_json<T: Serialize>(value: &T, output: Option<&Path>) -> Result<()> {
 
 fn write_bytes(bytes: &[u8], output: Option<&Path>) -> Result<()> {
     match output {
-        Some(path) => {
-            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("mkdir {}", parent.display()))?;
-            }
-            fs::write(path, bytes).with_context(|| format!("zapis {}", path.display()))
-        }
+        Some(path) => write_private_file(path, bytes),
         None => {
             io::stdout().write_all(bytes)?;
             Ok(())
         }
-    }
-}
-
-fn keychain_get_secret(account: &str) -> Result<Option<String>> {
-    #[cfg(target_os = "macos")]
-    {
-        let output = Command::new("security")
-            .args([
-                "find-generic-password",
-                "-s",
-                KEYCHAIN_SERVICE,
-                "-a",
-                account,
-                "-w",
-            ])
-            .output()
-            .with_context(|| "uruchomienie macOS security find-generic-password")?;
-        if output.status.success() {
-            let raw = String::from_utf8_lossy(&output.stdout)
-                .trim_end_matches(['\r', '\n'])
-                .to_string();
-            Ok(Some(decode_keychain_secret(&raw).unwrap_or(raw)))
-        } else {
-            Ok(None)
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = account;
-        Ok(None)
-    }
-}
-
-fn decode_keychain_secret(raw: &str) -> Option<String> {
-    if let Some(encoded) = raw.strip_prefix("base64:") {
-        return STANDARD
-            .decode(encoded)
-            .ok()
-            .and_then(|bytes| String::from_utf8(bytes).ok());
-    }
-
-    if raw.len().is_multiple_of(2) && raw.chars().all(|c| c.is_ascii_hexdigit()) {
-        return hex::decode(raw)
-            .ok()
-            .and_then(|bytes| String::from_utf8(bytes).ok());
-    }
-
-    None
-}
-
-fn keychain_set_secret(account: &str, secret: &str) -> Result<bool> {
-    #[cfg(target_os = "macos")]
-    {
-        let status = Command::new("security")
-            .args([
-                "add-generic-password",
-                "-s",
-                KEYCHAIN_SERVICE,
-                "-a",
-                account,
-                "-U",
-                "-w",
-                &format!("base64:{}", STANDARD.encode(secret)),
-            ])
-            .status()
-            .with_context(|| "uruchomienie macOS security add-generic-password")?;
-        Ok(status.success())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (account, secret);
-        Ok(false)
     }
 }
 
@@ -904,9 +841,15 @@ fn open_db(path: &Path) -> Result<Connection> {
     }
     let conn =
         Connection::open(path).with_context(|| format!("otwarcie SQLite {}", path.display()))?;
+    chmod_sqlite_files(path)?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.pragma_update(None, "trusted_schema", "OFF")?;
+    conn.pragma_update(None, "cell_size_check", "ON")?;
+    conn.pragma_update(None, "busy_timeout", 5000)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    chmod_sqlite_files(path)?;
     conn.execute_batch(
         r#"
-        PRAGMA foreign_keys = ON;
         CREATE TABLE IF NOT EXISTS invoices (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source TEXT NOT NULL,
@@ -1559,29 +1502,146 @@ fn is_supported_file(path: &Path) -> bool {
     )
 }
 
+const MAIL_PARSER_VERSION: &str = "lab-mail-parser:v3";
+
+#[cfg(test)]
+mod mail_cache_tests;
+
+fn mail_parse_needs_retry(record: &InvoiceRecord) -> bool {
+    record
+        .warnings
+        .iter()
+        .any(|warning| mail_warning_needs_retry(warning))
+}
+
+fn mail_warning_needs_retry(warning: &str) -> bool {
+    let warning = warning.to_lowercase();
+    warning.starts_with("nie udało się wyciągnąć tekstu pdf")
+        || warning.starts_with("pdf bez tekstu")
+        || warning.starts_with("pdf nie zawiera tekstu")
+        || warning.starts_with("ocr niedostępny")
+        || warning.starts_with("ocr nie powiódł się")
+        || warning.starts_with("błąd odczytu")
+}
+
+// Keep established values; only fill gaps and replace known name placeholders.
+fn merge_mail_fields(target: &mut InvoiceRecord, incoming: &InvoiceRecord) {
+    macro_rules! fill {
+        ($($field:ident),* $(,)?) => {$(
+            if target.$field.is_none() {
+                target.$field = incoming.$field.clone();
+            }
+        )*};
+    }
+    fill!(
+        invoice_number,
+        seller_tax_id,
+        buyer_tax_id,
+        issue_date,
+        sale_date,
+        due_date,
+        gross_amount_minor,
+        net_amount_minor,
+        vat_amount_minor,
+        currency,
+        ksef_reference,
+        source_path,
+        email_message_id,
+        email_subject,
+        email_from
+    );
+    for (target, incoming) in [
+        (&mut target.seller_name, &incoming.seller_name),
+        (&mut target.buyer_name, &incoming.buyer_name),
+    ] {
+        if target
+            .as_deref()
+            .is_none_or(counterparty_name_is_placeholder)
+            && incoming
+                .as_deref()
+                .is_some_and(|name| !counterparty_name_is_placeholder(name))
+        {
+            *target = incoming.clone();
+        }
+    }
+}
+
 fn sync_mail_records(
     mail_out: &Path,
     saved_files: &[String],
 ) -> Result<(Vec<InvoiceRecord>, usize)> {
+    sync_mail_records_with_parser(mail_out, saved_files, |path| {
+        parse_file(SourceKind::Mail, path)
+    })
+}
+
+fn sync_mail_records_with_parser(
+    mail_out: &Path,
+    saved_files: &[String],
+    mut parse: impl FnMut(&Path) -> Result<InvoiceRecord>,
+) -> Result<(Vec<InvoiceRecord>, usize)> {
     let cache_path = mail_out.join("records.jsonl");
     if !cache_path.exists() {
-        let records = scan_mail_input(mail_out)?;
+        let records = scan_mail_input_with_parser(mail_out, &mut parse)?;
         let parsed_count = records.len();
         write_records(&records, OutputFormat::Jsonl, Some(&cache_path))?;
         return Ok((records, parsed_count));
     }
-
     let mut records = load_records(SourceKind::Mail, &cache_path)?;
+    let mut parsed_count = 0usize;
+    for record in &mut records {
+        if record
+            .warnings
+            .iter()
+            .any(|warning| warning == MAIL_PARSER_VERSION)
+            && !mail_parse_needs_retry(record)
+        {
+            continue;
+        }
+        let Some(path) = record.source_path.as_deref().map(Path::new) else {
+            continue;
+        };
+        if !path.is_file()
+            || !path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+        {
+            continue;
+        }
+        // A failed extraction can contain filename guesses. Preserve the original
+        // record, including its parser version, so the next sync can try again.
+        let Ok(parsed) = parse(path) else { continue };
+        if mail_parse_needs_retry(&parsed) {
+            continue;
+        }
+        merge_mail_fields(record, &parsed);
+        record.content_hash = parsed.content_hash;
+        record.warnings.retain(|warning| {
+            !warning.starts_with("lab-mail-parser:") && !mail_warning_needs_retry(warning)
+        });
+        for warning in parsed.warnings {
+            if !warning.starts_with("lab-mail-parser:") && !record.warnings.contains(&warning) {
+                record.warnings.push(warning);
+            }
+        }
+        record.warnings.push(MAIL_PARSER_VERSION.to_string());
+        parsed_count += 1;
+    }
     let mut seen = records
         .iter()
         .map(|record| record.content_hash.clone())
         .collect::<HashSet<_>>();
-    let mut parsed_count = 0usize;
-    for path in saved_files.iter().map(PathBuf::from) {
-        if !is_mail_candidate_file(&path) {
+    let mut paths = saved_files.iter().map(PathBuf::from).collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    for path in paths {
+        if !path.is_file() || !is_mail_candidate_file(&path) {
             continue;
         }
-        let record = parse_file(SourceKind::Mail, &path)?;
+        let mut record = parse(&path)?;
+        if !mail_parse_needs_retry(&record) {
+            record.warnings.push(MAIL_PARSER_VERSION.to_string());
+        }
         if seen.insert(record.content_hash.clone()) {
             records.push(record);
             parsed_count += 1;
@@ -1593,7 +1653,10 @@ fn sync_mail_records(
     Ok((records, parsed_count))
 }
 
-fn scan_mail_input(input: &Path) -> Result<Vec<InvoiceRecord>> {
+fn scan_mail_input_with_parser(
+    input: &Path,
+    parse: &mut impl FnMut(&Path) -> Result<InvoiceRecord>,
+) -> Result<Vec<InvoiceRecord>> {
     let mut files = Vec::new();
     if input.is_dir() {
         for entry in WalkDir::new(input).into_iter().filter_map(Result::ok) {
@@ -1614,7 +1677,13 @@ fn scan_mail_input(input: &Path) -> Result<Vec<InvoiceRecord>> {
     files.sort();
     files
         .iter()
-        .map(|path| parse_file(SourceKind::Mail, path))
+        .map(|path| {
+            let mut record = parse(path)?;
+            if !mail_parse_needs_retry(&record) {
+                record.warnings.push(MAIL_PARSER_VERSION.to_string());
+            }
+            Ok(record)
+        })
         .collect::<Result<Vec<_>>>()
 }
 
@@ -1639,14 +1708,10 @@ fn parse_file(source: SourceKind, path: &Path) -> Result<InvoiceRecord> {
 
     let mut warnings = Vec::new();
     let text = match ext.as_str() {
-        "pdf" => match extract_pdf_text(path) {
-            Ok(text) if !text.trim().is_empty() => text,
-            Ok(_) => {
-                warnings.push("PDF bez tekstu; użyto tylko nazwy pliku i hasha".to_string());
-                path.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or_default()
-                    .to_string()
+        "pdf" => match extract_document_text(path) {
+            Ok((text, extraction_warnings)) => {
+                warnings.extend(extraction_warnings);
+                text
             }
             Err(err) => {
                 warnings.push(format!("nie udało się wyciągnąć tekstu PDF: {err}"));
@@ -1682,12 +1747,41 @@ fn parse_file(source: SourceKind, path: &Path) -> Result<InvoiceRecord> {
     Ok(record)
 }
 
+fn record_amounts_inconsistent(record: &InvoiceRecord) -> bool {
+    match (
+        record.net_amount_minor,
+        record.vat_amount_minor,
+        record.gross_amount_minor,
+    ) {
+        (Some(net), Some(vat), Some(gross)) => net.checked_add(vat) != Some(gross),
+        (Some(net), None, Some(gross)) if net >= 0 && gross >= 0 => net > gross,
+        (None, Some(vat), Some(gross)) if vat >= 0 && gross >= 0 => vat > gross,
+        _ => false,
+    }
+}
+
 fn record_missing_core_fields(record: &InvoiceRecord) -> bool {
-    record.invoice_number.is_none()
+    record_amounts_inconsistent(record)
+        || record.invoice_number.is_none()
         || record.issue_date.is_none()
         || record.gross_amount_minor.is_none()
         || record.currency.is_none()
-        || (record.seller_name.is_none() && record.buyer_name.is_none())
+        || (record
+            .seller_name
+            .as_deref()
+            .is_none_or(counterparty_name_is_placeholder)
+            && record
+                .buyer_name
+                .as_deref()
+                .is_none_or(counterparty_name_is_placeholder))
+        || record
+            .seller_name
+            .as_deref()
+            .is_some_and(counterparty_name_is_placeholder)
+        || record
+            .buyer_name
+            .as_deref()
+            .is_some_and(counterparty_name_is_placeholder)
 }
 
 fn json_first_string(value: &Value, keys: &[&str]) -> Option<String> {
@@ -1961,29 +2055,43 @@ fn parse_text_invoice(source: SourceKind, text: &str) -> InvoiceRecord {
     record.gross_amount_minor = amount_from_text(
         text,
         &[
-            "wartość brutto",
-            "wartosc brutto",
             "łączna kwota brutto",
             "laczna kwota brutto",
-            "razem do zapłaty",
-            "do zapłaty",
+            "wartość brutto",
+            "wartosc brutto",
             "kwota brutto",
             "razem brutto",
-            "brutto",
             "total gross",
-            "amount due",
             "total",
+            "brutto",
+            "razem do zapłaty",
+            "do zapłaty",
+            "amount due",
         ],
     );
-    record.net_amount_minor = amount_from_text(text, &["kwota netto", "netto", "total net", "net"]);
+    record.net_amount_minor = amount_from_text(
+        text,
+        &[
+            "total net",
+            "wartość netto",
+            "wartosc netto",
+            "kwota netto",
+            "netto",
+            "net",
+        ],
+    );
     record.vat_amount_minor = amount_from_text(
         text,
         &[
+            "total vat",
+            "wartość vat",
+            "wartosc vat",
             "kwota vat",
             "podatek vat",
             "vat amount",
             "tax amount",
             "podatek",
+            "vat",
         ],
     );
     record.currency = currency_from_text(text);
@@ -2038,9 +2146,10 @@ fn strip_xml(value: &str) -> String {
 
 fn invoice_number_from_text(text: &str) -> Option<String> {
     let patterns = [
+        r"(?is)numer\s+faktury[\s:#\-]*([0-9A-Z][A-Z0-9/_.\-]{2,})",
         r"(?im)^\s*invoice[ \t]*(?:no\.?|number)[ \t:#\-]*([A-Z0-9][A-Z0-9/_.\-]{2,})\s*$",
         r"(?i)(?:obraz\s+)?faktur(?:a|y)?\s*(?:vat)?\s*(?:nr|numer)?[\s:#\-\n]*([A-Z0-9][A-Z0-9/_.\-]{2,})",
-        r"(?i)(?:nr\s*faktury|invoice\s*(?:no\.?|number)?|numer)[\s:#\-\n]*([A-Z0-9][A-Z0-9/_.\-]{2,})",
+        r"(?i)(?:nr\s*faktury|invoice\s*(?:no\.?|number)?)[\s:#\-\n]*([A-Z0-9][A-Z0-9/_.\-]{2,})",
         r"(?i)\bFV[\s:#\-]*([A-Z0-9][A-Z0-9/_.\-]{2,})",
     ];
     for pattern in patterns {
@@ -2058,9 +2167,26 @@ fn invoice_number_from_text(text: &str) -> Option<String> {
 }
 
 fn is_valid_invoice_number_candidate(value: &str) -> bool {
+    let value = value.trim();
+    if value.chars().count() < 3 || !value.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
     !matches!(
         value,
-        "ZOSTA" | "ZOSTAŁA" | "VAT" | "FOR" | "INVOICE" | "NUMBER" | "DATE" | "DUE"
+        "ZOSTA"
+            | "ZOSTAŁA"
+            | "VAT"
+            | "FOR"
+            | "INVOICE"
+            | "NUMBER"
+            | "DATE"
+            | "DUE"
+            | "FAKTURY"
+            | "FAKTURA"
+            | "NUMER"
+            | "PODSTAWOWA"
+            | "SYSTEM"
+            | "KSEF"
     )
 }
 
@@ -2093,8 +2219,8 @@ fn clean_invoice_number(value: &str) -> String {
 
 fn tax_ids_from_text(text: &str) -> Vec<String> {
     let patterns = [
-        r"(?i)\b(?:NIP|VAT\s*ID|Tax\s*ID|PL\s*VAT|VAT)\b[^0-9]{0,16}(?:PL)?\s*([0-9][0-9\-\s]{8,}[0-9])",
-        r"(?i)\bPL\s*([0-9]{10})\b",
+        r"(?i)\b(?:NIP[ \t:]*|PL[ \t]+VAT[ \t:]*)(?:PL[ \t]*)?([0-9][0-9\- \t]{8,20}[0-9])\b",
+        r"(?i)\bPL[ \t]*([0-9]{10})\b",
     ];
     let mut seen = HashSet::new();
     let mut ids = Vec::new();
@@ -2207,12 +2333,59 @@ fn clean_name(value: &str) -> Option<String> {
 }
 
 fn counterparty_names_from_text(text: &str) -> (Option<String>, Option<String>) {
-    let seller = name_after_label(text, &["sprzedawca", "wystawca", "seller", "supplier"])
-        .or_else(|| name_before_label(text, &["bill to", "buyer", "customer"]))
-        .or_else(|| name_before_first_nip(text));
-    let buyer = name_after_label(
-        text,
+    let seller_labels = ["sprzedawca", "wystawca", "seller", "supplier"];
+    let seller = name_after_label(text, &seller_labels).or_else(|| {
+        if text
+            .lines()
+            .any(|line| name_label_match(line, &seller_labels).is_some())
+        {
+            None
+        } else {
+            name_before_label(text, &["bill to", "buyer", "customer"])
+                .or_else(|| name_before_first_nip(text))
+        }
+    });
+    let buyer_labels = [
+        "nabywca",
+        "odbiorca",
+        "kupujący",
+        "kupujacy",
+        "buyer",
+        "customer",
+        "bill to",
+    ];
+    let buyer = name_after_label(text, &buyer_labels).or_else(|| {
+        if text
+            .lines()
+            .any(|line| name_label_match(line, &buyer_labels).is_some())
+        {
+            None
+        } else {
+            name_before_nth_nip(text, 2)
+        }
+    });
+    (seller, buyer)
+}
+
+fn name_label_match<'a>(line: &'a str, labels: &[&str]) -> Option<regex::Match<'a>> {
+    let alternatives = labels
+        .iter()
+        .map(|label| regex::escape(label))
+        .collect::<Vec<_>>()
+        .join("|");
+    Regex::new(&format!(r"(?i)\b(?:{alternatives})\b(?:[ \t]+details\b)?"))
+        .ok()?
+        .find(line)
+}
+
+fn any_name_label(line: &str) -> Option<regex::Match<'_>> {
+    name_label_match(
+        line,
         &[
+            "sprzedawca",
+            "wystawca",
+            "seller",
+            "supplier",
             "nabywca",
             "odbiorca",
             "kupujący",
@@ -2222,44 +2395,39 @@ fn counterparty_names_from_text(text: &str) -> (Option<String>, Option<String>) 
             "bill to",
         ],
     )
-    .or_else(|| name_before_nth_nip(text, 2));
-    (seller, buyer)
 }
 
 fn name_after_label(text: &str, labels: &[&str]) -> Option<String> {
     let lines = raw_nonempty_lines(text);
     for (idx, line) in lines.iter().enumerate() {
-        let lower = line.to_lowercase();
-        let Some((label_pos, label_len)) = labels
-            .iter()
-            .find_map(|label| lower.find(label).map(|pos| (pos, label.len())))
-        else {
+        let Some(label) = name_label_match(line, labels) else {
             continue;
         };
-        let prefer_right_column = !line[..label_pos].trim().is_empty();
-        if let Some(after_label) = line.get(label_pos + label_len..).and_then(clean_name)
-            && is_probable_name_line(&after_label)
-        {
-            return Some(after_label);
+        // Regex offsets refer to the original UTF-8 string, not its lowercase copy.
+        let before = &line[..label.start()];
+        let after = &line[label.end()..];
+        let next_label = any_name_label(after);
+        let right_column = !before.trim().is_empty();
+        let paired = any_name_label(before).is_some() || next_label.is_some();
+        let inline = &after[..next_label.map_or(after.len(), |m| m.start())];
+        if let Some(name) = clean_name(inline).filter(|name| is_probable_name_line(name)) {
+            return Some(name);
         }
-        if let Some(after_colon) = line
-            .split_once(':')
-            .and_then(|(_, value)| clean_name(value))
-            && is_probable_name_line(&after_colon)
-        {
-            return Some(after_colon);
-        }
+        let column_start = line[..label.start()].chars().count();
         for candidate in lines.iter().skip(idx + 1).take(6) {
-            if prefer_right_column {
-                if let Some(segment) = right_column_segment(candidate)
-                    && is_probable_name_line(&segment)
-                {
-                    return clean_name(&segment);
-                }
+            if any_name_label(candidate).is_some() {
+                break;
             }
-            let cleaned = candidate.split_whitespace().collect::<Vec<_>>().join(" ");
-            if is_probable_name_line(&cleaned) {
-                return clean_name(&cleaned);
+            let segment = if paired || right_column {
+                name_column_segment(candidate, right_column, column_start)
+            } else {
+                Some(candidate.as_str())
+            };
+            if let Some(name) = segment
+                .and_then(clean_name)
+                .filter(|name| is_probable_name_line(name))
+            {
+                return Some(name);
             }
         }
     }
@@ -2269,11 +2437,10 @@ fn name_after_label(text: &str, labels: &[&str]) -> Option<String> {
 fn name_before_label(text: &str, labels: &[&str]) -> Option<String> {
     let lines = raw_nonempty_lines(text);
     for (idx, line) in lines.iter().enumerate() {
-        let lower = line.to_lowercase();
-        let Some(label_pos) = labels.iter().find_map(|label| lower.find(label)) else {
+        let Some(label) = name_label_match(line, labels) else {
             continue;
         };
-        if let Some(before_label) = clean_name(&line[..label_pos])
+        if let Some(before_label) = clean_name(&line[..label.start()])
             && is_probable_name_line(&before_label)
         {
             return Some(before_label);
@@ -2290,17 +2457,32 @@ fn name_before_label(text: &str, labels: &[&str]) -> Option<String> {
 
 fn raw_nonempty_lines(text: &str) -> Vec<String> {
     text.lines()
-        .map(|line| line.trim().to_string())
+        .map(|line| line.trim_end().to_string())
         .filter(|line| !line.is_empty())
         .collect()
 }
 
-fn right_column_segment(line: &str) -> Option<String> {
-    Regex::new(r"\s{2,}")
-        .ok()?
-        .split(line.trim())
-        .filter_map(clean_name)
-        .last()
+fn name_column_segment(line: &str, right: bool, column_start: usize) -> Option<&str> {
+    let separator = Regex::new(r" {2,}|\t+").ok()?;
+    let trimmed = line.trim();
+    if let Some(gap) = separator.find(trimmed) {
+        return Some(if right {
+            &trimmed[gap.end()..]
+        } else {
+            &trimmed[..gap.start()]
+        });
+    }
+    // A row can contain only one populated column. Keep its indentation.
+    let start = line.chars().take_while(|c| c.is_whitespace()).count();
+    let leading_tab = line
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .any(|c| c == '\t');
+    if right {
+        (leading_tab || start.saturating_add(2) >= column_start).then_some(trimmed)
+    } else {
+        (!leading_tab && start <= column_start.saturating_add(2)).then_some(trimmed)
+    }
 }
 
 fn name_before_first_nip(text: &str) -> Option<String> {
@@ -2334,8 +2516,13 @@ fn clean_lines(text: &str) -> Vec<String> {
 
 fn is_probable_name_line(line: &str) -> bool {
     let lower = line.to_lowercase();
-    line.len() >= 3
-        && line.len() <= 140
+    line.chars().count() >= 3
+        && !counterparty_name_is_placeholder(line)
+        && !matches!(lower.trim(), "name" | "name:" | "nazwa" | "nazwa:")
+        && !lower
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|word| word == "vat")
+        && line.chars().count() <= 140
         && !lower.contains("nip")
         && !lower.contains("regon")
         && !lower.contains("adres")
@@ -2362,6 +2549,9 @@ fn is_probable_name_line(line: &str) -> bool {
         && !lower.contains("zapl")
         && line.chars().any(|c| c.is_alphabetic())
 }
+
+#[cfg(test)]
+mod parser_names_tests;
 
 fn parse_money_minor(value: &str) -> Option<i64> {
     let mut s: String = value
@@ -2403,28 +2593,88 @@ fn parse_money_minor(value: &str) -> Option<i64> {
             1 => frac_part.parse::<i64>().ok()? * 10,
             _ => frac_part.parse::<i64>().ok()?,
         };
-        Some(sign * (units * 100 + cents))
+        units
+            .checked_mul(sign)?
+            .checked_mul(100)?
+            .checked_add(sign * cents)
     } else {
         s.retain(|c| c.is_ascii_digit() || c == '-');
-        s.parse::<i64>().ok().map(|v| v * 100)
+        s.parse::<i64>().ok().and_then(|v| v.checked_mul(100))
     }
 }
 
 fn amount_from_text(text: &str, labels: &[&str]) -> Option<i64> {
+    // Separatory grup wymagają pełnej części dziesiętnej. Nie łączymy kolumn ani linii.
+    let decimal = r"-?(?:[0-9]{1,3}(?:[ \u{00a0}\u{202f}][0-9]{3})+[.,][0-9]{2}|[0-9]{1,3}(?:\.[0-9]{3})+,[0-9]{2}|[0-9]{1,3}(?:,[0-9]{3})+\.[0-9]{2}|[0-9]+[.,][0-9]{2})";
+    let number = format!(r"(?:{decimal}|-?[0-9]+)");
+    let currency = r"(?:PLN|EUR|USD|GBP|CHF|CZK|SEK|NOK|DKK|zł|€|\$|£)";
+    let unit = format!(r"(?:\({currency}\)|{currency})");
+    let h = r"[\t \u{00a0}\u{202f}]*";
+    let value_re = Regex::new(&format!(
+        r"(?i)^{h}(?:{unit}{h})?({number})(?:{h}{currency})?{h}(?:$|[ \t]+(?:NET|VAT|TOTAL)\b)"
+    ))
+    .unwrap();
+    let parse_value = |value: &str| {
+        // Limit chroni również starszy parse_money_minor przed przepełnieniem.
+        if value.bytes().filter(u8::is_ascii_digit).count() > 16 {
+            return None;
+        }
+        parse_money_minor(value)
+    };
+
+    // Układ kolumn musi wynikać z nagłówka, nigdy z arytmetyki kwot.
+    // OCR może umieścić wartości w nagłówku, Poppler zachowuje osobny wiersz.
+    let header_re = Regex::new(&format!(
+        r"(?i)\bNET\b{h}(?:{unit}{h})?(?:{decimal}{h})?VAT\b{h}(?:{unit}{h})?(?:{decimal}{h})?TOTAL\b"
+    )).unwrap();
+    let row_re = Regex::new(&format!(
+        r"(?im)^[ \t]*TOTAL\b[ \t]*:?[ \t\r\n]+({decimal})[ \t\r\n]+({decimal})[ \t\r\n]+({decimal})[ \t]*\r?$"
+    )).unwrap();
+    let table = header_re.find_iter(text).find_map(|header| {
+        row_re.captures(&text[header.end()..]).map(|caps| {
+            [1, 2, 3].map(|column| caps.get(column).and_then(|m| parse_value(m.as_str())))
+        })
+    });
+
     for label in labels {
-        let pattern = format!(
-            r"(?i){}[^0-9€$£\-]{{0,120}}(?:[€$£]\s*)?(-?[0-9][0-9\s.,]{{0,20}})",
-            regex::escape(label)
-        );
-        let re = Regex::new(&pattern).unwrap();
-        if let Some(caps) = re.captures(text)
-            && let Some(value) = caps.get(1).and_then(|m| parse_money_minor(m.as_str()))
-        {
+        let column = match *label {
+            "net" => Some(0),
+            "vat" => Some(1),
+            "total" => Some(2),
+            _ => None,
+        };
+        if let Some(value) = column.and_then(|column| table.and_then(|row| row[column])) {
             return Some(value);
+        }
+        let label_re = Regex::new(&format!(
+            r"(?i)\b{}\b{h}(?:{unit}{h})?[:=]?{h}",
+            regex::escape(label)
+        ))
+        .unwrap();
+        let lines: Vec<_> = text.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            for label_match in label_re.find_iter(line) {
+                let tail = &line[label_match.end()..];
+                let candidate = if tail.is_empty() && line[..label_match.start()].trim().is_empty()
+                {
+                    // Tylko bezpośrednio następna linia; bez przeskakiwania nagłówków.
+                    lines.get(index + 1).copied().unwrap_or_default()
+                } else {
+                    tail
+                };
+                if let Some(caps) = value_re.captures(candidate)
+                    && let Some(value) = caps.get(1).and_then(|m| parse_value(m.as_str()))
+                {
+                    return Some(value);
+                }
+            }
         }
     }
     None
 }
+
+#[cfg(test)]
+mod parser_amounts_tests;
 
 fn normalize_currency(value: &str) -> Option<String> {
     let value = value.trim();
@@ -2528,11 +2778,9 @@ fn normalize_key(key: &str) -> String {
 }
 
 fn extract_pdf_text(path: &Path) -> Result<String> {
-    let pdftotext = Command::new("pdftotext")
-        .arg("-layout")
-        .arg(path)
-        .arg("-")
-        .output();
+    let mut command = Command::new(local_tool("pdftotext")?);
+    apply_isolated_env(&mut command);
+    let pdftotext = command.arg("-layout").arg(path).arg("-").output();
     match pdftotext {
         Ok(output) if output.status.success() => {
             let text = String::from_utf8_lossy(&output.stdout).to_string();
@@ -2580,26 +2828,25 @@ fn score_pair(ksef: &InvoiceRecord, mail: &InvoiceRecord) -> (u8, Vec<String>) {
         }
     }
 
-    let ksef_ids = [ksef.seller_tax_id.as_ref(), ksef.buyer_tax_id.as_ref()]
-        .into_iter()
-        .flatten()
-        .collect::<HashSet<_>>();
-    let mail_ids = [mail.seller_tax_id.as_ref(), mail.buyer_tax_id.as_ref()]
-        .into_iter()
-        .flatten()
-        .collect::<HashSet<_>>();
+    let ksef_ids = scoring_tax_ids(ksef);
+    let mail_ids = scoring_tax_ids(mail);
     if !ksef_ids.is_empty() && ksef_ids.iter().any(|id| mail_ids.contains(id)) {
         score += 20;
         reasons.push("tax_id match".to_string());
     }
-    if let (Some(a), Some(b)) = (&ksef.seller_tax_id, &mail.seller_tax_id)
-        && a == b
-    {
-        score += 5;
-        reasons.push("seller_tax_id same position".to_string());
+    if let (Some(a), Some(b)) = (&ksef.seller_tax_id, &mail.seller_tax_id) {
+        let a = normalize_tax_id(a);
+        let b = normalize_tax_id(b);
+        if a.is_some() && a == b && a.as_deref() != Some(DEFAULT_PRODUCTMESH_NIP) {
+            score += 5;
+            reasons.push("seller_tax_id same position".to_string());
+        }
     }
 
-    if let (Some(a), Some(b)) = (ksef.gross_amount_minor, mail.gross_amount_minor) {
+    if let (Some(a), Some(b)) = (ksef.gross_amount_minor, mail.gross_amount_minor)
+        && a != 0
+        && b != 0
+    {
         let diff = (a - b).abs();
         if diff == 0 {
             score += 20;
@@ -2629,6 +2876,49 @@ fn score_pair(ksef: &InvoiceRecord, mail: &InvoiceRecord) -> (u8, Vec<String>) {
     }
 
     (score.min(100) as u8, reasons)
+}
+
+fn scoring_tax_ids(record: &InvoiceRecord) -> HashSet<String> {
+    [
+        record.seller_tax_id.as_deref(),
+        record.buyer_tax_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(normalize_tax_id)
+    .filter(|id| id != DEFAULT_PRODUCTMESH_NIP)
+    .collect()
+}
+
+fn invoice_identity_match(left: &InvoiceRecord, right: &InvoiceRecord) -> bool {
+    if let (Some(left_ksef), Some(right_ksef)) = (&left.ksef_reference, &right.ksef_reference)
+        && !left_ksef.trim().is_empty()
+        && left_ksef == right_ksef
+    {
+        return true;
+    }
+    let Some(left_number) = left
+        .invoice_number
+        .as_deref()
+        .map(comparable_invoice_number)
+        .filter(|number| !number.is_empty())
+    else {
+        return false;
+    };
+    let Some(right_number) = right
+        .invoice_number
+        .as_deref()
+        .map(comparable_invoice_number)
+        .filter(|number| !number.is_empty())
+    else {
+        return false;
+    };
+    if left_number != right_number {
+        return false;
+    }
+    let left_ids = scoring_tax_ids(left);
+    let right_ids = scoring_tax_ids(right);
+    left_ids.is_empty() || right_ids.is_empty() || !left_ids.is_disjoint(&right_ids)
 }
 
 fn comparable_invoice_number(value: &str) -> String {
@@ -2766,7 +3056,10 @@ fn oauth_state() -> String {
 }
 
 fn wait_for_oauth_code(listener: &TcpListener) -> Result<(String, Option<String>)> {
-    let (mut stream, _) = listener.accept().context("oczekiwanie na redirect OAuth")?;
+    let (mut stream, peer) = listener.accept().context("oczekiwanie na redirect OAuth")?;
+    if !peer.ip().is_loopback() {
+        return Err(anyhow!("OAuth: połączenie spoza pętli lokalnej"));
+    }
     let mut buffer = [0u8; 8192];
     let len = stream.read(&mut buffer)?;
     let request = String::from_utf8_lossy(&buffer[..len]);
@@ -2828,40 +3121,27 @@ fn token_response_to_file(
 }
 
 fn save_gmail_token(path: &Path, token: &GmailTokenFile) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(token)?;
-    if uses_default_gmail_token_path(path)
-        && keychain_set_secret(
-            KEYCHAIN_ACCOUNT_GMAIL_TOKEN,
-            std::str::from_utf8(&bytes).context("token Gmail nie jest UTF-8")?,
-        )?
-    {
-        if path.exists() {
-            let _ = fs::remove_file(path);
-        }
+    let text = serde_json::to_string_pretty(token)?;
+    if uses_default_gmail_token_path(path) {
+        save_secret(Secret::GmailToken, &text)?;
         return Ok(());
     }
 
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-    }
-    fs::write(path, bytes).with_context(|| format!("zapis tokenu Gmail {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    write_private_file(path, text.as_bytes())
 }
 
 fn read_gmail_token(path: &Path) -> Result<GmailTokenFile> {
-    if uses_default_gmail_token_path(path)
-        && let Some(text) = keychain_get_secret(KEYCHAIN_ACCOUNT_GMAIL_TOKEN)?
-    {
-        return serde_json::from_str(&text).context("niepoprawny token Gmail w macOS Keychain");
+    if uses_default_gmail_token_path(path) {
+        let text = secret_value(Secret::GmailToken)?.ok_or_else(|| {
+            anyhow!(
+                "brak tokenu Gmail w Keychain i w {}; uruchom lab onboard",
+                path.display()
+            )
+        })?;
+        return serde_json::from_str(&text).context("niepoprawny token Gmail");
     }
 
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("odczyt tokenu Gmail {}", path.display()))?;
+    let text = read_secret_file(path, "token Gmail")?;
     serde_json::from_str(&text)
         .with_context(|| format!("niepoprawny token Gmail {}", path.display()))
 }
@@ -3405,6 +3685,38 @@ fn record_quality_score(record: &InvoiceRecord) -> usize {
     .count()
 }
 
+// A cache entry must cover and agree with every established invoice field.
+fn mail_cache_covers_fresh(cached: &InvoiceRecord, fresh: &InvoiceRecord) -> bool {
+    macro_rules! covers {
+        ($($field:ident),* $(,)?) => { true $(
+            && (fresh.$field.is_none() || fresh.$field == cached.$field)
+        )* };
+    }
+    covers!(
+        invoice_number,
+        seller_tax_id,
+        buyer_tax_id,
+        issue_date,
+        sale_date,
+        due_date,
+        gross_amount_minor,
+        net_amount_minor,
+        vat_amount_minor,
+        currency,
+        ksef_reference
+    ) && [
+        (&fresh.seller_name, &cached.seller_name),
+        (&fresh.buyer_name, &cached.buyer_name),
+    ]
+    .into_iter()
+    .all(|(fresh, cached)| {
+        fresh
+            .as_deref()
+            .is_none_or(counterparty_name_is_placeholder)
+            || fresh == cached
+    })
+}
+
 fn apply_cached_mail_candidates(
     path: &Path,
     candidates: &mut [InvoiceRecord],
@@ -3415,13 +3727,29 @@ fn apply_cached_mail_candidates(
     let cached = load_records(SourceKind::Mail, path)?;
     let by_hash = cached
         .into_iter()
+        .filter(|record| {
+            record
+                .warnings
+                .iter()
+                .any(|warning| warning == MAIL_PARSER_VERSION)
+        })
         .map(|record| (record.content_hash.clone(), record))
         .collect::<HashMap<_, _>>();
     let mut cached_hashes = HashSet::new();
     for candidate in candidates {
         if let Some(cached) = by_hash.get(&candidate.content_hash) {
-            *candidate = cached.clone();
-            cached_hashes.insert(candidate.content_hash.clone());
+            if mail_parse_needs_retry(cached) || !mail_cache_covers_fresh(cached, candidate) {
+                continue;
+            }
+            merge_mail_fields(candidate, cached);
+            for warning in &cached.warnings {
+                if !candidate.warnings.contains(warning) {
+                    candidate.warnings.push(warning.clone());
+                }
+            }
+            if !record_missing_core_fields(cached) && !mail_parse_needs_retry(candidate) {
+                cached_hashes.insert(candidate.content_hash.clone());
+            }
         }
     }
     Ok(cached_hashes)
@@ -3457,14 +3785,39 @@ where
     if todo == 0 {
         return Ok(());
     }
-    eprintln!(
-        "  [Gmail/Gemma] wzbogacanie {} kandydatów przez {}...",
-        todo,
+    let use_openrouter = openrouter_configured();
+    let model = if use_openrouter {
+        openrouter_model()
+    } else {
         llm_model()
+    };
+    let extract: fn(&mut InvoiceRecord, &Path) -> Result<bool> = if use_openrouter {
+        openrouter_extract_invoice_fields
+    } else {
+        gemma_extract_invoice_fields
+    };
+    eprintln!(
+        "  [Gmail/LLM] wzbogacanie {} kandydatów przez {}...",
+        todo, model
     );
-    ensure_ppmlx_server()?;
+    if !use_openrouter
+        && let Err(err) = ensure_ppmlx_server()
+    {
+        eprintln!("  [Gmail/LLM] pominięto wzbogacanie: {err}");
+        for idx in 0..records.len() {
+            if !skip_hashes.contains(&records[idx].content_hash)
+                && record_missing_core_fields(&records[idx])
+            {
+                let warning = format!("LLM niedostępny: {err}");
+                if !records[idx].warnings.contains(&warning) {
+                    records[idx].warnings.push(warning);
+                }
+                after_record(records, idx)?;
+            }
+        }
+        return Ok(());
+    }
     let mut processed = 0usize;
-    let mut consecutive_errors = 0usize;
     for idx in 0..records.len() {
         if skip_hashes.contains(&records[idx].content_hash)
             || !record_missing_core_fields(&records[idx])
@@ -3481,59 +3834,51 @@ where
         processed += 1;
         let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("PDF");
         let status = format!("LLM: {}/{} {}", processed, todo, fname);
-        eprintln!("  [Gmail/Gemma] {}", status);
+        eprintln!("  [Gmail/LLM] {}", status);
         if let Some(ref p) = progress {
             *p.lock().unwrap() = status;
         }
-        let mut stop_after_persist = false;
-        match gemma_extract_invoice_fields(&mut records[idx], path) {
+        match extract(&mut records[idx], path) {
             Ok(true) => {
-                consecutive_errors = 0;
-                records[idx]
-                    .warnings
-                    .push("gemma-4-e4b enrichment applied".to_string());
+                records[idx].warnings.push(format!(
+                    "LLM {model}: zastosowano zweryfikowane uzupełnienie"
+                ));
             }
-            Ok(false) => {
-                consecutive_errors = 0;
-            }
+            Ok(false) => {}
             Err(err) => {
-                consecutive_errors += 1;
-                records[idx].warnings.push(format!("gemma-4-e4b: {err}"));
-                eprintln!("  [Gmail/Gemma] błąd: {err}");
-                if consecutive_errors >= 2 {
-                    stop_after_persist = true;
+                let warning = format!("LLM {model}: {err}");
+                if !records[idx].warnings.contains(&warning) {
+                    records[idx].warnings.push(warning);
                 }
+                eprintln!("  [Gmail/LLM] odrzucono uzupełnienie: {err}");
             }
         }
         after_record(records, idx)?;
-        if stop_after_persist {
-            eprintln!("  [Gmail/Gemma] pomijam dalsze wzbogacanie po 2 kolejnych błędach");
-            break;
-        }
     }
-    eprintln!("  [Gmail/Gemma] gotowe");
+    eprintln!("  [Gmail/LLM] gotowe");
     Ok(())
 }
 
-fn ppmlx_base_url() -> String {
-    std::env::var("PPMLX_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:6767".to_string())
+fn ppmlx_base_url() -> Result<String> {
+    local_llm_base_url(
+        &lab_config_var("PPMLX_BASE_URL").unwrap_or_else(|| "http://127.0.0.1:6767".to_string()),
+    )
 }
 
 fn llm_model() -> String {
-    std::env::var("LAB_LLM_MODEL").unwrap_or_else(|_| "gemma-4-e4b-it-optiq".to_string())
+    lab_config_var("LAB_LLM_MODEL").unwrap_or_else(|| "gemma-4-e4b-it-optiq".to_string())
 }
 
 fn llm_timeout() -> Duration {
     Duration::from_secs(
-        std::env::var("LAB_LLM_TIMEOUT_SECS")
-            .ok()
+        lab_config_var("LAB_LLM_TIMEOUT_SECS")
             .and_then(|value| value.parse().ok())
             .unwrap_or(45),
     )
 }
 
 fn ensure_ppmlx_server() -> Result<()> {
-    let base = ppmlx_base_url();
+    let base = ppmlx_base_url()?;
     let model = llm_model();
     let client = Client::builder().timeout(Duration::from_secs(2)).build()?;
     if client
@@ -3543,32 +3888,17 @@ fn ensure_ppmlx_server() -> Result<()> {
     {
         return Ok(());
     }
-    if !(base.contains("127.0.0.1") || base.contains("localhost")) {
-        return Err(anyhow!("ppmlx server niedostępny: {base}"));
-    }
-    Command::new("ppmlx")
-        .args(["serve", "--model", &model])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("uruchomienie `ppmlx serve`")?;
-    for _ in 0..30 {
-        sleep(Duration::from_secs(1));
-        if client
-            .get(format!("{base}/v1/models"))
-            .send()
-            .is_ok_and(|r| r.status().is_success())
-        {
-            return Ok(());
-        }
-    }
-    Err(anyhow!("ppmlx server nie wystartował na {base}"))
+    Err(anyhow!(
+        "ppmlx niedostępny: {base}; uruchom w osobnym terminalu: ppmlx serve --model {model}"
+    ))
 }
 
 fn gemma_extract_invoice_fields(record: &mut InvoiceRecord, path: &Path) -> Result<bool> {
-    let text = extract_pdf_text(path).unwrap_or_default();
-    if text.trim().is_empty() {
-        return Ok(false);
+    let (text, extraction_warnings) = extract_document_text(path)?;
+    if text.chars().count() > 60_000 {
+        return Err(anyhow!(
+            "Dokument przekracza limit 60000 znaków LLM; nie obcinam stron"
+        ));
     }
     let prompt = format!(
         r#"Wyciągnij dane faktury z tekstu PDF.
@@ -3607,16 +3937,20 @@ Tekst PDF:
 ---
 {}
 ---"#,
-        text.chars().take(12000).collect::<String>()
+        text
     );
     let value = ppmlx_extract_json(&prompt)?;
-    let before = serde_json::to_string(record)?;
-    apply_extracted_invoice_json(record, &value);
-    Ok(serde_json::to_string(record)? != before)
+    let changed = invoice_validation::apply_normalized_invoice_json(record, &value)?;
+    for warning in extraction_warnings {
+        if !record.warnings.contains(&warning) {
+            record.warnings.push(warning);
+        }
+    }
+    Ok(changed)
 }
 
 fn ppmlx_extract_json(prompt: &str) -> Result<Value> {
-    let base = ppmlx_base_url();
+    let base = ppmlx_base_url()?;
     let model = llm_model();
     let client = Client::builder().timeout(llm_timeout()).build()?;
     let body = serde_json::json!({
@@ -3638,15 +3972,7 @@ fn ppmlx_extract_json(prompt: &str) -> Result<Value> {
         {
             Ok(resp) if resp.status().is_success() => {
                 let response: Value = resp.json()?;
-                let content = response
-                    .get("choices")
-                    .and_then(|v| v.as_array())
-                    .and_then(|choices| choices.first())
-                    .and_then(|choice| choice.get("message"))
-                    .and_then(|message| message.get("content"))
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("ppmlx response bez choices[0].message.content"))?;
-                return parse_json_from_llm(content);
+                return ppmlx_response_json(&response);
             }
             Ok(resp) if resp.status().as_u16() == 503 => {
                 let delay = std::time::Duration::from_secs(2u64.pow(attempt));
@@ -3675,6 +4001,32 @@ fn ppmlx_extract_json(prompt: &str) -> Result<Value> {
         anyhow!("ppmlx nie odpowiedział po 5 próbach (503 Service Unavailable)")
     }))
 }
+
+fn ppmlx_response_json(response: &Value) -> Result<Value> {
+    let choice = response
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|v| v.first())
+        .ok_or_else(|| anyhow!("ppmlx: brak odpowiedzi modelu"))?;
+    if choice
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .is_some_and(|r| r != "stop")
+    {
+        return Err(anyhow!(
+            "ppmlx: odpowiedź nie została zakończona poprawnie; nie zapisuję częściowego JSON"
+        ));
+    }
+    let content = choice
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("ppmlx: brak treści odpowiedzi"))?;
+    parse_json_from_llm(content)
+}
+
+#[cfg(test)]
+mod llm_flow_tests;
 
 fn parse_json_from_llm(content: &str) -> Result<Value> {
     let sanitized = sanitize_llm_content(content);
@@ -3860,11 +4212,24 @@ fn apply_extracted_invoice_json(record: &mut InvoiceRecord, value: &Value) {
         record.buyer_tax_id =
             json_first_string(value, &["buyer_tax_id"]).and_then(|v| normalize_tax_id(&v));
     }
-    if record.seller_name.is_none() {
-        record.seller_name =
-            json_first_string(value, &["seller_name"]).and_then(|v| clean_name(&v));
+    if record
+        .seller_name
+        .as_deref()
+        .is_none_or(counterparty_name_is_placeholder)
+        && let Some(name) = json_first_string(value, &["seller_name"])
+            .and_then(|v| clean_name(&v))
+            .filter(|v| !counterparty_name_is_placeholder(v))
+    {
+        record.seller_name = Some(name);
     }
-    if record.buyer_name.is_none() {
-        record.buyer_name = json_first_string(value, &["buyer_name"]).and_then(|v| clean_name(&v));
+    if record
+        .buyer_name
+        .as_deref()
+        .is_none_or(counterparty_name_is_placeholder)
+        && let Some(name) = json_first_string(value, &["buyer_name"])
+            .and_then(|v| clean_name(&v))
+            .filter(|v| !counterparty_name_is_placeholder(v))
+    {
+        record.buyer_name = Some(name);
     }
 }

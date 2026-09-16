@@ -1,6 +1,63 @@
 use crate::*;
 use chrono::Datelike;
 
+const SORT_LABELS: [&str; 7] = [
+    "domyślne",
+    "data",
+    "faktura",
+    "kontrahent",
+    "brutto",
+    "waluta",
+    "źródła",
+];
+
+fn compare_sort_values<T: Ord>(a: Option<T>, b: Option<T>, descending: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            if descending {
+                b.cmp(&a)
+            } else {
+                a.cmp(&b)
+            }
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn compare_invoice_sort(
+    a: &InvoiceRecord,
+    b: &InvoiceRecord,
+    column: usize,
+    descending: bool,
+) -> std::cmp::Ordering {
+    match column {
+        1 => compare_sort_values(a.issue_date, b.issue_date, descending),
+        2 => compare_sort_values(
+            a.invoice_number.as_ref().map(|s| s.to_lowercase()),
+            b.invoice_number.as_ref().map(|s| s.to_lowercase()),
+            descending,
+        ),
+        3 => compare_sort_values(
+            Some(counterparty_name(Some(a)).to_lowercase()),
+            Some(counterparty_name(Some(b)).to_lowercase()),
+            descending,
+        ),
+        4 => compare_sort_values(a.gross_amount_minor, b.gross_amount_minor, descending),
+        5 => compare_sort_values(
+            a.currency.as_ref().map(|s| s.to_lowercase()),
+            b.currency.as_ref().map(|s| s.to_lowercase()),
+            descending,
+        ),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+#[cfg(test)]
+mod sorting_tests;
+
 pub(crate) fn interactive_tui(db_path: &Path) -> Result<()> {
     interactive_reconcile_actions(db_path)
 }
@@ -180,7 +237,14 @@ impl InvoiceTableRow {
         self.upload_item.is_some() || self.ksef_document_id.is_some()
     }
 
+    fn is_approved_in_ksef_and_saldeo(&self) -> bool {
+        self.ksef_accounting == Some(true)
+    }
+
     fn needs_attention(&self) -> bool {
+        if self.is_approved_in_ksef_and_saldeo() {
+            return false;
+        }
         self.is_actionable()
             || self.sources.contains('-')
             || self.updated
@@ -793,6 +857,8 @@ pub(crate) fn run_invoice_table_tui(
     let mut table_sel = 0usize;
     let mut menu_sel = 0usize;
     let mut actionable_only = false;
+    let mut sort_column = 0usize;
+    let mut sort_descending = false;
     let mut editing_year: Option<String> = None;
     let mut editing_threshold: Option<String> = None;
     let mut paint_mode: bool = false;
@@ -925,11 +991,31 @@ pub(crate) fn run_invoice_table_tui(
             last_tick = std::time::Instant::now();
         }
 
-        let visible = rows
+        let mut visible = rows
             .iter()
             .enumerate()
-            .filter_map(|(idx, row)| (!actionable_only || row.needs_attention()).then_some(idx))
+            .filter_map(|(idx, row)| {
+                invoice_table_row_passes_filter(row, actionable_only).then_some(idx)
+            })
             .collect::<Vec<_>>();
+        if sort_column != 0 {
+            visible.sort_by(|&a, &b| {
+                if sort_column == 6 {
+                    compare_sort_values(
+                        Some(&rows[a].sources),
+                        Some(&rows[b].sources),
+                        sort_descending,
+                    )
+                } else {
+                    compare_invoice_sort(
+                        &rows[a].record,
+                        &rows[b].record,
+                        sort_column,
+                        sort_descending,
+                    )
+                }
+            });
+        }
         if visible.is_empty() {
             table_sel = 0;
         } else if table_sel >= visible.len() {
@@ -1025,7 +1111,11 @@ pub(crate) fn run_invoice_table_tui(
             .header(header)
             .block(
                 Block::default()
-                    .title(format!(" LAB faktury {year} · próg {review_score} "))
+                    .title(format!(
+                        " LAB faktury {year} · zgodność 3way {review_score} · s: sort {} {} · Shift+s: kierunek ",
+                        SORT_LABELS[sort_column],
+                        if sort_column == 0 { "" } else if sort_descending { "↓" } else { "↑" },
+                    ))
                     .borders(Borders::ALL)
                     .border_style(theme.very_muted()),
             )
@@ -1065,7 +1155,7 @@ pub(crate) fn run_invoice_table_tui(
                         editing_year.is_some(),
                     ),
                     mkbtn(
-                        &format!("Próg:{}", threshold_text),
+                        &format!("zgodność 3way:{}", threshold_text),
                         SM_THRESHOLD,
                         editing_threshold.is_some(),
                     ),
@@ -1175,7 +1265,8 @@ pub(crate) fn run_invoice_table_tui(
                 rows.len()
             );
             let help =
-                "f=braki/zmiany  e=popraw  spc=toggle  ⏎=select  ⌘c=commit  q=wyjdź".to_string();
+                "f=ukryj zatw. K+S  e=popraw  spc=toggle  ⏎=select  ⌘c=commit  q=wyjdź"
+                    .to_string();
             let stats_span = ratatui::text::Span::styled(
                 stats_text,
                 theme.muted().add_modifier(Modifier::ITALIC),
@@ -1250,7 +1341,7 @@ pub(crate) fn run_invoice_table_tui(
                             let db = db_path.to_path_buf();
                             let (tx, rx) = std::sync::mpsc::channel();
                             let progress =
-                                Arc::new(Mutex::new(format!("Przebudowa (próg {t})...")));
+                                Arc::new(Mutex::new(format!("Przebudowa (zgodność 3way {t})...")));
                             let progress_clone = progress.clone();
                             std::thread::spawn(move || {
                                 redirect_stderr_to_log();
@@ -1765,6 +1856,17 @@ pub(crate) fn run_invoice_table_tui(
                         rows[row_idx].selected = !rows[row_idx].selected;
                     }
                 }
+                KeyCode::Char('s') if !cmd => {
+                    sort_column = (sort_column + 1) % SORT_LABELS.len();
+                    table_sel = 0;
+                }
+                KeyCode::Char('S') if !cmd => {
+                    if sort_column == 0 {
+                        sort_column = 1;
+                    }
+                    sort_descending = !sort_descending;
+                    table_sel = 0;
+                }
                 KeyCode::Char('f') => {
                     actionable_only = !actionable_only;
                     table_sel = 0;
@@ -1793,6 +1895,13 @@ pub(crate) fn invoice_table_action_ksef_label(row: &InvoiceTableRow) -> String {
         InvoiceTableAction::RejectKsef => "ODRZUĆ".to_string(),
         InvoiceTableAction::None => invoice_table_ksef_status(row),
     }
+}
+
+pub(crate) fn invoice_table_row_passes_filter(
+    row: &InvoiceTableRow,
+    hide_approved_ksef_saldeo: bool,
+) -> bool {
+    !hide_approved_ksef_saldeo || !row.is_approved_in_ksef_and_saldeo()
 }
 
 pub(crate) fn invoice_table_ksef_status(row: &InvoiceTableRow) -> String {
