@@ -56,6 +56,17 @@ impl SecretSource {
 }
 
 impl Secret {
+    pub(crate) const ALL: [Secret; 8] = [
+        Secret::GmailToken,
+        Secret::SaldeoStorageState,
+        Secret::KsefToken,
+        Secret::KsefCertPassword,
+        Secret::KsefAccessToken,
+        Secret::SaldeoUsername,
+        Secret::SaldeoPassword,
+        Secret::OpenRouterApiKey,
+    ];
+
     pub(crate) fn account(self) -> &'static str {
         match self {
             Secret::GmailToken => ACCOUNT_GMAIL_TOKEN,
@@ -137,11 +148,6 @@ impl Secret {
             | Secret::OpenRouterApiKey => None,
         }
     }
-
-    /// Po udanym zapisie w Keychain plik zapasowy jest zbędny.
-    fn drops_file_after_store(self) -> bool {
-        matches!(self, Secret::GmailToken | Secret::KsefAccessToken)
-    }
 }
 
 pub(crate) fn saldeo_login_pair() -> Result<Option<(String, String)>> {
@@ -156,7 +162,7 @@ pub(crate) fn saldeo_login_pair() -> Result<Option<(String, String)>> {
     }
 }
 
-/// Kolejność: env procesu → Keychain → ~/.config/lab/env (z migracją) → plik 0600.
+/// Kolejność: env procesu → `.env` → plik 0600 → opcjonalnie Keychain (`LAB_USE_KEYCHAIN=1`).
 pub(crate) fn secret_value(secret: Secret) -> Result<Option<String>> {
     Ok(resolve_secret(secret)?.0)
 }
@@ -171,6 +177,14 @@ pub(crate) fn secret_is_set(secret: Secret) -> bool {
     secret_source(secret).is_set()
 }
 
+pub(crate) fn prepare_secret_store() {
+    if !keychain_enabled() {
+        return;
+    }
+    let _ = export_keychain_secrets_to_dotenv();
+    let _ = export_file_backed_secrets();
+}
+
 fn resolve_secret(secret: Secret) -> Result<(Option<String>, SecretSource)> {
     if let Some(key) = secret.env_key()
         && let Some(value) = process_env(key)
@@ -178,64 +192,67 @@ fn resolve_secret(secret: Secret) -> Result<(Option<String>, SecretSource)> {
         return Ok((Some(value), SecretSource::Env));
     }
 
-    if let Some(value) = store_get(secret) {
-        let _ = drop_secret_keys_from_env_file();
-        return Ok((Some(value), SecretSource::Keychain));
-    }
-
     if let Some(key) = secret.env_key()
-        && let Some(value) = env_file_secret(key)
+        && let Some(value) = dotenv_secret(key)
     {
-        let stored = migrate_env_file_secret(secret, key, &value)?;
-        let source = if stored {
-            SecretSource::Keychain
-        } else {
-            SecretSource::File
-        };
-        return Ok((Some(value), source));
+        return Ok((Some(value), SecretSource::File));
     }
 
     if let Some(path) = secret.file_path().filter(|path| path.is_file()) {
         let text = read_secret_file(&path, secret.label())?;
         if !text.trim().is_empty() {
-            let _ = store_set(secret, &text);
             return Ok((Some(text), SecretSource::File));
         }
+    }
+
+    if let Some(key) = secret.env_key()
+        && let Some(value) = env_file_secret(key)
+    {
+        let _ = migrate_env_file_secret(secret, key, &value);
+        return Ok((Some(value), SecretSource::File));
+    }
+
+    if keychain_enabled()
+        && let Some(value) = store_get(secret)
+    {
+        if let Some(key) = secret.env_key() {
+            let _ = upsert_dotenv_secret(key, &value);
+        }
+        return Ok((Some(value), SecretSource::Keychain));
     }
 
     Ok((None, SecretSource::Missing))
 }
 
-/// Zapis sekretu: Keychain, a przy jego braku plik 0600 — o ile sekret ma plik.
+/// Zapis sekretu: `.env` albo plik 0600. Keychain tylko przy `LAB_USE_KEYCHAIN=1`.
 pub(crate) fn save_secret(secret: Secret, value: &str) -> Result<SecretSource> {
     if value.trim().is_empty() {
         return Err(anyhow!("{} jest puste; nie zapisuję", secret.label()));
     }
 
-    let failure = match store_set(secret, value) {
-        Ok(true) => None,
-        Ok(false) => Some(anyhow!("Keychain jest niedostępny")),
-        Err(err) => Some(err),
-    };
-
-    let Some(failure) = failure else {
-        if let Some(path) = secret
-            .file_path()
-            .filter(|path| secret.drops_file_after_store() && path.is_file())
-        {
-            let _ = fs::remove_file(&path);
+    if let Some(key) = secret.env_key() {
+        upsert_dotenv_secret(key, value)?;
+        if keychain_enabled() {
+            let _ = store_set(secret, value);
         }
-        return Ok(SecretSource::Keychain);
-    };
+        return Ok(SecretSource::File);
+    }
 
-    let Some(path) = secret.file_path() else {
-        return Err(failure.context(format!(
-            "nie mogę zapisać {} w Keychain; plik env nie przechowuje sekretów",
-            secret.label()
-        )));
-    };
-    write_private_file(&path, value.as_bytes())?;
-    Ok(SecretSource::File)
+    if let Some(path) = secret.file_path() {
+        write_private_file(&path, value.as_bytes())?;
+        if keychain_enabled() {
+            let _ = store_set(secret, value);
+        }
+        return Ok(SecretSource::File);
+    }
+
+    if keychain_enabled() && store_set(secret, value).unwrap_or(false) {
+        return Ok(SecretSource::Keychain);
+    }
+    Err(anyhow!(
+        "nie mogę zapisać {}; użyj .env albo pliku 0600",
+        secret.label()
+    ))
 }
 
 /// Usuwa sekrety z mapy pliku env i przenosi je do Keychain.
@@ -282,29 +299,221 @@ fn ensure_private_mode(path: &Path, what: &str) -> Result<()> {
     Ok(())
 }
 
-fn drop_secret_keys_from_env_file() -> Result<()> {
-    let mut vars = read_lab_env_file()?;
-    let mut changed = false;
-    for key in SECRET_ENV_KEYS {
-        if vars.remove(key).is_some() {
-            changed = true;
-        }
-    }
-    if changed {
-        write_lab_env_file(&vars)?;
-    }
-    Ok(())
-}
-
-fn migrate_env_file_secret(secret: Secret, key: &str, value: &str) -> Result<bool> {
-    if !store_set(secret, value).unwrap_or(false) {
-        return Ok(false);
-    }
+fn migrate_env_file_secret(_secret: Secret, key: &str, value: &str) -> Result<bool> {
+    upsert_dotenv_secret(key, value)?;
     let mut vars = read_lab_env_file()?;
     if vars.remove(key).is_some() {
         write_lab_env_file(&vars)?;
     }
     Ok(true)
+}
+
+fn keychain_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(ctx) = testing::current() {
+        return ctx
+            .env
+            .get("LAB_USE_KEYCHAIN")
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    }
+    std::env::var("LAB_USE_KEYCHAIN")
+        .ok()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+pub(crate) fn lab_dotenv_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(ctx) = testing::current() {
+        return ctx.root.join(".env");
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let override_path = std::env::var_os("LAB_DOTENV").map(PathBuf::from);
+    select_lab_dotenv_path(&cwd, &home, override_path.as_deref())
+}
+
+pub(crate) fn select_lab_dotenv_path(
+    cwd: &Path,
+    home: &Path,
+    override_path: Option<&Path>,
+) -> PathBuf {
+    if let Some(path) = override_path {
+        return path.to_path_buf();
+    }
+    if cwd_is_lab_package(cwd) && cwd_dotenv_is_untracked_and_ignored(cwd) {
+        return cwd.join(".env");
+    }
+    home.join(".config").join("lab").join(".env")
+}
+
+fn cwd_is_lab_package(cwd: &Path) -> bool {
+    let Ok(manifest) = fs::read_to_string(cwd.join("Cargo.toml")) else {
+        return false;
+    };
+    // Fail closed for multiline TOML strings, which can contain fake table headers.
+    if manifest.contains("\"\"\"") || manifest.contains("'''") {
+        return false;
+    }
+    let package_header = Regex::new(r"^\[package\]\s*(?:#.*)?$").unwrap();
+    let package_name = Regex::new(r#"^(?:"lab-cli"|'lab-cli')\s*(?:#.*)?$"#).unwrap();
+    let mut in_package = false;
+    let mut seen_package = false;
+    let mut name_matches = None;
+    for line in manifest.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_package = package_header.is_match(line);
+            if in_package {
+                if seen_package {
+                    return false;
+                }
+                seen_package = true;
+            }
+        } else if in_package
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim() == "name"
+        {
+            if name_matches.is_some() {
+                return false;
+            }
+            name_matches = Some(package_name.is_match(value.trim()));
+        }
+    }
+    name_matches == Some(true)
+}
+
+fn cwd_dotenv_is_untracked_and_ignored(cwd: &Path) -> bool {
+    let git_command = || {
+        let mut command = Command::new("git");
+        command
+            .current_dir(cwd)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    };
+    let Ok(tracked) = git_command().args(["ls-files", "--", ".env"]).output() else {
+        return false;
+    };
+    if !tracked.status.success() || !tracked.stdout.is_empty() {
+        return false;
+    }
+    git_command()
+        .args(["check-ignore", "--quiet", "--no-index", "--", ".env"])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn parse_env_text(text: &str) -> HashMap<String, String> {
+    let mut vars = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        vars.insert(key.trim().to_string(), unquote_env_value(value.trim()));
+    }
+    vars
+}
+
+fn read_dotenv() -> HashMap<String, String> {
+    let path = lab_dotenv_path();
+    if !path.is_file() {
+        return HashMap::new();
+    }
+    fs::read_to_string(&path)
+        .ok()
+        .map(|text| parse_env_text(&text))
+        .unwrap_or_default()
+}
+
+pub(crate) fn dotenv_secret(key: &str) -> Option<String> {
+    read_dotenv()
+        .remove(key)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn upsert_dotenv_secret(key: &str, value: &str) -> Result<()> {
+    let mut vars = read_dotenv();
+    vars.insert(key.to_string(), value.to_string());
+    write_dotenv(&vars)
+}
+
+fn write_dotenv(vars: &HashMap<String, String>) -> Result<()> {
+    let path = lab_dotenv_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    let mut keys = vars.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    let mut out = String::from("# LAB secrets. Do not commit. chmod 600.\n");
+    for key in keys {
+        if let Some(value) = vars.get(&key) {
+            out.push_str(&format!("{}={}\n", key, quote_env_value(value)));
+        }
+    }
+    write_private_file(&path, out.as_bytes())
+}
+
+fn export_keychain_secrets_to_dotenv() -> Result<usize> {
+    if lab_dotenv_path().is_file() {
+        return Ok(0);
+    }
+    let mut vars = read_dotenv();
+    let mut added = 0usize;
+    for secret in Secret::ALL {
+        let Some(key) = secret.env_key() else {
+            continue;
+        };
+        if vars.get(key).is_some_and(|value| !value.trim().is_empty()) {
+            continue;
+        }
+        let Some(value) = store_get(secret) else {
+            continue;
+        };
+        vars.insert(key.to_string(), value);
+        added += 1;
+    }
+    if added > 0 || (!vars.is_empty() && !lab_dotenv_path().is_file()) {
+        write_dotenv(&vars)?;
+    }
+    if added > 0 {
+        eprintln!(
+            "  [LAB] zapisano {added} sekretów do {} (poza git)",
+            lab_dotenv_path().display()
+        );
+    }
+    Ok(added)
+}
+
+fn export_file_backed_secrets() -> Result<usize> {
+    let mut added = 0usize;
+    for secret in [
+        Secret::GmailToken,
+        Secret::SaldeoStorageState,
+        Secret::KsefAccessToken,
+    ] {
+        let Some(path) = secret.file_path() else {
+            continue;
+        };
+        if path.is_file() {
+            continue;
+        }
+        let Some(value) = store_get(secret) else {
+            continue;
+        };
+        write_private_file(&path, value.as_bytes())?;
+        added += 1;
+    }
+    Ok(added)
 }
 
 fn env_file_secret(key: &str) -> Option<String> {
@@ -333,6 +542,9 @@ fn store_get(secret: Secret) -> Option<String> {
             .flatten()
             .filter(|v| !v.trim().is_empty());
     }
+    if !keychain_enabled() {
+        return None;
+    }
     keychain_get_secret(secret.account())
         .ok()
         .flatten()
@@ -343,6 +555,9 @@ fn store_set(secret: Secret, value: &str) -> Result<bool> {
     #[cfg(test)]
     if let Some(ctx) = testing::current() {
         return ctx.set(secret.account(), value);
+    }
+    if !keychain_enabled() {
+        return Ok(false);
     }
     keychain_set_secret(secret.account(), value)
 }

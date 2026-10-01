@@ -26,18 +26,21 @@ Ustawienia przez zmienne środowiskowe lub `~/.config/lab/env`:
 - `LAB_OCR_PYTHON`: interpreter ze zainstalowanym `mlx_vlm`; domyślnie środowisko uv ppmlx, a jeśli go brak — `python3`.
 - `LAB_OCR_MAX_PAGES=10`, `LAB_OCR_TIMEOUT_SECS=180`: limity. Przekroczenie limitu nie daje częściowego wyniku.
 - `LAB_OCR_CACHE_DIR`: domyślnie `~/.cache/lab/ocr`. Cache jest powiązany z zawartością PDF, modelem i wersją adaptera. Tekst faktur jest zapisywany z uprawnieniami 600.
-- `LAB_LLM_MODEL`: model tekstowy ppmlx, domyślnie `gemma-4-e4b-it-optiq`. MiniCPM5 można wybrać do eksperymentów, ale próba na fakturach wykazała braki pól.
+- `OPENROUTER_API_KEY`: jeśli ustawiony, LAB wysyła sam plik PDF do OpenRouter (Gemini) przez zwykłe Chat Completions i żąda JSON według schematu 12 pól. Nie wysyła lokalnego tekstu Poppler/OCR i nie używa Batch API. Domyślny model: `google/gemini-3.8-flash`. Klucz zapisany przez `lab onboard` trafia do `.env`; Keychain jest opcjonalny (`LAB_USE_KEYCHAIN=1`). PDF chroniony hasłem jest pomijany: bez OCR, bez OpenRouter i bez zgadywania numeru z nazwy pliku. Gemini dostaje tylko trudne kandydatów faktur: brak numeru, daty albo kwoty brutto (albo niespójne kwoty) oraz sygnał faktury w numerze, NIP, KSeF, nazwie pliku albo temacie. Sam brak nazwy albo waluty nie uruchamia płatnego modelu. Wybrane wiersze w TUI (LLM) omijają ten filtr.
+- `LAB_OPENROUTER_MODEL`: nadpisuje model OpenRouter. Sufiks `:batch` jest obcinany, żeby request szedł na Chat Completions. Postęp: `OpenRouter N/M (xx%)`.
+- `LAB_OPENROUTER_TIMEOUT_SECS=120`, `LAB_OPENROUTER_PDF_ENGINE=native`.
+- `LAB_LLM_MODEL`: lokalny model tekstowy ppmlx, domyślnie `gemma-4-e4b-it-optiq`. Używany tylko gdy brak `OPENROUTER_API_KEY`.
 - `PPMLX_BASE_URL=http://127.0.0.1:6767`, `LAB_LLM_TIMEOUT_SECS=45`.
 
-Serwer LLM uruchom osobno, np. po pobraniu wybranego modelu:
+Gdy jest `OPENROUTER_API_KEY`, lokalny serwer LLM nie jest potrzebny. Bez klucza uruchom serwer osobno:
 
 ```bash
 ppmlx serve --model gemma-4-e4b-it-optiq
 ```
 
-Sekrety trzyma macOS Keychain (usługa `lab-cli`, konta `gmail_token`, `saldeo_storage_state`, `saldeo_username`, `saldeo_password`, `ksef_token`, `ksef_cert_password`, `ksef_access_token`). Gdy sesja Saldeo wygaśnie, LAB loguje Helium zapisanym `SALDEO_USERNAME`/`SALDEO_PASSWORD` (hasło idzie plikiem 600, nie listą argumentów). Bez loginu otwiera Helium do ręcznego logowania. 2FA i Captcha nadal wymagają Ciebie. Kolejność szukania: niepusta zmienna środowiskowa sesji → Keychain → `~/.config/lab/env` → plik 600. Wartość znaleziona w `~/.config/lab/env` trafia do Keychain, a jej klucz znika z pliku; pozostałe klucze (`GOOGLE_CLIENT_SECRET_PATH`, `KSEF_BASE_URL`, ustawienia OCR/LLM, ścieżki) zostają. `lab onboard` zapisuje `KSEF_TOKEN`, `KSEF_CERT_PASSWORD`, `SALDEO_USERNAME` i `SALDEO_PASSWORD` wyłącznie w Keychain. `KSEF_TOKEN=... lab ...` nadpisuje Keychain na jeden proces i nie jest nigdzie zapisywane. Plik sekretu z prawami szerszymi niż 600 jest odrzucany z komunikatem podającym ścieżkę.
+Sekrety tekstowe (`KSEF_TOKEN`, `SALDEO_USERNAME`, `SALDEO_PASSWORD`, `OPENROUTER_API_KEY`) trzyma plik `.env` z prawami 600. Lokalny `.env` jest wybierany automatycznie tylko w katalogu pakietu `lab-cli`, gdy Git go ignoruje i nie śledzi. W pozostałych katalogach LAB używa `~/.config/lab/.env`; `LAB_DOTENV` pozwala jawnie wskazać inny plik. Keychain jest wyłączony, chyba że `LAB_USE_KEYCHAIN=1`. Gdy sesja Saldeo wygaśnie, LAB loguje Helium zapisanym `SALDEO_USERNAME`/`SALDEO_PASSWORD` (hasło idzie plikiem 600, nie listą argumentów). Bez loginu otwiera Helium do ręcznego logowania. 2FA i Captcha nadal wymagają Ciebie. Kolejność szukania: zmienna sesji → `.env` → plik 600 → opcjonalnie Keychain. `~/.config/lab/env` nie trzyma sekretów; znalezione tam klucze sekretów trafiają do `.env`. `lab onboard` zapisuje sekrety tekstowe w `.env`. Gdy brak `KSEF_TOKEN`, LAB używa ważnego cache tokenu dostępu albo lokalnych metadanych KSeF; pełny Sync nie przerywa Gmail i Saldeo. Online bez cache wymaga tokenu z uprawnieniem InvoiceRead. `KSEF_TOKEN=... lab ...` nadpisuje Keychain na jeden proces i nie jest nigdzie zapisywane. Plik sekretu z prawami szerszymi niż 600 jest odrzucany z komunikatem podającym ścieżkę.
 
-Zapis tokenów Gmail i sesji Saldeo do Keychain idzie przez Security.framework. Sekret nie jest argumentem procesu `security`. Zapis tokenów, konfiguracji, cache i bazy używa uprawnień 600. Procesy `pdftotext`, `pdfinfo`, `pdftoppm`, `openssl` i OCR używają narzędzi z katalogów systemowych oraz środowiska bez `PYTHONPATH`. `PPMLX_BASE_URL` musi wskazywać pętlę lokalną. OCR odrzuca PDF większy niż 40 MB i nie pobiera modeli.
+Przy `LAB_USE_KEYCHAIN=1` zapis tokenów Gmail i sesji Saldeo do Keychain idzie przez Security.framework. Sekret nie jest argumentem procesu `security`. Tymczasowe pliki logowania Saldeo mają prawa 600 i są usuwane także przy błędzie instalacji lub uruchomienia procesu oraz przy przekroczeniu limitu czasu. Zapis tokenów, konfiguracji, cache i bazy używa uprawnień 600. Procesy `pdftotext`, `pdfinfo`, `pdftoppm`, `openssl` i OCR używają narzędzi z katalogów systemowych oraz środowiska bez `PYTHONPATH`. `PPMLX_BASE_URL` musi wskazywać pętlę lokalną. OCR odrzuca PDF większy niż 40 MB i nie pobiera modeli.
 
 LAB nie uruchamia ukrytego procesu serwera. Brak serwera daje ostrzeżenie i nie blokuje synchronizacji pozostałych źródeł. LLM otrzymuje cały odczyt do 60000 znaków; większe dokumenty są odrzucane bez obcinania. Odpowiedzi ucięte limitem tokenów nie są stosowane.
 
@@ -63,7 +66,7 @@ Sam test (bez kreatora):
 lab onboard --check
 ```
 
-Pobranie auth do Saldeo przez Playwright: wybierz `SALDEO_AUTH_SCRIPT` w `lab onboard`, albo uruchom ręcznie. Używa Helium Browser (`/Applications/Helium.app/Contents/MacOS/Helium`); można nadpisać `HELIUM_EXECUTABLE=/ścieżka/do/Helium`. Skrypt automatycznie zapisuje auth po poprawnym sprawdzeniu cookies (bez ręcznego Enter); timeout można zmienić przez `SALDEO_AUTH_TIMEOUT_MS`.
+Pobranie auth do Saldeo przez Playwright: przy wygasłej sesji LAB samo loguje zapisanym `SALDEO_USERNAME`/`SALDEO_PASSWORD` w Helium i czeka na formularz po starcie SPA. Używa Helium Browser (`/Applications/Helium.app/Contents/MacOS/Helium`); można nadpisać `HELIUM_EXECUTABLE`. Timeout: `SALDEO_AUTH_TIMEOUT_MS` (domyślnie 180000). Headless tylko przy `SALDEO_AUTH_HEADLESS=1`. 2FA i Captcha nadal wymagają Ciebie.
 
 ```bash
 ./scripts/saldeo-auth.sh
@@ -94,6 +97,13 @@ lab reconcile --status --year 2026   # ostatni raport z bazy
 
 lab upload                 # plan brakujących załączników Gmail → Saldeo
 lab upload --confirm       # faktyczny upload brakujących załączników; po nim LAB odświeża Saldeo cache
+lab upload --confirm --approve
+                           # upload, potem zatwierdzenie nieoznaczonych dokumentów KSeF w Saldeo
+lab repair                 # plan: uzupełnij puste pola Saldeo z KSeF/Gmail i zgłoś duplikaty
+lab repair --confirm       # zapisz lokalne poprawki Saldeo (gwiazdka w TUI)
+lab repair --llm --confirm # dodatkowo odczytaj trudne PDF-y Gmail przez LLM/OpenRouter
+lab approve                # plan nieoznaczonych dokumentów KSeF w Saldeo
+lab approve --confirm      # zatwierdź wszystkie nieoznaczone dokumenty KSeF w Saldeo
 ```
 
 Puste `lab` otwiera interaktywną tabelę faktur z tri-reconcile. Skróty: `j/k` lub strzałki — ruch, `u` — upload do Saldeo, `a` — zatwierdź KSeF, `r` — odrzuć KSeF, `n` — wyczyść, `f` — ukryj faktury zatwierdzone i obecne w KSeF oraz Saldeo, `e` — lokalna poprawka Saldeo, `c` — wykonaj, `q` — wyjdź. Zmiana roku w menu uruchamia pełny sync dla tego roku. `Akceptuj` wykonuje wybrane operacje bez wychodzenia z tabeli i odświeża status/tabelę na bieżąco. Poprawione rekordy Saldeo mają `*` w kolumnie źródeł.
@@ -106,7 +116,7 @@ Auto-sync/reconcile/upload przy logowaniu i cyklicznie przez launchd:
 scripts/install-launchd.sh
 ```
 
-Domyślnie uruchamia się przy logowaniu i co 4h, robiąc: `sync`, `reconcile --store`, `upload --confirm`, `sync --saldeo`, finalne `reconcile --store`.
+Domyślnie uruchamia się przy logowaniu i co 4h, robiąc: `sync`, `reconcile --store`, `repair --confirm`, `upload --confirm --approve`, `sync --saldeo`, finalne `reconcile --store`.
 Logi: `~/Library/Logs/lab/automation.log`.
 
 Konfiguracja instalacji:
@@ -133,12 +143,14 @@ lab --db ./data/full-2026.sqlite db tri-runs --limit 10
 lab --db ./data/full-2026.sqlite mcp
 ```
 
-Narzędzia: `sync`, `reconcile`, `reconcile_status`, `upload`, `db_stats`, `tri_runs`.
+Narzędzia: `sync`, `reconcile`, `reconcile_status`, `upload`, `repair`, `approve`, `db_stats`, `tri_runs`.
 
 Konfiguracja w `mcp/lab-mcp.example.json`.
 
 ## Pozostałe
 
+- `lab repair` — lokalne uzupełnienie pól Saldeo z KSeF/Gmail i raport duplikatów
+- `lab approve` — zatwierdzenie nieoznaczonych dokumentów KSeF w Saldeo
 - `lab db` — init, stats, list, tri-runs
 - `lab doctor` — diagnostyka Gmail, Saldeo, KSeF online, DB i domyślnych źródeł reconcile
 
@@ -157,6 +169,6 @@ lab reconcile --review-score 50 ...
 
 ## Uwagi
 
-- Tokeny/auth nie są zapisywane w repo. Na macOS LAB zapisuje Gmail token, Saldeo storage state i cache tokenu dostępowego KSeF w Keychain; pliki `~/.config/lab/gmail_token.json` / `~/.config/lab/saldeo-storage-state.json` / `~/.config/lab/ksef_access_token.json` są fallbackiem lub wejściem migracyjnym. `lab doctor` i `lab onboard --check` pokazują dla każdego sekretu tylko to, czy jest ustawiony i skąd pochodzi (`env`, `keychain`, `file`, `missing`).
-- KSeF: domyślnie online API v2 (`KSEF_TOKEN`, opcjonalnie `KSEF_CONTEXT_NIP`/`KSEF_ENV`/`KSEF_BASE_URL`); metadane są cache’owane w `data/ksef-<rok>/` albo `KSEF_DATA_DIR`.
+- Sekrety nie są śledzone przez Git. LAB zapisuje Gmail token, Saldeo storage state i cache tokenu dostępowego KSeF w prywatnych plikach `~/.config/lab/gmail_token.json` / `~/.config/lab/saldeo-storage-state.json` / `~/.config/lab/ksef_access_token.json`. Na macOS Keychain jest dodatkowym magazynem przy `LAB_USE_KEYCHAIN=1`. `lab doctor` i `lab onboard --check` pokazują dla każdego sekretu tylko to, czy jest ustawiony i skąd pochodzi (`env`, `keychain`, `file`, `missing`).
+- KSeF: domyślnie online API v2 (`KSEF_TOKEN`, opcjonalnie `KSEF_CONTEXT_NIP`/`KSEF_ENV`/`KSEF_BASE_URL`); metadane są cache’owane w `data/ksef-<rok>/` albo `KSEF_DATA_DIR`. `KSEF_CACHE_TTL_MINS=0` wyłącza używanie cache zamiast odświeżenia online. Gdy brakuje tokenu, LAB nadal może użyć lokalnego cache bez limitu wieku.
 - Upload do Saldeo: `generate-urls-for-upload` → `PUT` signed URL → `confirm`. Jeśli miesiąc faktury jest zamknięty, LAB zapisuje dokument w najnowszym otwartym miesiącu (bieżący miesiąc, a gdy i on jest zamknięty — kolejny otwarty).

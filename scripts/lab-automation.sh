@@ -56,7 +56,10 @@ if [[ "$status" -eq 0 ]]; then
   run "$LAB_BIN" reconcile --year "$YEAR" --store --raw --output "$RECONCILE_JSON" || status=$?
 fi
 if [[ "$status" -eq 0 ]]; then
-  run "$LAB_BIN" upload --year "$YEAR" --confirm --output "$UPLOAD_JSON" || status=$?
+  run "$LAB_BIN" repair --year "$YEAR" --confirm --output "$LOG_DIR/repair-$YEAR.json" || status=$?
+fi
+if [[ "$status" -eq 0 ]]; then
+  run "$LAB_BIN" upload --year "$YEAR" --confirm --approve --output "$UPLOAD_JSON" || status=$?
 fi
 if [[ "$status" -eq 0 ]]; then
   run "$LAB_BIN" sync --saldeo --year "$YEAR" || status=$?

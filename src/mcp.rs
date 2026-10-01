@@ -165,7 +165,28 @@ pub(crate) fn mcp_tools() -> Value {
                 "mail":{"type":"string","description":"Path to Gmail/PDF records JSON/JSONL"},
                 "ksef":{"type":"string","description":"Path to KSeF records JSON/JSONL"},
                 "saldeo":{"type":"string","description":"Path to Saldeo records JSON/JSONL"},
-                "review_score":{"type":"integer","default":70,"description":"Minimum match score when computing from sources"}
+                "review_score":{"type":"integer","default":70,"description":"Minimum match score when computing from sources"},
+                "confirm":{"type":"boolean","default":true,"description":"Execute the upload. Set false for a dry-run plan"},
+                "approve":{"type":"boolean","default":false,"description":"After upload, approve all unmarked KSeF documents in Saldeo"}
+            }}
+        },
+        {
+            "name": "repair",
+            "description": "Fill missing Saldeo invoice fields from KSeF/Gmail, report Saldeo duplicates, and optionally run LLM on mail PDFs.",
+            "inputSchema": {"type":"object","properties":{
+                "year":{"type":"integer","default":2026},
+                "review_score":{"type":"integer","default":70},
+                "llm":{"type":"boolean","default":false,"description":"Also enrich incomplete mail PDFs with LLM/OpenRouter"},
+                "confirm":{"type":"boolean","default":false,"description":"Write Saldeo overrides (and LLM results) to SQLite/files"}
+            }}
+        },
+        {
+            "name": "approve",
+            "description": "Approve unmarked KSeF documents in Saldeo. Without confirm, returns the pending document id plan.",
+            "inputSchema": {"type":"object","properties":{
+                "year":{"type":"integer","default":2026},
+                "review_score":{"type":"integer","default":70},
+                "confirm":{"type":"boolean","default":false,"description":"Execute markAccounting in Saldeo"}
             }}
         },
         {
@@ -259,13 +280,57 @@ pub(crate) fn call_mcp_tool(db_path: &Path, name: &str, args: &Value) -> Result<
                 confirm: true,
                 upload_url: None,
             })?;
-            saldeo_upload_plan(
-                &mut plan,
-                &default_saldeo_storage_state_path(),
-                DEFAULT_SALDEO_UPLOAD_URL,
-                "file",
-            )?;
+            let confirm = json_bool(args, "confirm", true);
+            let approve = json_bool(args, "approve", false);
+            plan.confirm = confirm;
+            if confirm {
+                ensure_saldeo_session()?;
+                saldeo_upload_plan(
+                    &mut plan,
+                    &default_saldeo_storage_state_path(),
+                    DEFAULT_SALDEO_UPLOAD_URL,
+                    "file",
+                )?;
+                if plan.summary.uploaded_count > 0 || approve {
+                    if let Err(err) = saldeo_fetch_with_progress(
+                        year,
+                        &default_saldeo_storage_state_path(),
+                        &default_saldeo_out_path(year),
+                        Some(db_path),
+                        None,
+                    ) {
+                        eprintln!("  [Saldeo] refresh po uploadzie nie powiódł się: {err}");
+                    }
+                }
+            }
+            if approve {
+                plan.ksef_approve = Some(saldeo_approve_pending_ksef(
+                    db_path,
+                    year,
+                    json_u8(args, "review_score", 70),
+                    confirm,
+                )?);
+            }
             Ok(serde_json::to_value(plan)?)
+        }
+        "repair" => {
+            let year = json_i32(args, "year", 2026);
+            Ok(serde_json::to_value(saldeo_repair_plan(
+                db_path,
+                year,
+                json_u8(args, "review_score", 70),
+                json_bool(args, "llm", false),
+                json_bool(args, "confirm", false),
+            )?)?)
+        }
+        "approve" => {
+            let year = json_i32(args, "year", 2026);
+            Ok(serde_json::to_value(saldeo_approve_pending_ksef(
+                db_path,
+                year,
+                json_u8(args, "review_score", 70),
+                json_bool(args, "confirm", false),
+            )?)?)
         }
         "db_stats" => {
             let conn = open_db(db_path)?;

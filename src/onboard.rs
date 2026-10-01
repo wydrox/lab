@@ -1,4 +1,7 @@
 use crate::*;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub(crate) struct OnboardStatus {
@@ -317,6 +320,11 @@ pub(crate) fn print_onboard_status(status: &OnboardStatus, db_path: &Path) {
         }
     );
     eprintln!(
+        "  OpenRouter:      {}{}",
+        display_secret_value(secret_is_set(Secret::OpenRouterApiKey)),
+        secret_source_suffix(secret_source(Secret::OpenRouterApiKey))
+    );
+    eprintln!(
         "  openssl:         {}",
         if status.openssl_ok {
             "✓"
@@ -413,9 +421,15 @@ pub(crate) fn onboard_next_steps(status: &OnboardStatus, gmail_ok: bool) -> Vec<
         steps.push("lab onboard --gmail-client-secret <ścieżka>");
     }
     if !status.saldeo_valid {
-        steps.push(
-            "Ustaw SALDEO_USERNAME i SALDEO_PASSWORD w lab onboard, albo odśwież sesję Helium",
-        );
+        if secret_is_set(Secret::SaldeoUsername) && secret_is_set(Secret::SaldeoPassword) {
+            steps.push(
+                "Sesja Saldeo wygasła. Odśwież ją: Menu → Saldeo, albo otwórz tabelę LAB — zaloguje Helium zapisanym hasłem",
+            );
+        } else {
+            steps.push(
+                "Ustaw SALDEO_USERNAME i SALDEO_PASSWORD w lab onboard, albo odśwież sesję Helium",
+            );
+        }
     }
     if !status.ksef_api_ok {
         steps.push("Ustaw KSEF_TOKEN z uprawnieniem InvoiceRead");
@@ -589,6 +603,10 @@ pub(crate) fn onboard_edit_env_secret(name: &str) -> Result<()> {
         return Ok(());
     }
     match save_secret(secret, value.trim())? {
+        SecretSource::File if Secret::from_env_key(name).is_some() => eprintln!(
+            "✓ Zapisano {name} w {} (poza git)\n",
+            crate::lab_dotenv_path().display()
+        ),
         SecretSource::File => eprintln!("✓ Zapisano {name} w pliku 0600\n"),
         _ => eprintln!("✓ Zapisano {name} w macOS Keychain (lab-cli)\n"),
     }
@@ -627,6 +645,58 @@ pub(crate) fn ensure_saldeo_session_or_auth(progress: Option<Arc<Mutex<String>>>
     }
 }
 
+struct SaldeoAuthTempFile {
+    path: PathBuf,
+}
+
+impl SaldeoAuthTempFile {
+    fn path_for(name: &str, extension: &str) -> PathBuf {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "lab-saldeo-{name}-{}-{id}.{extension}",
+            std::process::id()
+        ))
+    }
+
+    fn write(path: PathBuf, bytes: &[u8]) -> Result<Self> {
+        use std::io::Write;
+
+        Self::write_with(path, |file| file.write_all(bytes))
+    }
+
+    fn write_with(
+        path: PathBuf,
+        write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
+    ) -> Result<Self> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&path)
+            .with_context(|| format!("utworzenie {}", path.display()))?;
+        // Own the path before writing, so a partial write is also cleaned up.
+        let temporary = Self { path };
+        // Close before cleanup, even on panic or platforms that cannot unlink open files.
+        let result = {
+            let mut file = file;
+            write(&mut file)
+        };
+        result.with_context(|| format!("zapis {}", temporary.path.display()))?;
+        Ok(temporary)
+    }
+}
+
+impl Drop for SaldeoAuthTempFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 pub(crate) fn saldeo_auth_noninteractive() -> Result<()> {
     let target = preferred_saldeo_storage_state_path();
     if let Some(parent) = target.parent() {
@@ -640,55 +710,44 @@ pub(crate) fn saldeo_auth_noninteractive() -> Result<()> {
         return Err(anyhow!("nie znalazłem Helium executable: {helium}"));
     }
     let login = saldeo_login_pair()?;
-    let login_path = if let Some((username, password)) = &login {
-        let path =
-            std::env::temp_dir().join(format!("lab-saldeo-login-{}.json", std::process::id()));
-        write_private_file(
-            &path,
+    // Installation can fail or take a long time; do not leave credentials on disk yet.
+    let node_path = ensure_playwright_node_path()?;
+    let login_file = if let Some((username, password)) = &login {
+        Some(SaldeoAuthTempFile::write(
+            SaldeoAuthTempFile::path_for("login", "json"),
             &serde_json::to_vec(&serde_json::json!({
                 "username": username,
                 "password": password
             }))?,
-        )?;
-        Some(path)
+        )?)
     } else {
         None
     };
-    let script_path =
-        std::env::temp_dir().join(format!("lab-saldeo-login-script-{}.js", std::process::id()));
-    write_private_file(
-        &script_path,
+    let script_file = SaldeoAuthTempFile::write(
+        SaldeoAuthTempFile::path_for("login-script", "js"),
         include_str!("../scripts/saldeo-login.js").as_bytes(),
     )?;
-    let mut command = Command::new("npx");
+    let timeout_ms = saldeo_auth_timeout_ms();
+    let mut command = Command::new("node");
     command
-        .arg("--yes")
-        .arg("-p")
-        .arg("playwright")
-        .arg("node")
-        .arg(&script_path)
+        .arg(&script_file.path)
+        .env("NODE_PATH", &node_path)
         .env("LAB_SALDEO_STORAGE_STATE", &target)
         .env("SALDEO_URL", &url)
         .env("HELIUM_EXECUTABLE", &helium)
+        .env("SALDEO_AUTH_TIMEOUT_MS", timeout_ms.to_string())
         .stdin(Stdio::null())
-        .stdout(Stdio::null());
-    if let Some(path) = &login_path {
-        command.env("LAB_SALDEO_LOGIN_FILE", path);
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    if let Some(file) = &login_file {
+        command.env("LAB_SALDEO_LOGIN_FILE", &file.path);
     }
-    let output = command
-        .output()
-        .context("uruchomienie npx playwright + Helium")?;
-    if let Some(path) = &login_path {
-        let _ = fs::remove_file(path);
-    }
-    let _ = fs::remove_file(&script_path);
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "Playwright auth zakończył się błędem: {} (stderr: {})",
-            output.status,
-            stderr.trim()
-        ));
+    let status = command_status_with_timeout(&mut command, saldeo_auth_process_timeout())
+        .context("uruchomienie node + Playwright + Helium")?;
+    drop(login_file);
+    drop(script_file);
+    if !status.success() {
+        return Err(anyhow!("Playwright auth zakończył się błędem: {status}"));
     }
     if !target.exists() {
         return Err(anyhow!(
@@ -698,6 +757,40 @@ pub(crate) fn saldeo_auth_noninteractive() -> Result<()> {
     }
     save_saldeo_storage_state_secret(&target)?;
     Ok(())
+}
+
+pub(crate) fn saldeo_auth_timeout_ms() -> u64 {
+    std::env::var("SALDEO_AUTH_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|ms| *ms >= 5_000)
+        .unwrap_or(180_000)
+}
+
+pub(crate) fn saldeo_auth_process_timeout() -> Duration {
+    Duration::from_millis(saldeo_auth_timeout_ms().saturating_add(20_000))
+}
+
+fn command_status_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus> {
+    let mut child = command.spawn().context("spawn procesu logowania Saldeo")?;
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait()? {
+            Some(status) => return Ok(status),
+            None if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(200)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow!(
+                    "logowanie Saldeo przekroczyło limit {}s",
+                    timeout.as_secs()
+                ));
+            }
+        }
+    }
 }
 
 pub(crate) fn run_saldeo_auth_script() -> Result<()> {
@@ -730,12 +823,55 @@ pub(crate) fn run_saldeo_auth_script() -> Result<()> {
         return Ok(());
     }
 
-    eprintln!(
-        "Nie znalazłem scripts/saldeo-auth.sh — uruchamiam fallback przez npx playwright + Helium."
-    );
+    eprintln!("Nie znalazłem scripts/saldeo-auth.sh — uruchamiam Playwright + Helium.");
     saldeo_auth_noninteractive()?;
     eprintln!("✓ Zapisano Saldeo auth: {}\n", target.display());
     Ok(())
+}
+
+fn lab_playwright_prefix() -> PathBuf {
+    if let Some(path) = std::env::var_os("LAB_PLAYWRIGHT_PREFIX") {
+        return PathBuf::from(path);
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config")
+        .join("lab")
+        .join("playwright")
+}
+
+fn ensure_playwright_node_path() -> Result<PathBuf> {
+    let prefix = lab_playwright_prefix();
+    let node_modules = prefix.join("node_modules");
+    let module = node_modules.join("playwright");
+    if module.is_dir() {
+        return Ok(node_modules);
+    }
+    fs::create_dir_all(&prefix).with_context(|| format!("mkdir {}", prefix.display()))?;
+    eprintln!(
+        "  [Saldeo] instaluję Playwright w {} (bez przeglądarki Playwright)...",
+        prefix.display()
+    );
+    let status = Command::new("npm")
+        .arg("install")
+        .arg("--prefix")
+        .arg(&prefix)
+        .arg("--no-fund")
+        .arg("--no-audit")
+        .arg("playwright")
+        .env("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", "1")
+        .status()
+        .context("npm install playwright")?;
+    if !status.success() {
+        return Err(anyhow!(
+            "npm install playwright zakończył się błędem: {status}"
+        ));
+    }
+    if !module.is_dir() {
+        return Err(anyhow!("brak modułu playwright w {}", module.display()));
+    }
+    Ok(node_modules)
 }
 
 pub(crate) fn find_saldeo_auth_script() -> Option<PathBuf> {
@@ -826,6 +962,7 @@ pub(crate) fn lab_config_var(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
         .filter(|v| !v.trim().is_empty())
+        .or_else(|| crate::dotenv_secret(name))
         .or_else(|| read_lab_env_file().ok()?.remove(name))
 }
 
@@ -1077,9 +1214,162 @@ pub(crate) fn doctor(db_path: &Path, token_env: &str) -> Result<()> {
             "PDF-y są parsowane przez pdftotext, potem PyMuPDF/pdfplumber/pypdf jako fallback.",
             "lab reconcile bez własnych --ksef/--saldeo pobiera online metadane KSeF i Saldeo przed porównaniem.",
             "KSeF online używa KSEF_TOKEN, KSEF_CONTEXT_NIP/KSEF_NIP i KSEF_BASE_URL/KSEF_ENV; metadane są cache'owane lokalnie w KSEF_DATA_DIR albo data/ksef-<rok>.",
-            "Sekrety trzyma macOS Keychain (usługa lab-cli); zmienna środowiskowa sesji ma pierwszeństwo, plik ~/.config/lab/env już ich nie przechowuje."
+            "Sekrety trzyma macOS Keychain (usługa lab-cli); zmienna środowiskowa sesji ma pierwszeństwo, plik ~/.config/lab/env już ich nie przechowuje.",
+            "Jeśli OPENROUTER_API_KEY jest ustawiony, LAB odczytuje brakujące PDF-y przez google/gemini-3.8-flash ze structured output. Lokalny Gemma zostaje jako zapas."
         ],
         "next_steps": onboard_next_steps(&status, gmail_usable)
     });
     write_json(&status_json, None)
+}
+
+#[cfg(test)]
+mod saldeo_auth_temp_file_tests {
+    use super::*;
+
+    fn paths() -> (PathBuf, PathBuf) {
+        (
+            SaldeoAuthTempFile::path_for("test-login", "json"),
+            SaldeoAuthTempFile::path_for("test-script", "js"),
+        )
+    }
+
+    #[test]
+    fn cleans_both_files_on_success() -> Result<()> {
+        let (login_path, script_path) = paths();
+        let result = (|| -> Result<()> {
+            let _login = SaldeoAuthTempFile::write(login_path.clone(), b"dummy login")?;
+            let _script = SaldeoAuthTempFile::write(script_path.clone(), b"dummy script")?;
+            assert_eq!(fs::read(&login_path)?, b"dummy login");
+            assert_eq!(fs::read(&script_path)?, b"dummy script");
+            Ok(())
+        })();
+        assert!(!login_path.exists());
+        assert!(!script_path.exists());
+        result
+    }
+
+    #[test]
+    fn cleans_both_files_on_early_error() {
+        let (login_path, script_path) = paths();
+        let result = (|| -> Result<()> {
+            let _login = SaldeoAuthTempFile::write(login_path.clone(), b"dummy login")?;
+            let _script = SaldeoAuthTempFile::write(script_path.clone(), b"dummy script")?;
+            Err(anyhow!("injected process error"))?;
+            Ok(())
+        })();
+        assert!(result.is_err());
+        assert!(!login_path.exists());
+        assert!(!script_path.exists());
+    }
+
+    #[test]
+    fn cleans_partial_write_and_previously_created_file() {
+        use std::io::Write;
+
+        let (login_path, script_path) = paths();
+        let result = (|| -> Result<()> {
+            let _login = SaldeoAuthTempFile::write(login_path.clone(), b"dummy login")?;
+            let _script = SaldeoAuthTempFile::write_with(script_path.clone(), |file| {
+                file.write_all(b"partial dummy script")?;
+                Err(std::io::Error::other("injected write failure"))
+            })?;
+            Ok(())
+        })();
+        assert!(result.is_err());
+        assert!(!login_path.exists());
+        assert!(!script_path.exists());
+    }
+
+    #[test]
+    fn cleans_login_when_script_creation_fails() {
+        let (login_path, _) = paths();
+        let script_path = login_path.join("script.js");
+        let result = (|| -> Result<()> {
+            let _login = SaldeoAuthTempFile::write(login_path.clone(), b"dummy login")?;
+            // A regular file cannot be the parent directory of the script.
+            let _script = SaldeoAuthTempFile::write(script_path.clone(), b"dummy script")?;
+            Ok(())
+        })();
+        assert!(result.is_err());
+        assert!(!login_path.exists());
+        assert!(!script_path.exists());
+    }
+
+    #[test]
+    fn cleans_both_files_when_process_spawn_fails() {
+        let (login_path, script_path) = paths();
+        let result = (|| -> Result<()> {
+            let _login = SaldeoAuthTempFile::write(login_path.clone(), b"dummy login")?;
+            let _script = SaldeoAuthTempFile::write(script_path.clone(), b"dummy script")?;
+            // No process can run: its parent path is a regular file.
+            let mut command = Command::new(login_path.join("missing-node"));
+            command_status_with_timeout(&mut command, Duration::ZERO)?;
+            Ok(())
+        })();
+        assert!(result.is_err());
+        assert!(!login_path.exists());
+        assert!(!script_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleans_both_files_when_process_times_out() {
+        let (login_path, script_path) = paths();
+        let result = (|| -> Result<()> {
+            let _login = SaldeoAuthTempFile::write(login_path.clone(), b"dummy login")?;
+            let _script = SaldeoAuthTempFile::write(script_path.clone(), b"dummy script")?;
+            // Shell built-ins only: the child cannot exit before the zero timeout.
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "while :; do :; done"]);
+            command_status_with_timeout(&mut command, Duration::ZERO)?;
+            Ok(())
+        })();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("przekroczyło limit")
+        );
+        assert!(!login_path.exists());
+        assert!(!script_path.exists());
+    }
+
+    #[test]
+    fn cleans_both_files_during_unwinding() {
+        let (login_path, script_path) = paths();
+        let result = std::panic::catch_unwind(|| {
+            let _login = SaldeoAuthTempFile::write(login_path.clone(), b"dummy login").unwrap();
+            let _script = SaldeoAuthTempFile::write(script_path.clone(), b"dummy script").unwrap();
+            panic!("injected panic");
+        });
+        assert!(result.is_err());
+        assert!(!login_path.exists());
+        assert!(!script_path.exists());
+    }
+
+    #[test]
+    fn does_not_overwrite_or_remove_an_existing_file() -> Result<()> {
+        let (path, _) = paths();
+        let existing = SaldeoAuthTempFile::write(path.clone(), b"existing dummy data")?;
+        assert!(SaldeoAuthTempFile::write(path.clone(), b"replacement").is_err());
+        assert_eq!(fs::read(&path)?, b"existing dummy data");
+        drop(existing);
+        assert!(!path.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creates_private_files_before_writing() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (path, _) = paths();
+        let file = SaldeoAuthTempFile::write_with(path.clone(), |file| {
+            assert_eq!(file.metadata()?.permissions().mode() & 0o777, 0o600);
+            Ok(())
+        })?;
+        drop(file);
+        assert!(!path.exists());
+        Ok(())
+    }
 }

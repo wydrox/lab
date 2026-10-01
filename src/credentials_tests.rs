@@ -31,6 +31,141 @@ fn env_file_text(root: &Path) -> String {
     fs::read_to_string(root.join("env")).unwrap_or_default()
 }
 
+fn dotenv_text(root: &Path) -> String {
+    fs::read_to_string(root.join(".env")).unwrap_or_default()
+}
+
+struct DotenvPathFixture {
+    root: PathBuf,
+    cwd: PathBuf,
+    home: PathBuf,
+}
+
+impl DotenvPathFixture {
+    fn new(package_name: &str, ignored: bool) -> Self {
+        let root = temp_root("dotenv-path");
+        let cwd = root.join("checkout");
+        let home = root.join("home");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            cwd.join("Cargo.toml"),
+            format!("[package]\nname = \"{package_name}\"\nversion = \"0.1.0\"\n"),
+        )
+        .unwrap();
+        if ignored {
+            fs::write(cwd.join(".gitignore"), ".env\n").unwrap();
+        }
+        let fixture = Self { root, cwd, home };
+        fixture.git(&["init", "--quiet", "--template="]);
+        let excludes = fixture.root.join("empty-ignore");
+        fs::write(&excludes, "").unwrap();
+        fixture.git(&["config", "core.excludesFile", excludes.to_str().unwrap()]);
+        fixture
+    }
+
+    fn git(&self, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(&self.cwd)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .env("HOME", &self.home)
+            .env("XDG_CONFIG_HOME", self.root.join("xdg"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "fixture git {args:?} failed");
+    }
+
+    fn selected(&self, override_path: Option<&Path>) -> PathBuf {
+        select_lab_dotenv_path(&self.cwd, &self.home, override_path)
+    }
+
+    fn fallback(&self) -> PathBuf {
+        self.home.join(".config/lab/.env")
+    }
+}
+
+impl Drop for DotenvPathFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn dotenv_path_unrelated_rust_project_uses_home() {
+    let fixture = DotenvPathFixture::new("unrelated-cli", true);
+    fs::write(
+        fixture.cwd.join("Cargo.toml"),
+        "# name = \"lab-cli\"\n[package]\nname = \"unrelated-cli\"\n[package.metadata]\nname = \"lab-cli\"\n",
+    )
+    .unwrap();
+    assert_eq!(fixture.selected(None), fixture.fallback());
+}
+
+#[test]
+fn dotenv_path_lab_checkout_not_ignored_uses_home() {
+    let fixture = DotenvPathFixture::new("lab-cli", false);
+    assert_eq!(fixture.selected(None), fixture.fallback());
+}
+
+#[test]
+fn dotenv_path_tracked_env_uses_home_even_when_ignored() {
+    let fixture = DotenvPathFixture::new("lab-cli", true);
+    fs::write(fixture.cwd.join(".env"), "").unwrap();
+    fixture.git(&["add", "--force", "--", ".env"]);
+    assert_eq!(fixture.selected(None), fixture.fallback());
+}
+
+#[test]
+fn dotenv_path_ignored_lab_checkout_uses_cwd() {
+    let fixture = DotenvPathFixture::new("lab-cli", true);
+    assert_eq!(fixture.selected(None), fixture.cwd.join(".env"));
+    assert!(!fixture.cwd.join(".env").exists());
+}
+
+#[test]
+fn dotenv_path_explicit_override_is_preserved() {
+    let fixture = DotenvPathFixture::new("unrelated-cli", false);
+    let absolute = fixture.root.join("explicit.env");
+    for path in [absolute.as_path(), Path::new("relative.env")] {
+        assert_eq!(fixture.selected(Some(path)), path);
+        assert!(!fixture.cwd.join(".env").exists());
+    }
+}
+
+#[test]
+fn dotenv_path_lab_without_git_uses_home() {
+    let fixture = DotenvPathFixture::new("lab-cli", true);
+    fs::remove_dir_all(fixture.cwd.join(".git")).unwrap();
+    assert_eq!(fixture.selected(None), fixture.fallback());
+}
+
+#[test]
+fn dotenv_path_lab_package_accepts_literal_name_and_comments() {
+    let fixture = DotenvPathFixture::new("lab-cli", true);
+    fs::write(
+        fixture.cwd.join("Cargo.toml"),
+        "[package] # package table\nname = 'lab-cli' # package name\n[package.metadata]\nname = 'other'\n",
+    )
+    .unwrap();
+    assert_eq!(fixture.selected(None), fixture.cwd.join(".env"));
+}
+
+#[test]
+fn dotenv_path_fake_package_in_multiline_string_uses_home() {
+    let fixture = DotenvPathFixture::new("unrelated-cli", true);
+    fs::write(
+        fixture.cwd.join("Cargo.toml"),
+        "[package]\nname = 'unrelated-cli'\ndescription = '''\n[package]\nname = 'lab-cli'\n'''\n",
+    )
+    .unwrap();
+    assert_eq!(fixture.selected(None), fixture.fallback());
+}
+
 #[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
@@ -65,23 +200,24 @@ fn process_env_wins_and_is_not_written_back() {
 }
 
 #[test]
-fn keychain_wins_over_env_file() {
-    let (root, store, _guard) = setup("keychain-wins", &[], StoreMode::Available);
-    fs::write(root.join("env"), "KSEF_TOKEN='z-pliku'\n").unwrap();
+fn dotenv_wins_over_keychain() {
+    let (root, store, _guard) = setup("dotenv-wins", &[], StoreMode::Available);
+    fs::write(root.join(".env"), "KSEF_TOKEN='z-dotenv'\n").unwrap();
     store.set(ACCOUNT_KSEF_TOKEN, "z-keychaina").unwrap();
 
     assert_eq!(
         secret_value(Secret::KsefToken).unwrap().as_deref(),
+        Some("z-dotenv")
+    );
+    assert_eq!(secret_source(Secret::KsefToken), SecretSource::File);
+    assert_eq!(
+        store.stored(ACCOUNT_KSEF_TOKEN).as_deref(),
         Some("z-keychaina")
     );
-    assert_eq!(secret_source(Secret::KsefToken), SecretSource::Keychain);
-    let text = env_file_text(&root);
-    assert!(!text.contains("KSEF_TOKEN"));
-    assert!(!text.contains("z-pliku"));
 }
 
 #[test]
-fn env_file_secret_moves_to_keychain_and_other_keys_stay() {
+fn env_file_secret_moves_to_dotenv_and_other_keys_stay() {
     let (root, store, _guard) = setup("migracja", &[], StoreMode::Available);
     fs::write(
         root.join("env"),
@@ -93,15 +229,10 @@ fn env_file_secret_moves_to_keychain_and_other_keys_stay() {
         secret_value(Secret::KsefToken).unwrap().as_deref(),
         Some("token-ksef")
     );
-    assert_eq!(secret_source(Secret::KsefToken), SecretSource::Keychain);
-    assert_eq!(
-        store.stored(ACCOUNT_KSEF_TOKEN).as_deref(),
-        Some("token-ksef")
-    );
-    assert_eq!(
-        store.stored(ACCOUNT_KSEF_CERT_PASSWORD).as_deref(),
-        Some("haslo")
-    );
+    assert_eq!(secret_source(Secret::KsefToken), SecretSource::File);
+    assert!(dotenv_text(&root).contains("KSEF_TOKEN"));
+    assert!(!dotenv_text(&root).contains("GOOGLE_CLIENT_SECRET_PATH"));
+    assert_eq!(store.stored(ACCOUNT_KSEF_TOKEN), None);
 
     let text = env_file_text(&root);
     assert!(!text.contains("KSEF_TOKEN"));
@@ -112,7 +243,6 @@ fn env_file_secret_moves_to_keychain_and_other_keys_stay() {
     assert!(text.contains("KSEF_BASE_URL='https://api-test.ksef.mf.gov.pl/v2'"));
     assert!(text.contains("LAB_OCR_MODE='off'"));
     assert!(root.join("env").is_file());
-    // Klucz KSEF_CERT_PASSWORD nie zostaje w pliku env nawet po osobnym odczycie.
     assert_eq!(
         secret_value(Secret::KsefCertPassword).unwrap().as_deref(),
         Some("haslo")
@@ -133,20 +263,18 @@ fn env_file_secret_stays_when_store_is_unavailable() {
         Some("token-ksef")
     );
     assert_eq!(secret_source(Secret::KsefToken), SecretSource::File);
-    assert!(env_file_text(&root).contains("KSEF_TOKEN"));
+    assert!(dotenv_text(&root).contains("KSEF_TOKEN"));
+    assert!(!env_file_text(&root).contains("KSEF_TOKEN"));
 }
 
 #[test]
-fn file_fallback_is_read_and_promoted_to_keychain() {
+fn file_fallback_is_read_without_keychain() {
     let (root, store, _guard) = setup("plik-cache", &[], StoreMode::Available);
     let path = Secret::KsefAccessToken.file_path().unwrap();
     write_private_file(&path, br#"{"access_token":"abc"}"#).unwrap();
 
     assert_eq!(secret_source(Secret::KsefAccessToken), SecretSource::File);
-    assert_eq!(
-        store.stored(ACCOUNT_KSEF_ACCESS_TOKEN).as_deref(),
-        Some(r#"{"access_token":"abc"}"#)
-    );
+    assert_eq!(store.stored(ACCOUNT_KSEF_ACCESS_TOKEN), None);
     assert!(path.starts_with(&root));
 }
 
@@ -184,12 +312,10 @@ fn saving_secret_does_not_touch_env_file() {
 
     assert_eq!(
         save_secret(Secret::KsefToken, "nowy-token").unwrap(),
-        SecretSource::Keychain
+        SecretSource::File
     );
-    assert_eq!(
-        store.stored(ACCOUNT_KSEF_TOKEN).as_deref(),
-        Some("nowy-token")
-    );
+    assert_eq!(store.stored(ACCOUNT_KSEF_TOKEN), None);
+    assert!(dotenv_text(&root).contains("KSEF_TOKEN"));
     let text = env_file_text(&root);
     assert!(!text.contains("nowy-token"));
     assert!(!text.contains("KSEF_TOKEN"));
@@ -215,22 +341,20 @@ fn write_lab_env_file_drops_secret_keys() {
     assert!(!text.contains("token-ksef"));
     assert!(!text.contains("haslo"));
     assert!(text.contains("GOOGLE_CLIENT_SECRET_PATH='/tmp/client.json'"));
-    assert_eq!(
-        store.stored(ACCOUNT_KSEF_TOKEN).as_deref(),
-        Some("token-ksef")
-    );
+    assert!(dotenv_text(&root).contains("KSEF_TOKEN"));
+    assert_eq!(store.stored(ACCOUNT_KSEF_TOKEN), None);
     assert_eq!(store.stored(ACCOUNT_GMAIL_TOKEN), None);
     assert_eq!(store.stored(ACCOUNT_SALDEO_STORAGE_STATE), None);
 }
 
 #[test]
-fn secret_without_file_needs_keychain() {
+fn secret_without_file_goes_to_dotenv() {
     let (root, _store, _guard) = setup("brak-keychaina", &[], StoreMode::Failing);
-    let err = save_secret(Secret::KsefToken, "token-ksef")
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("KSEF_TOKEN"));
-    assert!(!err.contains("token-ksef"));
+    assert_eq!(
+        save_secret(Secret::KsefToken, "token-ksef").unwrap(),
+        SecretSource::File
+    );
+    assert!(dotenv_text(&root).contains("KSEF_TOKEN"));
     assert!(!root.join("env").exists());
     assert!(save_secret(Secret::KsefToken, "  ").is_err());
 }
@@ -265,11 +389,23 @@ fn keychain_store_replaces_gmail_token_file() {
     write_private_file(&path, b"{\"access_token\":\"stare\"}").unwrap();
 
     save_secret(Secret::GmailToken, "{\"access_token\":\"nowe\"}").unwrap();
-    assert!(!path.exists());
+    assert!(path.exists());
+    assert_eq!(store.stored(ACCOUNT_GMAIL_TOKEN), None);
     assert_eq!(
-        store.stored(ACCOUNT_GMAIL_TOKEN).as_deref(),
+        secret_value(Secret::GmailToken).unwrap().as_deref(),
         Some("{\"access_token\":\"nowe\"}")
     );
+}
+
+#[test]
+fn prepare_skips_keychain_when_disabled() {
+    let (root, store, _guard) = setup("prepare-skip", &[], StoreMode::Available);
+    store
+        .set(ACCOUNT_GMAIL_TOKEN, "{\"access_token\":\"tajne\"}")
+        .unwrap();
+    prepare_secret_store();
+    assert!(!root.join("gmail_token.json").exists());
+    assert_eq!(secret_source(Secret::GmailToken), SecretSource::Missing);
 }
 
 #[test]
@@ -329,11 +465,11 @@ fn secrets_never_use_argv_or_security_cli() {
 
 #[test]
 fn saldeo_login_pair_needs_both_fields() {
-    let (_root, store, _guard) = setup("saldeo-para", &[], StoreMode::Available);
+    let (_root, _store, _guard) = setup("saldeo-para", &[], StoreMode::Available);
     assert_eq!(saldeo_login_pair().unwrap(), None);
-    store.set(ACCOUNT_SALDEO_USERNAME, "jan").unwrap();
+    save_secret(Secret::SaldeoUsername, "jan").unwrap();
     assert!(saldeo_login_pair().is_err());
-    store.set(ACCOUNT_SALDEO_PASSWORD, "tajne-haslo").unwrap();
+    save_secret(Secret::SaldeoPassword, "tajne-haslo").unwrap();
     assert_eq!(
         saldeo_login_pair().unwrap(),
         Some(("jan".into(), "tajne-haslo".into()))
@@ -346,4 +482,37 @@ fn saldeo_login_script_reads_file_not_argv() {
     assert!(script.contains("LAB_SALDEO_LOGIN_FILE"));
     assert!(script.contains("unlinkSync"));
     assert!(!script.contains("process.argv["));
+}
+
+#[test]
+fn saldeo_auth_uses_local_playwright_not_npx_tmp() {
+    let source = include_str!("onboard.rs");
+    assert!(source.contains("NODE_PATH"));
+    assert!(source.contains("ensure_playwright_node_path"));
+    assert!(source.contains("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD"));
+    assert!(source.contains("saldeo_auth_timeout_ms"));
+    assert!(source.contains("stderr(Stdio::inherit())"));
+    assert!(!source.contains("Command::new(\"npx\")"));
+    assert!(!source.contains("Duration::from_secs(75)"));
+}
+
+#[test]
+fn saldeo_auth_timeout_gives_js_time_to_finish() {
+    let original = std::env::var("SALDEO_AUTH_TIMEOUT_MS").ok();
+    unsafe { std::env::remove_var("SALDEO_AUTH_TIMEOUT_MS") };
+    assert_eq!(saldeo_auth_timeout_ms(), 180_000);
+    assert_eq!(
+        saldeo_auth_process_timeout(),
+        std::time::Duration::from_millis(200_000)
+    );
+    unsafe { std::env::set_var("SALDEO_AUTH_TIMEOUT_MS", "120000") };
+    assert_eq!(saldeo_auth_timeout_ms(), 120_000);
+    assert_eq!(
+        saldeo_auth_process_timeout(),
+        std::time::Duration::from_millis(140_000)
+    );
+    match original {
+        Some(value) => unsafe { std::env::set_var("SALDEO_AUTH_TIMEOUT_MS", value) },
+        None => unsafe { std::env::remove_var("SALDEO_AUTH_TIMEOUT_MS") },
+    }
 }

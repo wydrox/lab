@@ -18,8 +18,8 @@ i poczeka, aż sesja będzie ważna.
 Zapis: $OUT
 EOF
 
-if ! command -v npx >/dev/null 2>&1; then
-  echo "ERROR: brak npx. Zainstaluj Node.js." >&2
+if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+  echo "ERROR: brak node/npm. Zainstaluj Node.js." >&2
   exit 1
 fi
 
@@ -44,10 +44,16 @@ if [[ -n "${SALDEO_USERNAME:-}" && -n "${SALDEO_PASSWORD:-}" ]]; then
   export LAB_SALDEO_LOGIN_FILE="$LOGIN_FILE"
 fi
 
+PREFIX="${LAB_PLAYWRIGHT_PREFIX:-$HOME/.config/lab/playwright}"
+if [[ ! -d "$PREFIX/node_modules/playwright" ]]; then
+  echo "Instaluję Playwright w $PREFIX (bez przeglądarki Playwright)..."
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install --prefix "$PREFIX" --no-fund --no-audit playwright
+fi
 LAB_SALDEO_STORAGE_STATE="$OUT" \
 SALDEO_URL="$URL" \
 HELIUM_EXECUTABLE="$HELIUM_EXECUTABLE" \
-npx --yes -p playwright node "$LOGIN_JS"
+NODE_PATH="$PREFIX/node_modules" \
+node "$LOGIN_JS"
 
 if [[ ! -s "$OUT" ]]; then
   echo "ERROR: storage state nie został zapisany: $OUT" >&2

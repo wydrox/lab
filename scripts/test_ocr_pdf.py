@@ -43,6 +43,10 @@ class OcrTests(unittest.TestCase):
         with patch.object(ocr.os, "access", return_value=True), patch.object(ocr.Path, "is_file", return_value=True):
             self.assertEqual(ocr.poppler_bin("pdfinfo"), Path("/opt/homebrew/bin/pdfinfo"))
 
+    def test_password_pdf_is_rejected_before_render(self):
+        self.assertTrue(ocr.poppler_reports_password("Command Line Error: Incorrect password"))
+        self.assertFalse(ocr.poppler_reports_password("Syntax Error"))
+
 
 if __name__ == "__main__":
     unittest.main()

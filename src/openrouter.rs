@@ -12,6 +12,32 @@ pub(crate) fn openrouter_model() -> String {
     lab_config_var("LAB_OPENROUTER_MODEL").unwrap_or_else(|| DEFAULT_OPENROUTER_MODEL.to_string())
 }
 
+pub(crate) fn strip_openrouter_batch_variant(model: &str) -> String {
+    let stripped = model
+        .split(':')
+        .filter(|part| !part.eq_ignore_ascii_case("batch"))
+        .collect::<Vec<_>>()
+        .join(":");
+    if stripped.is_empty() {
+        DEFAULT_OPENROUTER_MODEL.to_string()
+    } else {
+        stripped
+    }
+}
+
+pub(crate) fn openrouter_chat_model() -> String {
+    strip_openrouter_batch_variant(&openrouter_model())
+}
+
+pub(crate) fn openrouter_progress_line(processed: usize, todo: usize, filename: &str) -> String {
+    let percent = if todo == 0 {
+        100
+    } else {
+        processed.saturating_mul(100) / todo
+    };
+    format!("OpenRouter {processed}/{todo} ({percent}%) {filename}")
+}
+
 fn openrouter_timeout() -> Duration {
     Duration::from_secs(
         lab_config_var("LAB_OPENROUTER_TIMEOUT_SECS")
@@ -90,11 +116,7 @@ pub(crate) fn invoice_structured_schema() -> Value {
     })
 }
 
-pub(crate) fn openrouter_invoice_request(
-    model: &str,
-    filename: &str,
-    pdf_base64: &str,
-) -> Value {
+pub(crate) fn openrouter_invoice_request(model: &str, filename: &str, pdf_base64: &str) -> Value {
     serde_json::json!({
         "model": model,
         "temperature": 0,
@@ -165,6 +187,16 @@ pub(crate) fn openrouter_extract_invoice_fields(
     record: &mut InvoiceRecord,
     path: &Path,
 ) -> Result<bool> {
+    if record_is_password_protected(record) || pdf_is_password_protected(path) {
+        if !record
+            .warnings
+            .iter()
+            .any(|warning| is_pdf_password_warning(warning))
+        {
+            record.warnings.push(PDF_PASSWORD_WARNING.to_string());
+        }
+        return Err(anyhow!(PDF_PASSWORD_WARNING));
+    }
     let meta = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
     if meta.len() > MAX_OCR_PDF_BYTES {
         return Err(anyhow!(
@@ -180,7 +212,7 @@ pub(crate) fn openrouter_extract_invoice_fields(
     let api_key = secret_value(Secret::OpenRouterApiKey)?.ok_or_else(|| {
         anyhow!("brak OPENROUTER_API_KEY; ustaw klucz OpenRouter albo użyj lokalnego LLM")
     })?;
-    let model = openrouter_model();
+    let model = openrouter_chat_model();
     let body = openrouter_invoice_request(&model, filename, &pdf_base64);
     let client = Client::builder().timeout(openrouter_timeout()).build()?;
     let mut last_err = None;
@@ -257,12 +289,32 @@ mod tests {
         assert_eq!(body["response_format"]["json_schema"]["strict"], true);
         assert_eq!(body["plugins"][0]["pdf"]["engine"], "native");
         assert_eq!(body["provider"]["require_parameters"], true);
-        let file = &body["messages"][0]["content"][1]["file"];
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "file");
+        let file = &content[1]["file"];
         assert_eq!(file["filename"], "Invoice-M73SJH5X-0005.pdf");
         assert_eq!(file["file_data"], "data:application/pdf;base64,AAA");
         let encoded = serde_json::to_string(&body).unwrap();
         assert!(!encoded.contains("Bearer"));
         assert!(!encoded.contains("OPENROUTER"));
+        assert!(!encoded.contains("Tekst PDF"));
+    }
+
+    #[test]
+    fn chat_completions_use_base_model_and_progress() {
+        assert_eq!(
+            strip_openrouter_batch_variant("google/gemini-3.8-flash:batch"),
+            "google/gemini-3.8-flash"
+        );
+        assert_eq!(
+            strip_openrouter_batch_variant("google/gemini-3.8-flash:batch:nitro"),
+            "google/gemini-3.8-flash:nitro"
+        );
+        assert_eq!(
+            openrouter_progress_line(2, 8, "Invoice.pdf"),
+            "OpenRouter 2/8 (25%) Invoice.pdf"
+        );
     }
 
     #[test]
@@ -270,7 +322,10 @@ mod tests {
         let ok = serde_json::json!({
             "choices":[{"finish_reason":"stop","message":{"content":"{\"seller_name\":\"Elocity\"}"}}]
         });
-        assert_eq!(openrouter_response_json(&ok).unwrap()["seller_name"], "Elocity");
+        assert_eq!(
+            openrouter_response_json(&ok).unwrap()["seller_name"],
+            "Elocity"
+        );
         let truncated = serde_json::json!({
             "choices":[{"finish_reason":"length","message":{"content":"{\"seller_name\":\"Elocity\"}"}}]
         });

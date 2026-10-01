@@ -1,5 +1,6 @@
 use crate::*;
 use dialoguer::{Confirm, Input};
+use std::collections::{HashMap, HashSet};
 
 pub(crate) struct SaldeoSyncPlanConfig<'a> {
     pub(crate) year: i32,
@@ -73,6 +74,7 @@ pub(crate) fn saldeo_sync_plan(config: SaldeoSyncPlanConfig<'_>) -> Result<Salde
             .or_else(|| Some(DEFAULT_SALDEO_UPLOAD_URL.to_string())),
         summary,
         items,
+        ksef_approve: None,
     })
 }
 
@@ -144,6 +146,7 @@ pub(crate) fn saldeo_upload_plan_with_progress(
     _file_field: &str,
     progress: Option<Arc<Mutex<String>>>,
 ) -> Result<()> {
+    ensure_saldeo_session_or_auth(progress.clone())?;
     let session = read_saldeo_session(storage_state)?;
     let client = Client::builder().build()?;
     let uploadable_count = plan.items.iter().filter(|item| item.can_upload).count();
@@ -660,6 +663,125 @@ pub(crate) fn save_saldeo_record_override(
     upsert_saldeo_record_override(&conn, override_row)
 }
 
+pub(crate) struct SaldeoRepairCandidate {
+    pub(crate) override_row: SaldeoRecordOverride,
+    pub(crate) invoice_number: Option<String>,
+    pub(crate) changed_fields: Vec<String>,
+}
+
+pub(crate) fn saldeo_override_from_record(record: &InvoiceRecord) -> SaldeoRecordOverride {
+    SaldeoRecordOverride {
+        content_hash: record.content_hash.clone(),
+        invoice_number: record.invoice_number.clone(),
+        seller_tax_id: record.seller_tax_id.clone(),
+        buyer_tax_id: record.buyer_tax_id.clone(),
+        seller_name: record.seller_name.clone(),
+        buyer_name: record.buyer_name.clone(),
+        issue_date: record.issue_date,
+        gross_amount_minor: record.gross_amount_minor,
+        currency: record.currency.clone(),
+    }
+}
+
+pub(crate) fn saldeo_override_changed_fields(
+    before: &InvoiceRecord,
+    after: &InvoiceRecord,
+) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    if before.invoice_number != after.invoice_number {
+        changed.push("invoice_number");
+    }
+    if before.seller_tax_id != after.seller_tax_id {
+        changed.push("seller_tax_id");
+    }
+    if before.buyer_tax_id != after.buyer_tax_id {
+        changed.push("buyer_tax_id");
+    }
+    if before.seller_name != after.seller_name {
+        changed.push("seller_name");
+    }
+    if before.buyer_name != after.buyer_name {
+        changed.push("buyer_name");
+    }
+    if before.issue_date != after.issue_date {
+        changed.push("issue_date");
+    }
+    if before.gross_amount_minor != after.gross_amount_minor {
+        changed.push("gross_amount_minor");
+    }
+    if before.currency != after.currency {
+        changed.push("currency");
+    }
+    changed
+}
+
+pub(crate) fn repair_saldeo_items_from_report(
+    report: &TriReconcileReport,
+) -> Vec<SaldeoRepairCandidate> {
+    let mut items = Vec::new();
+    for row in &report.rows {
+        let Some(mut saldeo) = row.saldeo.clone() else {
+            continue;
+        };
+        if saldeo.source != SourceKind::Saldeo {
+            continue;
+        }
+        let original = saldeo.clone();
+        if let Some(ksef) = &row.ksef {
+            merge_missing_invoice_metadata(&mut saldeo, ksef);
+        }
+        if let Some(mail) = &row.mail {
+            merge_missing_invoice_metadata(&mut saldeo, mail);
+        }
+        let changed_fields = saldeo_override_changed_fields(&original, &saldeo);
+        if changed_fields.is_empty() {
+            continue;
+        }
+        items.push(SaldeoRepairCandidate {
+            invoice_number: saldeo.invoice_number.clone(),
+            override_row: saldeo_override_from_record(&saldeo),
+            changed_fields: changed_fields.into_iter().map(str::to_string).collect(),
+        });
+    }
+    items
+}
+
+pub(crate) fn saldeo_duplicate_groups(records: &[InvoiceRecord]) -> Vec<SaldeoDuplicateGroup> {
+    let mut by_key = HashMap::<String, Vec<&InvoiceRecord>>::new();
+    for record in records {
+        if record.source != SourceKind::Saldeo {
+            continue;
+        }
+        let Some(key) = reconcile_dedupe_key(record) else {
+            continue;
+        };
+        by_key.entry(key).or_default().push(record);
+    }
+    let mut groups = by_key
+        .into_iter()
+        .filter(|(_, records)| records.len() > 1)
+        .map(|(key, records)| {
+            let kept = records
+                .iter()
+                .max_by_key(|record| record_completeness_score(record))
+                .expect("duplicate group is not empty");
+            SaldeoDuplicateGroup {
+                key,
+                invoice_number: records
+                    .iter()
+                    .find_map(|record| record.invoice_number.clone()),
+                content_hashes: records
+                    .iter()
+                    .map(|record| record.content_hash.clone())
+                    .collect(),
+                kept_content_hash: kept.content_hash.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    groups.sort_by(|a, b| a.key.cmp(&b.key));
+    groups
+}
+
 pub(crate) fn saldeo_record_has_override(record: &InvoiceRecord) -> bool {
     record.source == SourceKind::Saldeo
         && record
@@ -936,6 +1058,7 @@ pub(crate) fn saldeo_fetch_with_progress(
     if let Some(progress) = &progress {
         set_progress(progress, "Saldeo: odczyt zapisanej sesji...");
     }
+    ensure_saldeo_session_or_auth(progress.clone())?;
     let storage: Value = serde_json::from_str(&read_saldeo_storage_state(storage_state)?)?;
     let cookies = storage
         .get("cookies")

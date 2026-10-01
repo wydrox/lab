@@ -4,3 +4,5 @@
 *.sqlite
 *.sqlite-*
 .env
+.env.*
+!.env.example

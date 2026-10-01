@@ -397,8 +397,10 @@ pub(crate) fn tri_row_display_record(row: &TriRow) -> Option<InvoiceRecord> {
             .find_map(|source| source.and_then(|r| r.ksef_reference.clone()));
     }
 
-    record.seller_name = first_useful_party_name(name_sources, |record| record.seller_name.as_deref());
-    record.buyer_name = first_useful_party_name(name_sources, |record| record.buyer_name.as_deref());
+    record.seller_name =
+        first_useful_party_name(name_sources, |record| record.seller_name.as_deref());
+    record.buyer_name =
+        first_useful_party_name(name_sources, |record| record.buyer_name.as_deref());
     if let Some(value) = metadata_sources
         .iter()
         .find_map(|source| source.and_then(|r| r.seller_tax_id.clone()))
@@ -567,11 +569,10 @@ fn first_useful_party_name(
     sources: [Option<&InvoiceRecord>; 3],
     pick: impl Fn(&InvoiceRecord) -> Option<&str>,
 ) -> Option<String> {
-    sources.into_iter().flatten().find_map(|record| {
-        pick(record)
-            .and_then(useful_party_name)
-            .map(str::to_string)
-    })
+    sources
+        .into_iter()
+        .flatten()
+        .find_map(|record| pick(record).and_then(useful_party_name).map(str::to_string))
 }
 
 fn first_useful_invoice_number(sources: [Option<&InvoiceRecord>; 3]) -> Option<String> {

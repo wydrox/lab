@@ -178,6 +178,57 @@ struct SaldeoSyncPlan {
     upload_url: Option<String>,
     summary: SaldeoSyncSummary,
     items: Vec<SaldeoSyncItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ksef_approve: Option<SaldeoApprovePlan>,
+}
+
+#[derive(Debug, Serialize)]
+struct SaldeoApprovePlan {
+    generated_at: DateTime<Utc>,
+    year: i32,
+    confirm: bool,
+    summary: SaldeoApproveSummary,
+    document_ids: Vec<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct SaldeoApproveSummary {
+    pending_count: usize,
+    approved_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct SaldeoRepairPlan {
+    generated_at: DateTime<Utc>,
+    year: i32,
+    confirm: bool,
+    llm: bool,
+    summary: SaldeoRepairSummary,
+    items: Vec<SaldeoRepairItem>,
+    duplicates: Vec<SaldeoDuplicateGroup>,
+}
+
+#[derive(Debug, Serialize)]
+struct SaldeoRepairSummary {
+    repaired_count: usize,
+    duplicate_group_count: usize,
+    duplicate_record_count: usize,
+    llm_enriched_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct SaldeoRepairItem {
+    content_hash: String,
+    invoice_number: Option<String>,
+    changed_fields: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SaldeoDuplicateGroup {
+    key: String,
+    invoice_number: Option<String>,
+    content_hashes: Vec<String>,
+    kept_content_hash: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -278,38 +329,50 @@ fn run_sync_sources_with_progress(
     let mut records_count = 0usize;
 
     if ksef || all {
-        let result = if let Some(input) = ksef_input {
+        let ksef_result = if let Some(input) = ksef_input {
             eprintln!("  [KSeF] synchronizacja z lokalnego eksportu...");
             if let Some(progress) = &progress {
                 set_progress(progress, "KSeF: synchronizacja z lokalnego eksportu...");
             }
-            ksef_sync(year, input, None)?
+            ksef_sync(year, input, None)
         } else {
             eprintln!("  [KSeF] synchronizacja online...");
             if progress.is_some() {
-                ksef_online_sync_cached_with_progress(year, None, progress.clone())?
+                ksef_online_sync_cached_with_progress(year, None, progress.clone())
             } else {
-                ksef_online_sync_with_progress(year, None, progress.clone())?
+                ksef_online_sync_with_progress(year, None, progress.clone())
             }
         };
-        records_count += result.records.len();
-        if let Some(progress) = &progress {
-            set_progress(
-                progress,
-                format!("KSeF: zapis do bazy ({} rekordów)...", result.records.len()),
-            );
+        match ksef_result {
+            Ok(result) => {
+                records_count += result.records.len();
+                if let Some(progress) = &progress {
+                    set_progress(
+                        progress,
+                        format!("KSeF: zapis do bazy ({} rekordów)...", result.records.len()),
+                    );
+                }
+                if let Some(conn) = conn {
+                    store_records(conn, &result.records)?;
+                }
+                eprintln!("  [KSeF] gotowe: {} rekordów", result.summary.records_count);
+                if let Some(progress) = &progress {
+                    set_progress(
+                        progress,
+                        format!("KSeF: gotowe — {} rekordów", result.summary.records_count),
+                    );
+                }
+                synced.push(format!("ksef ({})", result.summary.records_count));
+            }
+            Err(err) if all && is_missing_ksef_token(&err) => {
+                eprintln!("  [KSeF] pominięto: {err}");
+                if let Some(progress) = &progress {
+                    set_progress(progress, format!("KSeF: pominięto ({err})"));
+                }
+                synced.push("ksef (pominięte: brak tokenu)".to_string());
+            }
+            Err(err) => return Err(err),
         }
-        if let Some(conn) = conn {
-            store_records(conn, &result.records)?;
-        }
-        eprintln!("  [KSeF] gotowe: {} rekordów", result.summary.records_count);
-        if let Some(progress) = &progress {
-            set_progress(
-                progress,
-                format!("KSeF: gotowe — {} rekordów", result.summary.records_count),
-            );
-        }
-        synced.push(format!("ksef ({})", result.summary.records_count));
     }
 
     if mail || amazon_mail || all {
@@ -564,6 +627,7 @@ fn sync_reconcile_metadata_with_progress(
 }
 
 fn main() -> Result<()> {
+    prepare_secret_store();
     let cli = Cli::parse();
     let db_path = cli.db;
     match cli.command {
@@ -636,6 +700,7 @@ fn handle_command(db_path: &Path, command: Commands) -> Result<()> {
             output,
             csv,
             confirm,
+            approve,
         } => handle_upload_command(
             db_path,
             year,
@@ -647,7 +712,21 @@ fn handle_command(db_path: &Path, command: Commands) -> Result<()> {
             output,
             csv,
             confirm,
+            approve,
         ),
+        Commands::Repair {
+            year,
+            review_score,
+            llm,
+            confirm,
+            output,
+        } => handle_repair_command(db_path, year, review_score, llm, confirm, output),
+        Commands::Approve {
+            year,
+            review_score,
+            confirm,
+            output,
+        } => handle_approve_command(db_path, year, review_score, confirm, output),
         Commands::Mcp => run_mcp_server(db_path),
         Commands::Db { command } => handle_db_command(db_path, command),
         Commands::Doctor { token_env } => doctor(db_path, &token_env),
@@ -763,6 +842,7 @@ fn handle_upload_command(
     output: Option<PathBuf>,
     csv: Option<PathBuf>,
     confirm: bool,
+    approve: bool,
 ) -> Result<()> {
     let mut plan = saldeo_sync_plan(SaldeoSyncPlanConfig {
         year,
@@ -776,14 +856,16 @@ fn handle_upload_command(
         upload_url: None,
     })?;
     if confirm {
-        let storage_state = default_saldeo_storage_state_path();
-        saldeo_upload_plan(&mut plan, &storage_state, DEFAULT_SALDEO_UPLOAD_URL, "file")?;
+        ensure_saldeo_session()?;
+        saldeo_upload_plan(
+            &mut plan,
+            &default_saldeo_storage_state_path(),
+            DEFAULT_SALDEO_UPLOAD_URL,
+            "file",
+        )?;
     }
-    if let Some(csv_path) = csv {
-        write_saldeo_sync_csv(&plan, &csv_path)?;
-    }
-    write_json(&plan, output.as_deref())?;
-    if confirm && plan.summary.uploaded_count > 0 {
+    let refresh_after_upload = confirm && plan.summary.uploaded_count > 0;
+    if refresh_after_upload || (confirm && approve) {
         if let Err(err) = saldeo_fetch_with_progress(
             year,
             &default_saldeo_storage_state_path(),
@@ -794,7 +876,206 @@ fn handle_upload_command(
             eprintln!("  [Saldeo] refresh po uploadzie nie powiódł się: {err}");
         }
     }
+    if approve {
+        plan.ksef_approve = Some(saldeo_approve_pending_ksef(
+            db_path,
+            year,
+            review_score,
+            confirm,
+        )?);
+    }
+    if let Some(csv_path) = csv {
+        write_saldeo_sync_csv(&plan, &csv_path)?;
+    }
+    write_json(&plan, output.as_deref())?;
     Ok(())
+}
+
+fn handle_repair_command(
+    db_path: &Path,
+    year: i32,
+    review_score: u8,
+    llm: bool,
+    confirm: bool,
+    output: Option<PathBuf>,
+) -> Result<()> {
+    write_json(
+        &saldeo_repair_plan(db_path, year, review_score, llm, confirm)?,
+        output.as_deref(),
+    )
+}
+
+fn handle_approve_command(
+    db_path: &Path,
+    year: i32,
+    review_score: u8,
+    confirm: bool,
+    output: Option<PathBuf>,
+) -> Result<()> {
+    write_json(
+        &saldeo_approve_pending_ksef(db_path, year, review_score, confirm)?,
+        output.as_deref(),
+    )
+}
+
+fn ensure_saldeo_session() -> Result<SaldeoSession> {
+    ensure_saldeo_session_or_auth(None)?;
+    read_saldeo_session(&default_saldeo_storage_state_path())
+}
+
+fn enrich_repair_mail_with(
+    candidates: &mut [InvoiceRecord],
+    confirm: bool,
+    enrich: impl FnOnce(&mut [InvoiceRecord]) -> Result<()>,
+    persist: impl FnOnce(&[InvoiceRecord]) -> Result<()>,
+) -> Result<usize> {
+    let before = candidates.to_vec();
+    enrich(candidates)?;
+    let enriched_count = before
+        .iter()
+        .zip(candidates.iter())
+        .filter(|(old, record)| {
+            old.invoice_number != record.invoice_number
+                || old.seller_tax_id != record.seller_tax_id
+                || old.buyer_tax_id != record.buyer_tax_id
+                || old.seller_name != record.seller_name
+                || old.buyer_name != record.buyer_name
+                || old.issue_date != record.issue_date
+                || old.gross_amount_minor != record.gross_amount_minor
+                || old.currency != record.currency
+        })
+        .count();
+    if confirm && enriched_count > 0 {
+        persist(candidates)?;
+    }
+    Ok(enriched_count)
+}
+
+fn saldeo_repair_plan(
+    db_path: &Path,
+    year: i32,
+    review_score: u8,
+    llm: bool,
+    confirm: bool,
+) -> Result<SaldeoRepairPlan> {
+    let mail_path = default_mail_candidates_path(year);
+    let mut mail = load_records_if_present(SourceKind::Mail, &mail_path)?;
+    let mut llm_enriched_count = 0usize;
+    if llm {
+        if mail_path.exists() {
+            let cached = apply_cached_mail_candidates(&mail_path, &mut mail)?;
+            llm_enriched_count = enrich_repair_mail_with(
+                &mut mail,
+                confirm,
+                |candidates| enrich_candidates_with_gemma(candidates, &cached, None),
+                |candidates| {
+                    write_records(candidates, OutputFormat::Jsonl, Some(&mail_path))?;
+                    let conn = open_db(db_path)?;
+                    store_records(&conn, candidates).map(|_| ())
+                },
+            )?;
+        } else {
+            eprintln!("  [LAB] brak pliku Gmail do LLM: {}", mail_path.display());
+        }
+    }
+
+    let mail = filter_invoice_records_for_year(mail, year);
+    let ksef = filter_invoice_records_for_year(
+        load_records_if_present(SourceKind::Ksef, &configured_ksef_out_path(year))?,
+        year,
+    );
+    let saldeo_path = default_saldeo_records_path(year);
+    let saldeo = if saldeo_path.exists() {
+        filter_invoice_records_for_year(load_saldeo_records(&saldeo_path, Some(db_path))?, year)
+    } else {
+        Vec::new()
+    };
+    let duplicates = saldeo_duplicate_groups(&saldeo);
+    let report = tri_reconcile(mail, ksef, saldeo, review_score);
+    let items = repair_saldeo_items_from_report(&report);
+    if confirm {
+        for item in &items {
+            save_saldeo_record_override(db_path, &item.override_row)?;
+        }
+        eprintln!("  [LAB] zapisano {} poprawek Saldeo", items.len());
+    }
+    Ok(SaldeoRepairPlan {
+        generated_at: Utc::now(),
+        year,
+        confirm,
+        llm,
+        summary: SaldeoRepairSummary {
+            repaired_count: items.len(),
+            duplicate_group_count: duplicates.len(),
+            duplicate_record_count: duplicates
+                .iter()
+                .map(|group| group.content_hashes.len())
+                .sum(),
+            llm_enriched_count,
+        },
+        items: items
+            .into_iter()
+            .map(|item| SaldeoRepairItem {
+                content_hash: item.override_row.content_hash,
+                invoice_number: item.invoice_number,
+                changed_fields: item.changed_fields,
+            })
+            .collect(),
+        duplicates,
+    })
+}
+
+fn saldeo_approve_pending_ksef(
+    db_path: &Path,
+    year: i32,
+    review_score: u8,
+    confirm: bool,
+) -> Result<SaldeoApprovePlan> {
+    if confirm {
+        ensure_saldeo_session()?;
+    } else if !saldeo_session_valid(&default_saldeo_storage_state_path()) {
+        eprintln!(
+            "  [Saldeo] sesja nieważna — plan zatwierdzenia może być pusty. Użyj --confirm, żeby zalogować Helium."
+        );
+    }
+    let rows = build_invoice_table_rows(year, review_score, db_path)?;
+    let mut document_ids = pending_ksef_approve_ids(&rows);
+    let mut approved_count = 0usize;
+    if confirm && !document_ids.is_empty() {
+        let session = ensure_saldeo_session()?;
+        eprintln!(
+            "  [Saldeo] zatwierdzam KSeF ({} dokumentów)...",
+            document_ids.len()
+        );
+        document_ids = saldeo_mark_ksef_documents(&session, &document_ids, true)?;
+        approved_count = document_ids.len();
+        let mut statuses = load_ksef_accounting_cache(year);
+        for document_id in &document_ids {
+            statuses.insert(*document_id, Some(true));
+        }
+        if let Err(err) = save_ksef_accounting_cache(year, &statuses) {
+            eprintln!("  [Saldeo] nie zapisałem cache statusów KSeF: {err}");
+        }
+        if let Err(err) = saldeo_fetch_with_progress(
+            year,
+            &default_saldeo_storage_state_path(),
+            &default_saldeo_out_path(year),
+            Some(db_path),
+            None,
+        ) {
+            eprintln!("  [Saldeo] refresh po zatwierdzeniu nie powiódł się: {err}");
+        }
+    }
+    Ok(SaldeoApprovePlan {
+        generated_at: Utc::now(),
+        year,
+        confirm,
+        summary: SaldeoApproveSummary {
+            pending_count: document_ids.len(),
+            approved_count,
+        },
+        document_ids,
+    })
 }
 
 fn write_records(
@@ -1425,6 +1706,14 @@ fn db_stats(conn: &Connection) -> Result<Value> {
     }))
 }
 
+fn load_records_if_present(source: SourceKind, input: &Path) -> Result<Vec<InvoiceRecord>> {
+    if input.exists() {
+        load_records(source, input)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
 fn load_records(source: SourceKind, input: &Path) -> Result<Vec<InvoiceRecord>> {
     if input.is_dir() {
         for file_name in [
@@ -1515,6 +1804,9 @@ fn mail_parse_needs_retry(record: &InvoiceRecord) -> bool {
 }
 
 fn mail_warning_needs_retry(warning: &str) -> bool {
+    if is_pdf_password_warning(warning) {
+        return false;
+    }
     let warning = warning.to_lowercase();
     warning.starts_with("nie udało się wyciągnąć tekstu pdf")
         || warning.starts_with("pdf bez tekstu")
@@ -1713,6 +2005,10 @@ fn parse_file(source: SourceKind, path: &Path) -> Result<InvoiceRecord> {
                 warnings.extend(extraction_warnings);
                 text
             }
+            Err(err) if is_pdf_password_error(&err) => {
+                warnings.push(PDF_PASSWORD_WARNING.to_string());
+                String::new()
+            }
             Err(err) => {
                 warnings.push(format!("nie udało się wyciągnąć tekstu PDF: {err}"));
                 path.file_name()
@@ -1741,7 +2037,7 @@ fn parse_file(source: SourceKind, path: &Path) -> Result<InvoiceRecord> {
     record.source_path = Some(path.display().to_string());
     record.content_hash = hash;
     record.warnings.extend(warnings);
-    if record.invoice_number.is_none() {
+    if record.invoice_number.is_none() && !record_is_password_protected(&record) {
         record.invoice_number = invoice_number_from_filename(path);
     }
     Ok(record)
@@ -1782,6 +2078,72 @@ fn record_missing_core_fields(record: &InvoiceRecord) -> bool {
             .buyer_name
             .as_deref()
             .is_some_and(counterparty_name_is_placeholder)
+}
+
+fn invoice_signal_re() -> &'static Regex {
+    static RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(?i)(invoice|faktura|faktury|rachunek|proforma|\bfv\b|ksef|billing@)").unwrap()
+    });
+    &RE
+}
+
+fn record_has_invoice_signal(record: &InvoiceRecord) -> bool {
+    record
+        .invoice_number
+        .as_deref()
+        .is_some_and(is_valid_invoice_number_candidate)
+        || record.seller_tax_id.is_some()
+        || record.buyer_tax_id.is_some()
+        || record.ksef_reference.is_some()
+        || record.gross_amount_minor.is_some()
+        || [
+            record.source_path.as_deref(),
+            record.email_subject.as_deref(),
+            record.email_from.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|text| invoice_signal_re().is_match(text))
+}
+
+fn record_missing_hard_fields(record: &InvoiceRecord) -> bool {
+    record_amounts_inconsistent(record)
+        || record
+            .invoice_number
+            .as_deref()
+            .is_none_or(|number| !is_valid_invoice_number_candidate(number))
+        || record.issue_date.is_none()
+        || record.gross_amount_minor.is_none()
+}
+
+pub(crate) fn record_needs_paid_llm(record: &InvoiceRecord) -> bool {
+    !record_is_password_protected(record)
+        && record_has_invoice_signal(record)
+        && record_missing_hard_fields(record)
+}
+
+fn record_queued_for_llm(
+    record: &InvoiceRecord,
+    skip_hashes: &HashSet<String>,
+    paid: bool,
+    force: bool,
+) -> bool {
+    if skip_hashes.contains(&record.content_hash) || record_is_password_protected(record) {
+        return false;
+    }
+    if !record.source_path.as_ref().is_some_and(|path| {
+        Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+    }) {
+        return false;
+    }
+    if paid && !force {
+        record_needs_paid_llm(record)
+    } else {
+        record_missing_core_fields(record)
+    }
 }
 
 fn json_first_string(value: &Value, keys: &[&str]) -> Option<String> {
@@ -2777,6 +3139,48 @@ fn normalize_key(key: &str) -> String {
         .collect()
 }
 
+pub(crate) const PDF_PASSWORD_WARNING: &str = "PDF chroniony hasłem; pominięto";
+
+pub(crate) fn poppler_reports_password(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("incorrect password")
+        || stderr.contains("password required")
+        || stderr.contains("needs a password")
+}
+
+pub(crate) fn is_pdf_password_warning(warning: &str) -> bool {
+    warning.starts_with("PDF chroniony hasłem")
+}
+
+pub(crate) fn is_pdf_password_error(err: &anyhow::Error) -> bool {
+    is_pdf_password_warning(&err.to_string())
+}
+
+pub(crate) fn record_is_password_protected(record: &InvoiceRecord) -> bool {
+    record
+        .warnings
+        .iter()
+        .any(|warning| is_pdf_password_warning(warning))
+}
+
+pub(crate) fn pdf_is_password_protected(path: &Path) -> bool {
+    if let Ok(pdfinfo) = local_tool("pdfinfo") {
+        let mut command = Command::new(pdfinfo);
+        apply_isolated_env(&mut command);
+        if let Ok(output) = command.arg(path).output() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if poppler_reports_password(&stderr) || poppler_reports_password(&stdout) {
+                return true;
+            }
+            if output.status.success() {
+                return false;
+            }
+        }
+    }
+    extract_pdf_text(path).is_err_and(|err| is_pdf_password_error(&err))
+}
+
 fn extract_pdf_text(path: &Path) -> Result<String> {
     let mut command = Command::new(local_tool("pdftotext")?);
     apply_isolated_env(&mut command);
@@ -2790,6 +3194,9 @@ fn extract_pdf_text(path: &Path) -> Result<String> {
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            if poppler_reports_password(&stderr) {
+                return Err(anyhow!(PDF_PASSWORD_WARNING));
+            }
             if !stderr.trim().is_empty() {
                 eprintln!("pdftotext failed for {}: {}", path.display(), stderr.trim());
             }
@@ -3616,6 +4023,9 @@ fn productmesh_invoice_candidates(
     let mut fallback_seen = HashSet::new();
     let mut fallback_out = Vec::new();
     for record in records {
+        if record_is_password_protected(record) {
+            continue;
+        }
         let names = format!(
             "{} {}",
             record.seller_name.clone().unwrap_or_default(),
@@ -3760,34 +4170,43 @@ fn enrich_candidates_with_gemma(
     skip_hashes: &HashSet<String>,
     progress: Option<Arc<Mutex<String>>>,
 ) -> Result<()> {
-    enrich_candidates_with_gemma_with_hook(records, skip_hashes, progress, |_, _| Ok(()))
+    enrich_candidates_with_gemma_with_hook(records, skip_hashes, progress, false, |_, _| Ok(()))
 }
 
 fn enrich_candidates_with_gemma_with_hook<F>(
     records: &mut [InvoiceRecord],
     skip_hashes: &HashSet<String>,
     progress: Option<Arc<Mutex<String>>>,
+    force: bool,
     mut after_record: F,
 ) -> Result<()>
 where
     F: FnMut(&[InvoiceRecord], usize) -> Result<()>,
 {
+    let use_openrouter = openrouter_configured();
     let todo = records
         .iter()
-        .filter(|record| !skip_hashes.contains(&record.content_hash))
-        .filter(|record| record_missing_core_fields(record))
-        .filter(|record| {
-            record.source_path.as_ref().is_some_and(|path| {
-                Path::new(path).extension().and_then(|e| e.to_str()) == Some("pdf")
-            })
-        })
+        .filter(|record| record_queued_for_llm(record, skip_hashes, use_openrouter, force))
         .count();
+    if use_openrouter && !force {
+        let skipped = records
+            .iter()
+            .filter(|record| {
+                record_queued_for_llm(record, skip_hashes, false, false)
+                    && !record_needs_paid_llm(record)
+            })
+            .count();
+        if skipped > 0 {
+            eprintln!(
+                "  [Gmail/OpenRouter] pominięto {skipped} łatwych albo bez sygnału faktury; Gemini tylko dla trudnych"
+            );
+        }
+    }
     if todo == 0 {
         return Ok(());
     }
-    let use_openrouter = openrouter_configured();
     let model = if use_openrouter {
-        openrouter_model()
+        openrouter_chat_model()
     } else {
         llm_model()
     };
@@ -3800,9 +4219,7 @@ where
         "  [Gmail/LLM] wzbogacanie {} kandydatów przez {}...",
         todo, model
     );
-    if !use_openrouter
-        && let Err(err) = ensure_ppmlx_server()
-    {
+    if !use_openrouter && let Err(err) = ensure_ppmlx_server() {
         eprintln!("  [Gmail/LLM] pominięto wzbogacanie: {err}");
         for idx in 0..records.len() {
             if !skip_hashes.contains(&records[idx].content_hash)
@@ -3819,9 +4236,7 @@ where
     }
     let mut processed = 0usize;
     for idx in 0..records.len() {
-        if skip_hashes.contains(&records[idx].content_hash)
-            || !record_missing_core_fields(&records[idx])
-        {
+        if !record_queued_for_llm(&records[idx], skip_hashes, use_openrouter, force) {
             continue;
         }
         let Some(source_path) = records[idx].source_path.clone() else {
@@ -3833,10 +4248,14 @@ where
         }
         processed += 1;
         let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("PDF");
-        let status = format!("LLM: {}/{} {}", processed, todo, fname);
+        let status = if use_openrouter {
+            openrouter_progress_line(processed, todo, fname)
+        } else {
+            format!("LLM: {}/{} {}", processed, todo, fname)
+        };
         eprintln!("  [Gmail/LLM] {}", status);
         if let Some(ref p) = progress {
-            *p.lock().unwrap() = status;
+            set_progress(p, status);
         }
         match extract(&mut records[idx], path) {
             Ok(true) => {
@@ -4028,7 +4447,7 @@ fn ppmlx_response_json(response: &Value) -> Result<Value> {
 #[cfg(test)]
 mod llm_flow_tests;
 
-fn parse_json_from_llm(content: &str) -> Result<Value> {
+pub(crate) fn parse_json_from_llm(content: &str) -> Result<Value> {
     let sanitized = sanitize_llm_content(content);
     let content = sanitized.trim();
 

@@ -65,6 +65,11 @@ pub(crate) fn interactive_tui(db_path: &Path) -> Result<()> {
 pub(crate) fn interactive_reconcile_actions(db_path: &Path) -> Result<()> {
     let mut year: i32 = 2026;
     let mut review_score: u8 = 70;
+    if !saldeo_session_valid(&default_saldeo_storage_state_path()) {
+        eprintln!(
+            "  [Saldeo] sesja nieważna — otwieram tabelę. Menu → Saldeo, żeby zalogować Helium."
+        );
+    }
     let mut rows = build_invoice_table_rows(year, review_score, db_path)?;
 
     loop {
@@ -238,7 +243,8 @@ impl InvoiceTableRow {
     }
 
     fn is_approved_in_ksef_and_saldeo(&self) -> bool {
-        self.ksef_accounting == Some(true)
+        let [_, ksef, saldeo] = invoice_table_source_parts(&self.sources);
+        ksef == "K" && saldeo == "S" && self.ksef_accounting == Some(true)
     }
 
     fn needs_attention(&self) -> bool {
@@ -318,36 +324,7 @@ pub(crate) fn build_invoice_table_rows_with_progress(
         .into_iter()
         .map(|candidate| candidate.document_id)
         .collect::<Vec<_>>();
-    let ksef_statuses = if ksef_ids.is_empty() {
-        Some(HashMap::new())
-    } else {
-        if let Some(progress) = &progress {
-            set_progress(
-                progress,
-                format!(
-                    "Tabela: status KSeF w Saldeo ({} dokumentów)...",
-                    ksef_ids.len()
-                ),
-            );
-        }
-        match read_saldeo_session(&default_saldeo_storage_state_path())
-            .and_then(|session| saldeo_fetch_ksef_accounting_statuses(&session, &ksef_ids))
-        {
-            Ok(statuses) => Some(statuses),
-            Err(err) => {
-                eprintln!(
-                    "  [Saldeo] pomijam statusy KSeF w tabeli (sesja/API niedostępne): {err}"
-                );
-                if let Some(progress) = &progress {
-                    set_progress(
-                        progress,
-                        "Tabela: status KSeF w Saldeo niedostępny — użyj Menu → Saldeo, aby odświeżyć sesję",
-                    );
-                }
-                None
-            }
-        }
-    };
+    let ksef_statuses = resolve_ksef_accounting_statuses(year, &ksef_ids, progress.clone());
 
     if let Some(progress) = &progress {
         set_progress(
@@ -358,7 +335,13 @@ pub(crate) fn build_invoice_table_rows_with_progress(
     let rows = report
         .rows
         .iter()
-        .filter_map(|row| invoice_table_row_from_reconcile_row(row, ksef_statuses.as_ref()))
+        .filter_map(|row| {
+            invoice_table_row_from_status_maps(
+                row,
+                Some(&ksef_statuses.display),
+                Some(&ksef_statuses.fresh),
+            )
+        })
         .filter(|row| invoice_table_row_matches_year(row, year))
         .collect::<Vec<_>>();
     Ok(rows)
@@ -381,13 +364,36 @@ pub(crate) fn filter_invoice_records_for_year(
         .collect()
 }
 
-pub(crate) fn invoice_table_row_matches_year(row: &InvoiceTableRow, year: i32) -> bool {
-    invoice_record_matches_year(&row.record, year)
+pub(crate) fn invoice_table_source_parts(sources: &str) -> [&str; 3] {
+    let cleaned = sources.trim_end_matches('*');
+    let mut parts = cleaned.split('/');
+    [
+        parts.next().unwrap_or("-"),
+        parts.next().unwrap_or("-"),
+        parts.next().unwrap_or("-"),
+    ]
 }
 
+pub(crate) fn invoice_table_row_matches_year(row: &InvoiceTableRow, year: i32) -> bool {
+    invoice_record_matches_year(&row.record, year)
+        || row
+            .saldeo_record
+            .as_ref()
+            .is_some_and(|record| invoice_record_matches_year(record, year))
+}
+
+#[cfg(test)]
 pub(crate) fn invoice_table_row_from_reconcile_row(
     row: &TriRow,
     ksef_statuses: Option<&HashMap<i64, Option<bool>>>,
+) -> Option<InvoiceTableRow> {
+    invoice_table_row_from_status_maps(row, ksef_statuses, ksef_statuses)
+}
+
+pub(crate) fn invoice_table_row_from_status_maps(
+    row: &TriRow,
+    display_statuses: Option<&HashMap<i64, Option<bool>>>,
+    fresh_statuses: Option<&HashMap<i64, Option<bool>>>,
 ) -> Option<InvoiceTableRow> {
     let record = tri_row_display_record(row)?;
     let saldeo_record = row.saldeo.clone();
@@ -420,15 +426,13 @@ pub(crate) fn invoice_table_row_from_reconcile_row(
             })
             .and_then(saldeo_document_id)
             .map(|document_id| {
-                let Some(ksef_statuses) = ksef_statuses else {
-                    return (None, None);
-                };
-                let accounting = ksef_statuses.get(&document_id).copied().flatten();
-                let actionable_id = if accounting.is_none() {
-                    Some(document_id)
-                } else {
-                    None
-                };
+                let accounting = display_statuses
+                    .and_then(|statuses| statuses.get(&document_id))
+                    .copied()
+                    .flatten();
+                let actionable_id = fresh_statuses
+                    .is_some_and(|statuses| statuses.get(&document_id) == Some(&None))
+                    .then_some(document_id);
                 (actionable_id, accounting)
             })
             .unwrap_or((None, None))
@@ -749,6 +753,7 @@ pub(crate) fn execute_invoice_table_actions(
             upload_url: Some(DEFAULT_SALDEO_UPLOAD_URL.to_string()),
             summary: saldeo_sync_summary(&selected_upload_items),
             items: selected_upload_items,
+            ksef_approve: None,
         };
         saldeo_upload_plan_with_progress(
             &mut upload_plan,
@@ -784,6 +789,7 @@ pub(crate) fn execute_invoice_table_actions(
     }
 
     if !selected_approve_ids.is_empty() || !selected_reject_ids.is_empty() {
+        ensure_saldeo_session_or_auth(Some(progress.clone()))?;
         let session = read_saldeo_session(&storage_state)?;
         if !selected_approve_ids.is_empty() {
             set_progress(
@@ -1067,7 +1073,7 @@ pub(crate) fn run_invoice_table_tui(
                         InvoiceTableAction::ApproveKsef => theme.approve(),
                         InvoiceTableAction::RejectKsef => theme.reject(),
                         InvoiceTableAction::None if row.needs_attention() => theme.neutral(),
-                        InvoiceTableAction::None => theme.very_muted(),
+                        InvoiceTableAction::None => theme.muted(),
                     }
                 };
                 Row::new(vec![
@@ -1255,18 +1261,26 @@ pub(crate) fn run_invoice_table_tui(
             // Stats bar — stats left, help right
             let upd = invoice_table_updated_count(rows);
             let stats_text = format!(
-                "sel:{} | up:{} | zatw:{} | odrz:{} | zm:{} | {}/{}",
+                "sel:{} | up:{} | zatw:{} | odrz:{} | zm:{} | {}/{}{}",
                 sel,
                 u,
                 a,
                 r,
                 upd,
                 visible.len(),
-                rows.len()
+                rows.len(),
+                if actionable_only {
+                    " | ukryte zatw. K+S"
+                } else {
+                    ""
+                }
             );
-            let help =
+            let help = if actionable_only {
+                "f=pokaż zatw. K+S  e=popraw  spc=toggle  ⏎=select  ⌘c=commit  q=wyjdź"
+            } else {
                 "f=ukryj zatw. K+S  e=popraw  spc=toggle  ⏎=select  ⌘c=commit  q=wyjdź"
-                    .to_string();
+            }
+            .to_string();
             let stats_span = ratatui::text::Span::styled(
                 stats_text,
                 theme.muted().add_modifier(Modifier::ITALIC),
@@ -1621,6 +1635,7 @@ pub(crate) fn run_invoice_table_tui(
                                                         &mut to_enrich,
                                                         &empty_skip,
                                                         Some(progress_clone.clone()),
+                                                        true,
                                                         |enriched_records, idx| {
                                                             let enriched =
                                                                 enriched_records[idx].clone();
@@ -1669,16 +1684,9 @@ pub(crate) fn run_invoice_table_tui(
                                                     &mut candidates,
                                                     &cached,
                                                     Some(progress_clone.clone()),
+                                                    false,
                                                     |all_records, idx| {
                                                         let enriched = all_records[idx].clone();
-                                                        set_progress(
-                                                            &progress_clone,
-                                                            format!(
-                                                                "LLM: zapis {}/{} do pliku i DB...",
-                                                                idx + 1,
-                                                                all_records.len()
-                                                            ),
-                                                        );
                                                         write_records(
                                                             all_records,
                                                             OutputFormat::Jsonl,
@@ -1870,6 +1878,11 @@ pub(crate) fn run_invoice_table_tui(
                 KeyCode::Char('f') => {
                     actionable_only = !actionable_only;
                     table_sel = 0;
+                    status_message = if actionable_only {
+                        "Ukryto zatwierdzone KSeF+Saldeo. f pokazuje je z powrotem.".to_string()
+                    } else {
+                        "Pokazuję zatwierdzone KSeF+Saldeo.".to_string()
+                    };
                 }
                 KeyCode::Char('v') => {
                     paint_mode = !paint_mode;
@@ -1906,9 +1919,9 @@ pub(crate) fn invoice_table_row_passes_filter(
 
 pub(crate) fn invoice_table_ksef_status(row: &InvoiceTableRow) -> String {
     match (row.ksef_document_id, row.ksef_accounting) {
-        (Some(_), None) => "nieozn.".to_string(),
-        (_, Some(true)) => "zatw.".to_string(),
-        (_, Some(false)) => "odrz.".to_string(),
+        (Some(_), None) => "nieoznaczone".to_string(),
+        (_, Some(true)) => "zatwierdzone".to_string(),
+        (_, Some(false)) => "odrzucone".to_string(),
         _ => "—".to_string(),
     }
 }
@@ -1925,6 +1938,126 @@ pub(crate) fn row_source_mask(row: &TriRow) -> String {
 #[derive(Debug, Clone)]
 pub(crate) struct SaldeoKsefAccountingCandidate {
     document_id: i64,
+}
+
+pub(crate) struct KsefAccountingStatuses {
+    pub(crate) display: HashMap<i64, Option<bool>>,
+    pub(crate) fresh: HashMap<i64, Option<bool>>,
+}
+
+impl KsefAccountingStatuses {
+    pub(crate) fn from_live(
+        mut cached: HashMap<i64, Option<bool>>,
+        live: Result<HashMap<i64, Option<bool>>>,
+    ) -> Self {
+        // Cached entries are display-only, even when a successful response is partial.
+        let fresh = live.unwrap_or_default();
+        cached.extend(fresh.iter().map(|(id, status)| (*id, *status)));
+        Self {
+            display: cached,
+            fresh,
+        }
+    }
+}
+
+fn resolve_ksef_accounting_statuses(
+    year: i32,
+    document_ids: &[i64],
+    progress: Option<Arc<Mutex<String>>>,
+) -> KsefAccountingStatuses {
+    if document_ids.is_empty() {
+        return KsefAccountingStatuses::from_live(HashMap::new(), Ok(HashMap::new()));
+    }
+    if let Some(progress) = &progress {
+        set_progress(
+            progress,
+            format!(
+                "Tabela: status KSeF w Saldeo ({} dokumentów)...",
+                document_ids.len()
+            ),
+        );
+    }
+    let cached = load_ksef_accounting_cache(year);
+    if let Err(err) = ensure_saldeo_session_or_auth(progress.clone()) {
+        eprintln!("  [Saldeo] automatyczne logowanie nie powiodło się: {err}");
+    }
+    match read_saldeo_session(&default_saldeo_storage_state_path())
+        .and_then(|session| saldeo_fetch_ksef_accounting_statuses(&session, document_ids))
+    {
+        Ok(live) => {
+            let statuses = KsefAccountingStatuses::from_live(cached, Ok(live));
+            if let Err(err) = save_ksef_accounting_cache(year, &statuses.display) {
+                eprintln!("  [Saldeo] nie zapisałem cache statusów KSeF: {err}");
+            }
+            statuses
+        }
+        Err(err) => {
+            if cached.is_empty() {
+                eprintln!(
+                    "  [Saldeo] pomijam statusy KSeF w tabeli (sesja/API niedostępne): {err}"
+                );
+                if let Some(progress) = &progress {
+                    set_progress(
+                        progress,
+                        "Tabela: status KSeF w Saldeo niedostępny — użyj Menu → Saldeo, aby odświeżyć sesję",
+                    );
+                }
+            } else {
+                eprintln!(
+                    "  [Saldeo] statusy KSeF z cache ({} dokumentów); akcje wyłączone; live: {err}",
+                    cached.len()
+                );
+                if let Some(progress) = &progress {
+                    set_progress(
+                        progress,
+                        format!(
+                            "Tabela: status KSeF z cache ({} dokumentów); akcje wyłączone",
+                            cached.len()
+                        ),
+                    );
+                }
+            }
+            KsefAccountingStatuses::from_live(cached, Err(err))
+        }
+    }
+}
+
+pub(crate) fn ksef_accounting_cache_path(year: i32) -> PathBuf {
+    default_saldeo_out_path(year).join("ksef_accounting.json")
+}
+
+pub(crate) fn load_ksef_accounting_cache(year: i32) -> HashMap<i64, Option<bool>> {
+    let path = ksef_accounting_cache_path(year);
+    let Ok(text) = fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    serde_json::from_str::<HashMap<String, Option<bool>>>(&text)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(key, value)| key.parse().ok().map(|id| (id, value)))
+        .collect()
+}
+
+pub(crate) fn save_ksef_accounting_cache(
+    year: i32,
+    statuses: &HashMap<i64, Option<bool>>,
+) -> Result<()> {
+    let path = ksef_accounting_cache_path(year);
+    let json = statuses
+        .iter()
+        .map(|(id, value)| (id.to_string(), *value))
+        .collect::<HashMap<_, _>>();
+    write_private_file(&path, &serde_json::to_vec_pretty(&json)?)
+}
+
+pub(crate) fn pending_ksef_approve_ids(rows: &[InvoiceTableRow]) -> Vec<i64> {
+    let mut ids = rows
+        .iter()
+        .filter_map(|row| row.ksef_document_id)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 pub(crate) fn saldeo_ksef_accounting_candidates(
@@ -1966,6 +2099,12 @@ pub(crate) fn saldeo_fetch_ksef_accounting_statuses(
         .send()?
         .error_for_status()?
         .json()?;
+    parse_ksef_accounting_statuses(&response)
+}
+
+pub(crate) fn parse_ksef_accounting_statuses(
+    response: &Value,
+) -> Result<HashMap<i64, Option<bool>>> {
     if response.get("status").and_then(|v| v.as_str()) != Some("SUCCESS") {
         return Err(anyhow!("Saldeo KSeF accounting status failed: {response}"));
     }
@@ -1977,16 +2116,53 @@ pub(crate) fn saldeo_fetch_ksef_accounting_statuses(
         .flatten()
     {
         if let Some(document_id) = item.get("documentId").and_then(|v| v.as_i64()) {
-            out.insert(
-                document_id,
-                item.get("accounting").and_then(|v| v.as_bool()),
-            );
+            let accounting = match item.get("accounting") {
+                Some(Value::Null) => None,
+                Some(Value::Bool(value)) => Some(*value),
+                _ => continue,
+            };
+            out.insert(document_id, accounting);
         }
     }
     Ok(out)
 }
 
+pub(crate) fn mark_unmarked_ksef_documents_with(
+    document_ids: &[i64],
+    fetch: impl FnOnce(&[i64]) -> Result<HashMap<i64, Option<bool>>>,
+    mark: impl FnOnce(&[i64]) -> Result<()>,
+) -> Result<Vec<i64>> {
+    if document_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Mutation never consults the display cache; lookup errors propagate before any write.
+    let fresh = fetch(document_ids)?;
+    let mut unmarked = document_ids
+        .iter()
+        .copied()
+        .filter(|id| fresh.get(id) == Some(&None))
+        .collect::<Vec<_>>();
+    unmarked.sort_unstable();
+    unmarked.dedup();
+    if !unmarked.is_empty() {
+        mark(&unmarked)?;
+    }
+    Ok(unmarked)
+}
+
 pub(crate) fn saldeo_mark_ksef_documents(
+    session: &SaldeoSession,
+    document_ids: &[i64],
+    mark_is_accounting: bool,
+) -> Result<Vec<i64>> {
+    mark_unmarked_ksef_documents_with(
+        document_ids,
+        |ids| saldeo_fetch_ksef_accounting_statuses(session, ids),
+        |ids| saldeo_mark_ksef_documents_unchecked(session, ids, mark_is_accounting).map(|_| ()),
+    )
+}
+
+fn saldeo_mark_ksef_documents_unchecked(
     session: &SaldeoSession,
     document_ids: &[i64],
     mark_is_accounting: bool,

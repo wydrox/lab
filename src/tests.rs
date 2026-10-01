@@ -309,6 +309,311 @@ fn saldeo_bad_placeholder_counterparty_triggers_fallback() {
 }
 
 #[test]
+fn repair_fills_missing_saldeo_fields_from_ksef_and_mail() {
+    let mut saldeo = empty_record(SourceKind::Saldeo);
+    saldeo.content_hash = "saldeo:repair-1".into();
+    saldeo.seller_name = Some("nabywca".into());
+    saldeo.issue_date = NaiveDate::from_ymd_opt(2026, 1, 2);
+    saldeo.gross_amount_minor = Some(12300);
+    saldeo.currency = Some("PLN".into());
+
+    let mut ksef = empty_record(SourceKind::Ksef);
+    ksef.content_hash = "ksef:repair-1".into();
+    ksef.invoice_number = Some("FV/1/2026".into());
+    ksef.seller_tax_id = Some("5210000001".into());
+    ksef.seller_name = Some("Sprzedawca Sp. z o.o.".into());
+    ksef.issue_date = NaiveDate::from_ymd_opt(2026, 1, 2);
+    ksef.gross_amount_minor = Some(12300);
+    ksef.currency = Some("PLN".into());
+
+    let mut mail = empty_record(SourceKind::Mail);
+    mail.content_hash = "mail:repair-1".into();
+    mail.invoice_number = Some("FV/1/2026".into());
+    mail.buyer_name = Some("Productmesh".into());
+    mail.buyer_tax_id = Some("5242920020".into());
+    mail.issue_date = NaiveDate::from_ymd_opt(2026, 1, 2);
+    mail.gross_amount_minor = Some(12300);
+    mail.currency = Some("PLN".into());
+
+    let report = tri_reconcile(vec![mail], vec![ksef], vec![saldeo], 30);
+    let items = repair_saldeo_items_from_report(&report);
+    assert_eq!(items.len(), 1);
+    assert!(
+        items[0]
+            .changed_fields
+            .iter()
+            .any(|field| field == "invoice_number")
+    );
+    assert_eq!(
+        items[0].override_row.invoice_number.as_deref(),
+        Some("FV/1/2026")
+    );
+    assert_eq!(
+        items[0].override_row.seller_name.as_deref(),
+        Some("Sprzedawca Sp. z o.o.")
+    );
+    assert_eq!(
+        items[0].override_row.buyer_name.as_deref(),
+        Some("Productmesh")
+    );
+}
+
+#[test]
+fn duplicate_groups_keep_more_complete_saldeo_record() {
+    let mut first = empty_record(SourceKind::Saldeo);
+    first.content_hash = "saldeo:dup-a".into();
+    first.invoice_number = Some("FV/1/2026".into());
+    first.gross_amount_minor = Some(10000);
+    first.currency = Some("PLN".into());
+    first.seller_tax_id = Some("5210000001".into());
+
+    let mut second = first.clone();
+    second.content_hash = "saldeo:dup-b".into();
+    second.seller_name = Some("Sprzedawca".into());
+    second.buyer_name = Some("Productmesh".into());
+
+    let groups = saldeo_duplicate_groups(&[first, second]);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].content_hashes.len(), 2);
+    assert_eq!(groups[0].kept_content_hash, "saldeo:dup-b");
+}
+
+#[test]
+fn pending_ksef_approve_ids_skip_already_marked() {
+    let mut ksef = empty_record(SourceKind::Ksef);
+    ksef.content_hash = "ksef:approve".into();
+    ksef.invoice_number = Some("FV/9/2026".into());
+    ksef.ksef_reference = Some("KSEF-REF".into());
+
+    let mut saldeo = empty_record(SourceKind::Saldeo);
+    saldeo.content_hash = "saldeo:42".into();
+    saldeo.invoice_number = Some("FV/9/2026".into());
+    saldeo.ksef_reference = Some("KSEF-REF".into());
+
+    let row = TriRow {
+        status: "ksef_saldeo_missing_gmail".into(),
+        mail_score_to_ksef: None,
+        mail_score_to_saldeo: None,
+        ksef_score_to_saldeo: Some(80),
+        mail: None,
+        ksef: Some(ksef),
+        saldeo: Some(saldeo),
+    };
+    let mut statuses = std::collections::HashMap::new();
+    let unknown = invoice_table_row_from_reconcile_row(&row, Some(&statuses)).unwrap();
+    assert!(pending_ksef_approve_ids(&[unknown]).is_empty());
+
+    statuses.insert(42, None);
+    let pending = invoice_table_row_from_reconcile_row(&row, Some(&statuses)).unwrap();
+    assert_eq!(pending_ksef_approve_ids(&[pending]), vec![42]);
+
+    for marked in [true, false] {
+        statuses.insert(42, Some(marked));
+        let marked_row = invoice_table_row_from_reconcile_row(&row, Some(&statuses)).unwrap();
+        assert!(pending_ksef_approve_ids(&[marked_row]).is_empty());
+    }
+}
+
+fn ksef_status_test_row(document_id: i64) -> TriRow {
+    let mut ksef = empty_record(SourceKind::Ksef);
+    ksef.invoice_number = Some("FV/9/2026".into());
+    ksef.ksef_reference = Some("KSEF-REF".into());
+    let mut saldeo = ksef.clone();
+    saldeo.source = SourceKind::Saldeo;
+    saldeo.content_hash = format!("saldeo:{document_id}");
+    TriRow {
+        status: "ksef_saldeo_missing_gmail".into(),
+        mail_score_to_ksef: None,
+        mail_score_to_saldeo: None,
+        ksef_score_to_saldeo: Some(80),
+        mail: None,
+        ksef: Some(ksef),
+        saldeo: Some(saldeo),
+    }
+}
+
+#[test]
+fn ksef_partial_live_statuses_never_enable_cached_or_unknown_actions() {
+    let snapshot = KsefAccountingStatuses::from_live(
+        HashMap::from([(1, None), (2, Some(true))]),
+        Ok(HashMap::from([(2, None), (3, Some(false))])),
+    );
+    for (id, expected_id, expected_status) in [
+        (1, None, None),
+        (2, Some(2), None),
+        (3, None, Some(false)),
+        (4, None, None),
+    ] {
+        let row = invoice_table_row_from_status_maps(
+            &ksef_status_test_row(id),
+            Some(&snapshot.display),
+            Some(&snapshot.fresh),
+        )
+        .unwrap();
+        assert_eq!(row.ksef_document_id, expected_id, "id={id}");
+        assert_eq!(row.ksef_accounting, expected_status, "id={id}");
+    }
+}
+
+#[test]
+fn ksef_failed_lookup_keeps_cache_display_but_disables_approval_and_rejection() {
+    let snapshot = KsefAccountingStatuses::from_live(
+        HashMap::from([(1, None), (2, Some(true)), (3, Some(false))]),
+        Err(anyhow!("simulated status lookup failure")),
+    );
+    assert!(snapshot.fresh.is_empty());
+    for id in 1..=4 {
+        let mut row = invoice_table_row_from_status_maps(
+            &ksef_status_test_row(id),
+            Some(&snapshot.display),
+            Some(&snapshot.fresh),
+        )
+        .unwrap();
+        assert_eq!(row.ksef_document_id, None);
+        assert_eq!(
+            row.ksef_accounting,
+            snapshot.display.get(&id).copied().flatten()
+        );
+        assert!(pending_ksef_approve_ids(&[row.clone()]).is_empty());
+        for action in [
+            InvoiceTableAction::ApproveKsef,
+            InvoiceTableAction::RejectKsef,
+        ] {
+            row.action = action;
+            let (_, approve, reject) = collect_invoice_table_actions(&[row.clone()]);
+            assert!(approve.is_empty() && reject.is_empty());
+        }
+    }
+}
+
+#[test]
+fn ksef_status_parser_requires_explicit_null_or_boolean() {
+    let statuses = parse_ksef_accounting_statuses(&serde_json::json!({
+        "status": "SUCCESS",
+        "data": [
+            {"documentId": 1, "accounting": null},
+            {"documentId": 2, "accounting": true},
+            {"documentId": 3, "accounting": false},
+            {"documentId": 4},
+            {"documentId": 5, "accounting": "false"}
+        ]
+    }))
+    .unwrap();
+    assert_eq!(
+        statuses,
+        HashMap::from([(1, None), (2, Some(true)), (3, Some(false))])
+    );
+    assert!(parse_ksef_accounting_statuses(&serde_json::json!({"status": "ERROR"})).is_err());
+}
+
+#[test]
+fn ksef_mutation_rechecks_and_marks_only_fresh_explicit_unmarked_ids() {
+    let mut written = Vec::new();
+    let marked = mark_unmarked_ksef_documents_with(
+        &[1, 2, 3, 4, 1],
+        |ids| {
+            assert_eq!(ids, [1, 2, 3, 4, 1]);
+            // IDs 2 and 3 were selected earlier but are now already marked.
+            Ok(HashMap::from([
+                (1, None),
+                (2, Some(true)),
+                (3, Some(false)),
+            ]))
+        },
+        |ids| {
+            written.extend_from_slice(ids);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(marked, vec![1]);
+    assert_eq!(written, marked);
+}
+
+#[test]
+fn ksef_mutation_lookup_failure_or_no_unmarked_ids_never_writes() {
+    let error = mark_unmarked_ksef_documents_with(
+        &[1, 2],
+        |_| Err(anyhow!("fresh lookup failed")),
+        |_| panic!("must not mutate after lookup failure"),
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "fresh lookup failed");
+    for statuses in [
+        HashMap::new(),
+        HashMap::from([(1, Some(true)), (2, Some(false))]),
+    ] {
+        let marked = mark_unmarked_ksef_documents_with(
+            &[1, 2],
+            |_| Ok(statuses),
+            |_| panic!("must not mutate unknown or marked documents"),
+        )
+        .unwrap();
+        assert!(marked.is_empty());
+    }
+}
+
+#[test]
+fn repair_llm_dry_run_reconciles_enrichment_without_persisting() {
+    for confirm in [false, true] {
+        let mut mail = empty_record(SourceKind::Mail);
+        mail.content_hash = "mail:repair-preview".into();
+        mail.invoice_number = Some("FV/1/2026".into());
+        mail.issue_date = NaiveDate::from_ymd_opt(2026, 1, 2);
+        mail.gross_amount_minor = Some(12300);
+        mail.currency = Some("PLN".into());
+        let mut saldeo = mail.clone();
+        saldeo.source = SourceKind::Saldeo;
+        saldeo.content_hash = "saldeo:repair-preview".into();
+        let mut candidates = vec![mail];
+        let mut persisted = false;
+        let enriched = enrich_repair_mail_with(
+            &mut candidates,
+            confirm,
+            |records| {
+                records[0].seller_name = Some("Enriched Seller".into());
+                Ok(())
+            },
+            |records| {
+                persisted = true;
+                assert_eq!(records[0].seller_name.as_deref(), Some("Enriched Seller"));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(enriched, 1);
+        assert_eq!(persisted, confirm);
+        let mail = filter_invoice_records_for_year(candidates, 2026);
+        let report = tri_reconcile(mail, Vec::new(), vec![saldeo], 70);
+        let repairs = repair_saldeo_items_from_report(&report);
+        assert_eq!(repairs.len(), 1, "confirm={confirm}");
+        assert_eq!(
+            repairs[0].override_row.seller_name.as_deref(),
+            Some("Enriched Seller")
+        );
+        assert!(
+            repairs[0]
+                .changed_fields
+                .iter()
+                .any(|field| field == "seller_name")
+        );
+    }
+}
+
+#[test]
+fn repair_llm_unchanged_candidates_do_not_persist() {
+    let mut candidates = vec![empty_record(SourceKind::Mail)];
+    let enriched = enrich_repair_mail_with(
+        &mut candidates,
+        true,
+        |_| Ok(()),
+        |_| panic!("unchanged candidates must not be persisted"),
+    )
+    .unwrap();
+    assert_eq!(enriched, 0);
+}
+
+#[test]
 fn tri_reconcile_dedupes_equivalent_saldeo_records() {
     let mut mail = empty_record(SourceKind::Mail);
     mail.content_hash = "mail:1".into();
@@ -424,10 +729,7 @@ fn display_shows_buyer_when_seller_is_own_company() {
         saldeo: None,
     };
     let table_row = invoice_table_row_from_reconcile_row(&row, None).unwrap();
-    assert_eq!(
-        counterparty_name(Some(&table_row.record)),
-        "Olga Borovska"
-    );
+    assert_eq!(counterparty_name(Some(&table_row.record)), "Olga Borovska");
 }
 
 #[test]
@@ -449,7 +751,10 @@ fn display_replaces_mail_heading_with_ksef_invoice_number() {
         saldeo: None,
     };
     let table_row = invoice_table_row_from_reconcile_row(&row, None).unwrap();
-    assert_eq!(table_row.record.invoice_number.as_deref(), Some("2026/01/1"));
+    assert_eq!(
+        table_row.record.invoice_number.as_deref(),
+        Some("2026/01/1")
+    );
 }
 
 #[test]
@@ -691,18 +996,44 @@ fn filter_hides_approved_invoices_in_ksef_and_saldeo() {
     let mut statuses = std::collections::HashMap::new();
     statuses.insert(123, Some(true));
     let approved = invoice_table_row_from_reconcile_row(&row, Some(&statuses)).unwrap();
-    assert_eq!(invoice_table_ksef_status(&approved), "zatw.");
+    assert_eq!(invoice_table_ksef_status(&approved), "zatwierdzone");
     assert!(approved.sources.contains('-'));
     assert!(!invoice_table_row_passes_filter(&approved, true));
     assert!(invoice_table_row_passes_filter(&approved, false));
 
     statuses.insert(123, None);
     let unmarked = invoice_table_row_from_reconcile_row(&row, Some(&statuses)).unwrap();
-    assert_eq!(invoice_table_ksef_status(&unmarked), "nieozn.");
+    assert_eq!(invoice_table_ksef_status(&unmarked), "nieoznaczone");
     assert!(invoice_table_row_passes_filter(&unmarked, true));
 
     statuses.insert(123, Some(false));
     let rejected = invoice_table_row_from_reconcile_row(&row, Some(&statuses)).unwrap();
-    assert_eq!(invoice_table_ksef_status(&rejected), "odrz.");
+    assert_eq!(invoice_table_ksef_status(&rejected), "odrzucone");
     assert!(invoice_table_row_passes_filter(&rejected, true));
+}
+
+#[test]
+fn approved_filter_ignores_rows_without_ksef_and_saldeo() {
+    assert_eq!(invoice_table_source_parts("-/K/S"), ["-", "K", "S"]);
+    assert_eq!(invoice_table_source_parts("G/K/S*"), ["G", "K", "S"]);
+    let mut mail = empty_record(SourceKind::Mail);
+    mail.invoice_number = Some("FV/9/2026".into());
+    mail.issue_date = NaiveDate::from_ymd_opt(2026, 3, 1);
+    let mut saldeo = empty_record(SourceKind::Saldeo);
+    saldeo.content_hash = "saldeo:9".into();
+    saldeo.ksef_reference = Some("KSEF-REF".into());
+    let row = TriRow {
+        status: "gmail_saldeo_missing_ksef".into(),
+        mail_score_to_ksef: None,
+        mail_score_to_saldeo: Some(80),
+        ksef_score_to_saldeo: None,
+        mail: Some(mail),
+        ksef: None,
+        saldeo: Some(saldeo),
+    };
+    let mut statuses = std::collections::HashMap::new();
+    statuses.insert(9, Some(true));
+    let missing_ksef = invoice_table_row_from_reconcile_row(&row, Some(&statuses)).unwrap();
+    assert_eq!(invoice_table_ksef_status(&missing_ksef), "—");
+    assert!(invoice_table_row_passes_filter(&missing_ksef, true));
 }

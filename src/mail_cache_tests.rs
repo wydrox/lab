@@ -305,6 +305,18 @@ fn absent_candidate_cache_leaves_records_unchanged() {
 }
 
 #[test]
+fn password_pdf_warning_does_not_retry() {
+    assert!(!mail_parse_needs_retry(&InvoiceRecord {
+        warnings: vec![PDF_PASSWORD_WARNING.into()],
+        ..empty_record(SourceKind::Mail)
+    }));
+    assert!(mail_warning_needs_retry(
+        "nie udało się wyciągnąć tekstu PDF: test"
+    ));
+    assert!(!mail_warning_needs_retry(PDF_PASSWORD_WARNING));
+}
+
+#[test]
 fn failed_new_parse_is_not_versioned_and_retries() {
     for incremental in [false, true] {
         let dir = TempDir::new();

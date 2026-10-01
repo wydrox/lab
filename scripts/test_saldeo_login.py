@@ -29,6 +29,13 @@ if (data.username !== "jan" || data.password !== "tajne-haslo") process.exit(2);
         self.assertNotIn("process.argv[", text)
         self.assertNotIn("SALDEO_PASSWORD", text)
 
+    def test_password_login_waits_for_spa_and_is_headed_by_default(self):
+        text = Path(__file__).with_name("saldeo-login.js").read_text()
+        self.assertIn("waitAndFillLogin", text)
+        self.assertIn("SALDEO_AUTH_HEADLESS === \"1\"", text)
+        self.assertNotIn("Boolean(login)", text)
+        self.assertIn("waitForLoadState", text)
+
 
 if __name__ == "__main__":
     unittest.main()

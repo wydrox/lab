@@ -72,8 +72,14 @@ fn select_text(
 }
 
 pub(crate) fn extract_document_text(path: &Path) -> Result<(String, Vec<String>)> {
+    let text = extract_pdf_text(path);
+    if let Err(err) = &text
+        && is_pdf_password_error(err)
+    {
+        return Err(anyhow!(PDF_PASSWORD_WARNING));
+    }
     let mode = ocr_mode(&lab_config_var("LAB_OCR_MODE").unwrap_or_else(|| "auto".into()))?;
-    select_text(mode, extract_pdf_text(path), || run_ocr(path))
+    select_text(mode, text, || run_ocr(path))
 }
 
 fn run_ocr(path: &Path) -> Result<String> {
@@ -237,6 +243,16 @@ mod tests {
         .unwrap();
         assert_eq!(text, partial);
         assert!(warnings[0].contains("zachowano tekst Poppler"));
+    }
+
+    #[test]
+    fn password_pdf_does_not_call_ocr() {
+        let err = anyhow!(PDF_PASSWORD_WARNING);
+        assert!(is_pdf_password_error(&err));
+        assert!(poppler_reports_password(
+            "Command Line Error: Incorrect password"
+        ));
+        assert!(!poppler_reports_password("Syntax Error: Unknown font"));
     }
 
     #[test]

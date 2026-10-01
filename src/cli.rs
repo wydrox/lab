@@ -122,6 +122,42 @@ pub(crate) enum Commands {
         /// Wykonaj upload do Saldeo. Bez tej flagi zwraca tylko plan.
         #[arg(long)]
         confirm: bool,
+        /// Po uploadzie zatwierdź w Saldeo wszystkie nieoznaczone dokumenty KSeF.
+        #[arg(long)]
+        approve: bool,
+    },
+    /// Uzupełnia lokalne dane Saldeo z KSeF/Gmail i zgłasza duplikaty.
+    Repair {
+        /// Rok rozliczeniowy.
+        #[arg(long, default_value_t = 2026)]
+        year: i32,
+        /// Minimalny score dopasowania.
+        #[arg(long, default_value_t = 70)]
+        review_score: u8,
+        /// Dodatkowo odczytaj brakujące PDF-y przez LLM/OpenRouter.
+        #[arg(long)]
+        llm: bool,
+        /// Zapisz poprawki Saldeo w SQLite. Bez tej flagi zwraca tylko plan.
+        #[arg(long)]
+        confirm: bool,
+        /// Plik JSON z wynikiem.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Zatwierdza w Saldeo nieoznaczone dokumenty KSeF.
+    Approve {
+        /// Rok rozliczeniowy.
+        #[arg(long, default_value_t = 2026)]
+        year: i32,
+        /// Minimalny score dopasowania przy budowie listy dokumentów.
+        #[arg(long, default_value_t = 70)]
+        review_score: u8,
+        /// Wykonaj zatwierdzenie w Saldeo. Bez tej flagi zwraca tylko plan.
+        #[arg(long)]
+        confirm: bool,
+        /// Plik JSON z wynikiem.
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
     /// Uruchamia prosty serwer MCP po stdio dla agentów.
     Mcp,

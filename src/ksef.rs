@@ -5,7 +5,7 @@ pub(crate) struct KsefOnlineConfig {
     base_url: String,
     context_type: String,
     context_value: String,
-    ksef_token: String,
+    ksef_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -129,7 +129,29 @@ pub(crate) fn ksef_online_sync_with_progress_and_cache(
     if let Some(progress) = &progress {
         set_progress(progress, "KSeF: pobieram token dostępu...");
     }
-    let access_token = ksef_access_token(&client, &config)?;
+    let access_token = match ksef_access_token(&client, &config) {
+        Ok(token) => token,
+        Err(err) if is_missing_ksef_token(&err) => {
+            if let Some(result) = ksef_cached_sync_result(year, out_dir, progress.clone(), None)? {
+                eprintln!(
+                    "  [KSeF] brak KSEF_TOKEN; używam lokalnego cache ({} rekordów)",
+                    result.summary.records_count
+                );
+                if let Some(progress) = &progress {
+                    set_progress(
+                        progress,
+                        format!(
+                            "KSeF: brak tokenu, lokalny cache ({} rekordów)",
+                            result.summary.records_count
+                        ),
+                    );
+                }
+                return Ok(result);
+            }
+            return Err(err);
+        }
+        Err(err) => return Err(err),
+    };
     let page_size = ksef_metadata_page_size();
     let mut metadata = Vec::new();
 
@@ -256,15 +278,22 @@ pub(crate) fn ksef_online_config() -> Result<KsefOnlineConfig> {
     } else {
         raw_context
     };
-    let ksef_token = secret_value(Secret::KsefToken)?.ok_or_else(|| {
-        anyhow!("brak KSEF_TOKEN; potrzebny token KSeF z uprawnieniem InvoiceRead")
-    })?;
+    let ksef_token = secret_value(Secret::KsefToken)?.filter(|value| !value.trim().is_empty());
     Ok(KsefOnlineConfig {
         base_url,
         context_type,
         context_value,
         ksef_token,
     })
+}
+
+pub(crate) fn missing_ksef_token_error() -> anyhow::Error {
+    anyhow!("brak KSEF_TOKEN; potrzebny token KSeF z uprawnieniem InvoiceRead")
+}
+
+pub(crate) fn is_missing_ksef_token(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.to_string().contains("brak KSEF_TOKEN"))
 }
 
 pub(crate) fn ksef_base_url() -> String {
@@ -317,13 +346,33 @@ pub(crate) fn ksef_fresh_cached_sync_result(
     out_dir: Option<&Path>,
     progress: Option<Arc<Mutex<String>>>,
 ) -> Result<Option<KsefSyncResult>> {
-    let Some(ttl) = ksef_cache_ttl() else {
+    ksef_fresh_cached_sync_result_with_ttl(year, out_dir, progress, ksef_cache_ttl())
+}
+
+fn ksef_fresh_cached_sync_result_with_ttl(
+    year: i32,
+    out_dir: Option<&Path>,
+    progress: Option<Arc<Mutex<String>>>,
+    ttl: Option<Duration>,
+) -> Result<Option<KsefSyncResult>> {
+    let Some(ttl) = ttl else {
         return Ok(None);
     };
+    ksef_cached_sync_result(year, out_dir, progress, Some(ttl))
+}
+
+pub(crate) fn ksef_cached_sync_result(
+    year: i32,
+    out_dir: Option<&Path>,
+    progress: Option<Arc<Mutex<String>>>,
+    ttl: Option<Duration>,
+) -> Result<Option<KsefSyncResult>> {
     let out_dir = ksef_sync_output_dir(year, out_dir);
     let jsonl_output = out_dir.join("records.jsonl");
     if !jsonl_output.is_file() {
-        if let Some(progress) = &progress {
+        if ttl.is_some()
+            && let Some(progress) = &progress
+        {
             set_progress(progress, "KSeF: brak lokalnego cache, odświeżam online...");
         }
         return Ok(None);
@@ -335,7 +384,9 @@ pub(crate) fn ksef_fresh_cached_sync_result(
     let Some(age) = age else {
         return Ok(None);
     };
-    if age > ttl {
+    if let Some(ttl) = ttl
+        && age > ttl
+    {
         if let Some(progress) = &progress {
             set_progress(
                 progress,
@@ -352,9 +403,14 @@ pub(crate) fn ksef_fresh_cached_sync_result(
         set_progress(
             progress,
             format!(
-                "KSeF: lokalny cache świeży ({}; {} rekordów), pomijam online",
+                "KSeF: lokalny cache ({}; {} rekordów){}",
                 format_duration_short(age),
-                records.len()
+                records.len(),
+                if ttl.is_some() {
+                    ", pomijam online"
+                } else {
+                    ", brak tokenu"
+                }
             ),
         );
     }
@@ -468,6 +524,11 @@ pub(crate) fn ksef_authenticate_with_ksef_token(
     client: &Client,
     config: &KsefOnlineConfig,
 ) -> Result<String> {
+    let ksef_token = config
+        .ksef_token
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(missing_ksef_token_error)?;
     let key = ksef_token_encryption_key(client, &config.base_url)?;
     let challenge_url = format!("{}/auth/challenge", config.base_url);
     let challenge: KsefChallengeResponse = ksef_send_with_retry(
@@ -479,7 +540,7 @@ pub(crate) fn ksef_authenticate_with_ksef_token(
     .json()
     .context("KSeF challenge response JSON")?;
 
-    let token_with_timestamp = format!("{}|{}", config.ksef_token, challenge.timestamp_ms);
+    let token_with_timestamp = format!("{ksef_token}|{}", challenge.timestamp_ms);
     let encrypted_token =
         ksef_encrypt_token_with_certificate(&key.certificate, &token_with_timestamp)?;
     let auth_url = format!("{}/auth/ksef-token", config.base_url);
@@ -916,4 +977,71 @@ pub(crate) fn ksef_sync(year: i32, input: &Path, out_dir: Option<&Path>) -> Resu
         },
         records,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::credentials::testing::{StoreMode, install};
+
+    #[test]
+    fn missing_ksef_token_is_detected() {
+        let err = missing_ksef_token_error();
+        assert!(is_missing_ksef_token(&err));
+        assert!(is_missing_ksef_token(
+            &anyhow!("KSeF HTTP client").context(missing_ksef_token_error())
+        ));
+        assert!(!is_missing_ksef_token(&anyhow!("inny błąd KSeF")));
+    }
+
+    #[test]
+    fn disabled_fresh_cache_preserves_explicit_tokenless_fallback() {
+        let root = std::env::temp_dir().join(format!(
+            "lab-ksef-cache-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let mut record = empty_record(SourceKind::Ksef);
+        record.content_hash = "ksef:cache-test".to_string();
+        fs::write(
+            root.join("records.jsonl"),
+            serde_json::to_string(&record).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            ksef_fresh_cached_sync_result_with_ttl(2026, Some(&root), None, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ksef_fresh_cached_sync_result_with_ttl(
+                2026,
+                Some(&root),
+                None,
+                Some(Duration::from_secs(3600)),
+            )
+            .unwrap()
+            .is_some()
+        );
+        let fallback = ksef_cached_sync_result(2026, Some(&root), None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fallback.records.len(), 1);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn online_config_does_not_require_ksef_token() {
+        let root = std::env::temp_dir().join(format!(
+            "lab-ksef-config-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let (_store, _guard) = install(root, &[], StoreMode::Available);
+        let config = ksef_online_config().unwrap();
+        assert!(config.ksef_token.is_none());
+        assert_eq!(config.context_value, DEFAULT_PRODUCTMESH_NIP);
+    }
 }

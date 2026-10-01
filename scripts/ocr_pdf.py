@@ -15,6 +15,11 @@ MAX_PDF_BYTES = 40_000_000
 POPPLER_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin")
 
 
+def poppler_reports_password(text):
+    text = (text or "").lower()
+    return "incorrect password" in text or "password required" in text or "needs a password" in text
+
+
 def poppler_bin(name):
     for directory in POPPLER_DIRS:
         path = Path(directory) / name
@@ -91,7 +96,12 @@ def main():
             return
     env = tool_env()
     info = subprocess.run([str(poppler_bin("pdfinfo")), str(pdf)], capture_output=True, text=True,
-                          timeout=30, check=True, env=env).stdout
+                          timeout=30, env=env)
+    err = f"{info.stderr or ''}{info.stdout or ''}"
+    if poppler_reports_password(err):
+        raise ValueError("PDF chroniony hasłem; pominięto")
+    info.check_returncode()
+    info = info.stdout
     count = next((int(line.split(":", 1)[1].strip()) for line in info.splitlines()
                   if line.startswith("Pages:")), 0)
     if count < 1 or count > args.max_pages:
