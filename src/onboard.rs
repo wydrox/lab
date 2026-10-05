@@ -201,12 +201,8 @@ pub(crate) fn collect_onboard_status(db_path: &Path) -> Result<OnboardStatus> {
     let saldeo_valid = saldeo_exists && saldeo_session_valid(&saldeo_state);
 
     let pdftotext_ok = local_tool("pdftotext").is_ok();
-    let python_ok = Command::new("python3")
-        .arg("-c")
-        .arg("import shutil, subprocess, sys; pp=shutil.which('ppmlx'); sys.exit(1 if not pp else 0)")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    // Tylko informacja o obecności ppmlx; żaden proces (np. Python z cwd) nie jest uruchamiany.
+    let python_ok = crate::hardening::tool_present_for_status("ppmlx");
     let openssl_ok = local_tool("openssl").is_ok();
 
     let db_exists = db_path.exists();
@@ -268,28 +264,33 @@ pub(crate) fn collect_onboard_status(db_path: &Path) -> Result<OnboardStatus> {
 /// Raport o sekretach: czy są ustawione i skąd pochodzą; bez wartości.
 pub(crate) fn secrets_status_json(status: &OnboardStatus) -> Value {
     serde_json::json!({
-        "gmail_token": secret_status_entry(status.gmail_token_source),
-        "saldeo_storage_state": secret_status_entry(status.saldeo_state_source),
-        "saldeo_username": secret_status_entry(secret_source(Secret::SaldeoUsername)),
-        "saldeo_password": secret_status_entry(secret_source(Secret::SaldeoPassword)),
-        "ksef_token": secret_status_entry(status.ksef_token_source),
-        "ksef_cert_password": secret_status_entry(status.ksef_password_source),
-        "ksef_access_token": secret_status_entry(status.ksef_access_source),
-        "openrouter_api_key": secret_status_entry(secret_source(Secret::OpenRouterApiKey)),
+        "gmail_token": secret_status_entry(&status.gmail_token_source),
+        "saldeo_storage_state": secret_status_entry(&status.saldeo_state_source),
+        "saldeo_username": secret_status_entry(&secret_source(Secret::SaldeoUsername)),
+        "saldeo_password": secret_status_entry(&secret_source(Secret::SaldeoPassword)),
+        "ksef_token": secret_status_entry(&status.ksef_token_source),
+        "ksef_cert_password": secret_status_entry(&status.ksef_password_source),
+        "ksef_access_token": secret_status_entry(&status.ksef_access_source),
+        "openrouter_api_key": secret_status_entry(&secret_source(Secret::OpenRouterApiKey)),
     })
 }
 
-fn secret_status_entry(source: SecretSource) -> Value {
-    serde_json::json!({ "set": source.is_set(), "source": source.as_str() })
+fn secret_status_entry(source: &SecretSource) -> Value {
+    let mut entry = serde_json::json!({ "set": source.is_set(), "source": source.as_str() });
+    if let Some(problem) = source.problem() {
+        entry["problem"] = Value::String(problem);
+    }
+    entry
 }
 
 /// Skąd LAB wziął sekret; do wydruku statusu, nigdy z wartością.
-pub(crate) fn secret_source_suffix(source: SecretSource) -> String {
+pub(crate) fn secret_source_suffix(source: &SecretSource) -> String {
     match source {
         SecretSource::Env => " (zmienna sesji)".to_string(),
         SecretSource::Keychain => " (Keychain)".to_string(),
         SecretSource::File => " (plik 600)".to_string(),
         SecretSource::Missing => String::new(),
+        SecretSource::Insecure(path) => format!(" (insecure permissions: {})", path.display()),
     }
 }
 
@@ -322,7 +323,7 @@ pub(crate) fn print_onboard_status(status: &OnboardStatus, db_path: &Path) {
     eprintln!(
         "  OpenRouter:      {}{}",
         display_secret_value(secret_is_set(Secret::OpenRouterApiKey)),
-        secret_source_suffix(secret_source(Secret::OpenRouterApiKey))
+        secret_source_suffix(&secret_source(Secret::OpenRouterApiKey))
     );
     eprintln!(
         "  openssl:         {}",
@@ -341,7 +342,7 @@ pub(crate) fn print_onboard_status(status: &OnboardStatus, db_path: &Path) {
         } else {
             "✗"
         },
-        secret_source_suffix(status.gmail_token_source)
+        secret_source_suffix(&status.gmail_token_source)
     );
     eprintln!(
         "  Saldeo:          {}{}",
@@ -352,15 +353,18 @@ pub(crate) fn print_onboard_status(status: &OnboardStatus, db_path: &Path) {
         } else {
             "✗"
         },
-        secret_source_suffix(status.saldeo_state_source)
+        secret_source_suffix(&status.saldeo_state_source)
     );
-    let saldeo_login =
-        secret_is_set(Secret::SaldeoUsername) && secret_is_set(Secret::SaldeoPassword);
+    let saldeo_username = secret_source(Secret::SaldeoUsername);
+    let saldeo_password = secret_source(Secret::SaldeoPassword);
+    let saldeo_login = saldeo_username.is_set() && saldeo_password.is_set();
     eprintln!(
         "  Saldeo login:    {}{}",
         if saldeo_login { "✓" } else { "✗" },
-        if saldeo_login {
-            secret_source_suffix(secret_source(Secret::SaldeoUsername))
+        if saldeo_login || saldeo_username.problem().is_some() {
+            secret_source_suffix(&saldeo_username)
+        } else if saldeo_password.problem().is_some() {
+            secret_source_suffix(&saldeo_password)
         } else {
             String::new()
         }
@@ -388,12 +392,12 @@ pub(crate) fn print_onboard_status(status: &OnboardStatus, db_path: &Path) {
         } else {
             "✗"
         },
-        secret_source_suffix(status.ksef_password_source)
+        secret_source_suffix(&status.ksef_password_source)
     );
     eprintln!(
         "  KSeF token:      {}{}",
         if status.ksef_token_ok { "✓" } else { "✗" },
-        secret_source_suffix(status.ksef_token_source)
+        secret_source_suffix(&status.ksef_token_source)
     );
     eprintln!(
         "  KSeF dane:       {}",
@@ -494,7 +498,8 @@ pub(crate) fn onboard_configure_gmail(
     }
 
     *gmail_client_secret = Some(secret.clone());
-    let mut vars = read_lab_env_file().unwrap_or_default();
+    // Nieczytelny plik env to błąd, nie pusta mapa: zapis nie może skasować innych kluczy.
+    let mut vars = read_lab_env_file()?;
     vars.insert(
         "GOOGLE_CLIENT_SECRET_PATH".to_string(),
         secret.display().to_string(),
@@ -528,16 +533,22 @@ pub(crate) fn onboard_configure_saldeo() -> Result<()> {
             .allow_empty(true)
             .interact_text()?;
         if !username.trim().is_empty() {
-            save_secret(Secret::SaldeoUsername, username.trim())?;
+            let saved = save_secret(Secret::SaldeoUsername, username.trim())?;
             let password = Password::new()
                 .with_prompt("SALDEO_PASSWORD")
                 .allow_empty_password(true)
                 .interact()?;
             if password.is_empty() {
-                eprintln!("⏭ Hasło puste; login zapisany, hasło bez zmian.\n");
+                eprintln!(
+                    "⏭ Hasło puste; SALDEO_USERNAME zapisany {}, hasło bez zmian.\n",
+                    saved.describe()
+                );
             } else {
-                save_secret(Secret::SaldeoPassword, &password)?;
-                eprintln!("✓ Zapisano SALDEO_USERNAME i SALDEO_PASSWORD w Keychain\n");
+                let saved = save_secret(Secret::SaldeoPassword, &password)?;
+                eprintln!(
+                    "✓ Zapisano SALDEO_USERNAME i SALDEO_PASSWORD {}\n",
+                    saved.describe()
+                );
             }
         }
     }
@@ -559,23 +570,21 @@ pub(crate) fn onboard_configure_saldeo() -> Result<()> {
         return Ok(());
     }
     if source != target {
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-        }
-        fs::copy(&source, &target)
+        // Kopia od razu jako plik 600 (bez okna z prawami umask).
+        let bytes = fs::read(&source).with_context(|| format!("odczyt {}", source.display()))?;
+        write_private_file(&target, &bytes)
             .with_context(|| format!("kopiowanie {} → {}", source.display(), target.display()))?;
     }
-    save_saldeo_storage_state_secret(&target)?;
-    eprintln!(
-        "✓ Saldeo storage state zapisany: {}\n✓ Saldeo storage state zapisany w macOS Keychain (jeśli dostępny)\n",
-        target.display()
-    );
+    match save_saldeo_storage_state_secret(&target)? {
+        Some(saved) => eprintln!("✓ Saldeo storage state zapisany {}\n", saved.describe()),
+        None => eprintln!("✗ Saldeo storage state jest pusty: {}\n", target.display()),
+    }
     Ok(())
 }
 
 pub(crate) fn onboard_edit_env_path(name: &str) -> Result<()> {
     if let Some(value) = prompt_env_path(name, lab_config_var(name))? {
-        let mut vars = read_lab_env_file().unwrap_or_default();
+        let mut vars = read_lab_env_file()?;
         vars.insert(name.to_string(), value);
         write_lab_env_file(&vars)?;
         eprintln!("✓ Zapisano {name} w {}\n", lab_env_file_path().display());
@@ -602,14 +611,8 @@ pub(crate) fn onboard_edit_env_secret(name: &str) -> Result<()> {
         eprintln!("⏭ Bez zmian.\n");
         return Ok(());
     }
-    match save_secret(secret, value.trim())? {
-        SecretSource::File if Secret::from_env_key(name).is_some() => eprintln!(
-            "✓ Zapisano {name} w {} (poza git)\n",
-            crate::lab_dotenv_path().display()
-        ),
-        SecretSource::File => eprintln!("✓ Zapisano {name} w pliku 0600\n"),
-        _ => eprintln!("✓ Zapisano {name} w macOS Keychain (lab-cli)\n"),
-    }
+    let saved = save_secret(secret, value.trim())?;
+    eprintln!("✓ Zapisano {name} {}\n", saved.describe());
     Ok(())
 }
 
@@ -700,7 +703,7 @@ impl Drop for SaldeoAuthTempFile {
 pub(crate) fn saldeo_auth_noninteractive() -> Result<()> {
     let target = preferred_saldeo_storage_state_path();
     if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+        crate::hardening::create_dir_for_private_files(parent)?;
     }
     let url =
         std::env::var("SALDEO_URL").unwrap_or_else(|_| "https://saldeo.brainshare.pl/".to_string());
@@ -848,11 +851,13 @@ fn ensure_playwright_node_path() -> Result<PathBuf> {
     if module.is_dir() {
         return Ok(node_modules);
     }
-    fs::create_dir_all(&prefix).with_context(|| format!("mkdir {}", prefix.display()))?;
+    crate::hardening::create_dir_for_private_files(&prefix)?;
     eprintln!(
         "  [Saldeo] instaluję Playwright w {} (bez przeglądarki Playwright)...",
         prefix.display()
     );
+    // stdout bywa strumieniem JSON-RPC serwera MCP: wyjście npm idzie na stderr,
+    // a npm nie czyta stdin.
     let status = Command::new("npm")
         .arg("install")
         .arg("--prefix")
@@ -861,6 +866,9 @@ fn ensure_playwright_node_path() -> Result<PathBuf> {
         .arg("--no-audit")
         .arg("playwright")
         .env("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(std::io::stderr()))
+        .stderr(Stdio::inherit())
         .status()
         .context("npm install playwright")?;
     if !status.success() {
@@ -940,7 +948,7 @@ pub(crate) fn onboard_configure_ksef_data(current_year: i32) -> Result<()> {
         fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
         eprintln!("✓ Utworzono: {}", dir.display());
     }
-    let mut vars = read_lab_env_file().unwrap_or_default();
+    let mut vars = read_lab_env_file()?;
     vars.insert("KSEF_DATA_DIR".to_string(), dir.display().to_string());
     write_lab_env_file(&vars)?;
     eprintln!(
@@ -963,7 +971,18 @@ pub(crate) fn lab_config_var(name: &str) -> Option<String> {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .or_else(|| crate::dotenv_secret(name))
-        .or_else(|| read_lab_env_file().ok()?.remove(name))
+        .or_else(|| lab_env_file_value(name))
+}
+
+/// Zwykły odczyt z `~/.config/lab/env`; problem z plikiem = brak wartości i komunikat na stderr.
+fn lab_env_file_value(name: &str) -> Option<String> {
+    match read_lab_env_file() {
+        Ok(mut vars) => vars.remove(name),
+        Err(err) => {
+            crate::warn_unreadable_secret_file(&lab_env_file_path(), &err);
+            None
+        }
+    }
 }
 
 pub(crate) fn preferred_saldeo_storage_state_path() -> PathBuf {
@@ -988,34 +1007,16 @@ pub(crate) fn lab_env_file_path() -> PathBuf {
         .join("env")
 }
 
+/// Brak pliku = pusta mapa. Prawa szersze niż 600, błąd odczytu albo tekst spoza UTF-8
+/// to błąd ze ścieżką; wywołujący odczyt-modyfikację-zapis nie może wtedy nic zapisać.
 pub(crate) fn read_lab_env_file() -> Result<HashMap<String, String>> {
-    let path = lab_env_file_path();
-    if !path.exists() {
-        return Ok(HashMap::new());
-    }
-    let text = fs::read_to_string(&path).with_context(|| format!("odczyt {}", path.display()))?;
-    let mut vars = HashMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let line = line.strip_prefix("export ").unwrap_or(line);
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        vars.insert(key.trim().to_string(), unquote_env_value(value.trim()));
-    }
-    Ok(vars)
+    crate::read_private_env_file(&lab_env_file_path(), "plik env LAB")
 }
 
 pub(crate) fn write_lab_env_file(vars: &HashMap<String, String>) -> Result<()> {
     let mut vars = vars.clone();
     strip_secret_env_keys(&mut vars)?;
     let path = lab_env_file_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-    }
     let mut keys = vars.keys().cloned().collect::<Vec<_>>();
     keys.sort();
     let mut out = String::from(
@@ -1043,18 +1044,20 @@ pub(crate) fn unquote_env_value(value: &str) -> String {
     }
 }
 
-pub(crate) fn save_saldeo_storage_state_secret(storage_state: &Path) -> Result<()> {
+/// `None`, gdy pliku nie ma albo jest pusty; inaczej miejsce zapisu.
+pub(crate) fn save_saldeo_storage_state_secret(
+    storage_state: &Path,
+) -> Result<Option<SavedSecret>> {
     if !storage_state.is_file() {
-        return Ok(());
+        return Ok(None);
     }
     // Playwright zapisuje plik z prawami umask; zacieśniamy je przed odczytem.
     crate::hardening::chmod_private(storage_state)?;
     let text = read_secret_file(storage_state, "sesja Saldeo")?;
     if text.trim().is_empty() {
-        return Ok(());
+        return Ok(None);
     }
-    save_secret(Secret::SaldeoStorageState, &text)?;
-    Ok(())
+    save_secret(Secret::SaldeoStorageState, &text).map(Some)
 }
 
 pub(crate) fn read_saldeo_storage_state(storage_state: &Path) -> Result<String> {
@@ -1118,6 +1121,22 @@ pub(crate) fn saldeo_session_valid(storage_state: &Path) -> bool {
     {
         Ok(resp) => resp.status().is_success(),
         Err(_) => false,
+    }
+}
+
+/// Notatka `doctor` o tym, gdzie faktycznie leżą sekrety; bez wartości.
+pub(crate) fn secrets_storage_note() -> String {
+    let dotenv = crate::lab_dotenv_path();
+    if keychain_enabled() {
+        format!(
+            "Sekrety tekstowe LAB zapisuje w {} (plik 600) i kopiuje do macOS Keychain (usługa lab-cli, LAB_USE_KEYCHAIN=1); wartości z Keychain nie są kopiowane do tego pliku. Kolejność odczytu: zmienna sesji → ten plik → plik 600 → Keychain. Plik ~/.config/lab/env nie przechowuje sekretów.",
+            dotenv.display()
+        )
+    } else {
+        format!(
+            "Sekrety tekstowe są w {} (plik 600); Keychain jest wyłączony (LAB_USE_KEYCHAIN=1 go włącza). Zmienna sesji ma pierwszeństwo; plik ~/.config/lab/env nie przechowuje sekretów.",
+            dotenv.display()
+        )
     }
 }
 
@@ -1214,7 +1233,7 @@ pub(crate) fn doctor(db_path: &Path, token_env: &str) -> Result<()> {
             "PDF-y są parsowane przez pdftotext, potem PyMuPDF/pdfplumber/pypdf jako fallback.",
             "lab reconcile bez własnych --ksef/--saldeo pobiera online metadane KSeF i Saldeo przed porównaniem.",
             "KSeF online używa KSEF_TOKEN, KSEF_CONTEXT_NIP/KSEF_NIP i KSEF_BASE_URL/KSEF_ENV; metadane są cache'owane lokalnie w KSEF_DATA_DIR albo data/ksef-<rok>.",
-            "Sekrety trzyma macOS Keychain (usługa lab-cli); zmienna środowiskowa sesji ma pierwszeństwo, plik ~/.config/lab/env już ich nie przechowuje.",
+            secrets_storage_note(),
             "Jeśli OPENROUTER_API_KEY jest ustawiony, LAB odczytuje brakujące PDF-y przez google/gemini-3.8-flash ze structured output. Lokalny Gemma zostaje jako zapas."
         ],
         "next_steps": onboard_next_steps(&status, gmail_usable)

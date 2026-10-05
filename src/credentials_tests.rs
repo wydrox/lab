@@ -2,28 +2,43 @@ use super::*;
 use credentials::testing::{StoreMode, TestStore, TestStoreGuard, install};
 use std::rc::Rc;
 
+/// Unikalny katalog na test: pid + licznik procesu (zegar macOS ma rozdzielczość µs,
+/// więc równoległe testy dostawały tę samą nazwę).
 fn temp_root(name: &str) -> PathBuf {
-    let nonce = format!(
-        "{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let root = std::env::temp_dir().join(format!("lab-credentials-{name}-{nonce}"));
+    static NEXT_ROOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let id = NEXT_ROOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "lab-credentials-{name}-{}-{id}",
+        std::process::id()
+    ));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();
     root
+}
+
+/// Odpina testowy magazyn i usuwa katalog testu.
+struct SetupGuard {
+    root: PathBuf,
+    _store: TestStoreGuard,
+}
+
+impl Drop for SetupGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
 }
 
 fn setup(
     name: &str,
     env: &[(&str, &str)],
     mode: StoreMode,
-) -> (PathBuf, Rc<TestStore>, TestStoreGuard) {
+) -> (PathBuf, Rc<TestStore>, SetupGuard) {
     let root = temp_root(name);
     let (store, guard) = install(root.clone(), env, mode);
+    let guard = SetupGuard {
+        root: root.clone(),
+        _store: guard,
+    };
     (root, store, guard)
 }
 
@@ -172,6 +187,11 @@ fn set_mode(path: &Path, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
 
+/// Plik sekretów z prawami 600, jak po zapisie przez LAB.
+fn write_secret_text(path: PathBuf, text: &str) -> Result<()> {
+    write_private_file(&path, text.as_bytes())
+}
+
 #[test]
 fn process_env_wins_and_is_not_written_back() {
     let (root, store, _guard) = setup(
@@ -202,7 +222,7 @@ fn process_env_wins_and_is_not_written_back() {
 #[test]
 fn dotenv_wins_over_keychain() {
     let (root, store, _guard) = setup("dotenv-wins", &[], StoreMode::Available);
-    fs::write(root.join(".env"), "KSEF_TOKEN='z-dotenv'\n").unwrap();
+    write_secret_text(root.join(".env"), "KSEF_TOKEN='z-dotenv'\n").unwrap();
     store.set(ACCOUNT_KSEF_TOKEN, "z-keychaina").unwrap();
 
     assert_eq!(
@@ -219,7 +239,7 @@ fn dotenv_wins_over_keychain() {
 #[test]
 fn env_file_secret_moves_to_dotenv_and_other_keys_stay() {
     let (root, store, _guard) = setup("migracja", &[], StoreMode::Available);
-    fs::write(
+    write_secret_text(
         root.join("env"),
         "# LAB\nKSEF_TOKEN='token-ksef'\nKSEF_CERT_PASSWORD='haslo'\nGOOGLE_CLIENT_SECRET_PATH='/tmp/client.json'\nKSEF_BASE_URL='https://api-test.ksef.mf.gov.pl/v2'\nLAB_OCR_MODE='off'\n",
     )
@@ -252,7 +272,7 @@ fn env_file_secret_moves_to_dotenv_and_other_keys_stay() {
 #[test]
 fn env_file_secret_stays_when_store_is_unavailable() {
     let (root, _store, _guard) = setup("bez-keychaina", &[], StoreMode::Unavailable);
-    fs::write(
+    write_secret_text(
         root.join("env"),
         "KSEF_TOKEN='token-ksef'\nKSEF_BASE_URL='https://api.ksef.mf.gov.pl/v2'\n",
     )
@@ -297,6 +317,12 @@ fn world_readable_secret_file_is_rejected() {
     assert!(err.contains("644"));
     assert!(!err.contains("tajne-abc"));
 
+    // doctor / onboard --check: "insecure", nie "missing".
+    let source = secret_source(Secret::GmailToken);
+    assert_eq!(source, SecretSource::Insecure(path.clone()));
+    assert_eq!(source.as_str(), "insecure");
+    assert!(!source.is_set());
+
     set_mode(&path, 0o600);
     assert!(secret_value(Secret::GmailToken).unwrap().is_some());
 }
@@ -304,7 +330,7 @@ fn world_readable_secret_file_is_rejected() {
 #[test]
 fn saving_secret_does_not_touch_env_file() {
     let (root, store, _guard) = setup("zapis", &[], StoreMode::Available);
-    fs::write(
+    write_secret_text(
         root.join("env"),
         "KSEF_BASE_URL='https://api.ksef.mf.gov.pl/v2'\n",
     )
@@ -312,7 +338,10 @@ fn saving_secret_does_not_touch_env_file() {
 
     assert_eq!(
         save_secret(Secret::KsefToken, "nowy-token").unwrap(),
-        SecretSource::File
+        SavedSecret {
+            file: Some(root.join(".env")),
+            keychain: false
+        }
     );
     assert_eq!(store.stored(ACCOUNT_KSEF_TOKEN), None);
     assert!(dotenv_text(&root).contains("KSEF_TOKEN"));
@@ -352,7 +381,10 @@ fn secret_without_file_goes_to_dotenv() {
     let (root, _store, _guard) = setup("brak-keychaina", &[], StoreMode::Failing);
     assert_eq!(
         save_secret(Secret::KsefToken, "token-ksef").unwrap(),
-        SecretSource::File
+        SavedSecret {
+            file: Some(root.join(".env")),
+            keychain: false
+        }
     );
     assert!(dotenv_text(&root).contains("KSEF_TOKEN"));
     assert!(!root.join("env").exists());
@@ -361,10 +393,13 @@ fn secret_without_file_goes_to_dotenv() {
 
 #[test]
 fn secret_with_file_falls_back_to_private_file() {
-    let (_root, _store, _guard) = setup("plik-zapas", &[], StoreMode::Unavailable);
+    let (root, _store, _guard) = setup("plik-zapas", &[], StoreMode::Unavailable);
     assert_eq!(
         save_secret(Secret::SaldeoStorageState, "{\"cookies\":[]}").unwrap(),
-        SecretSource::File
+        SavedSecret {
+            file: Some(root.join("saldeo-storage-state.json")),
+            keychain: false
+        }
     );
     let path = Secret::SaldeoStorageState.file_path().unwrap();
     assert!(path.is_file());
@@ -515,4 +550,347 @@ fn saldeo_auth_timeout_gives_js_time_to_finish() {
         Some(value) => unsafe { std::env::set_var("SALDEO_AUTH_TIMEOUT_MS", value) },
         None => unsafe { std::env::remove_var("SALDEO_AUTH_TIMEOUT_MS") },
     }
+}
+
+/// Jeden bajt ISO-8859-2 (`ł` = 0xB3) w ręcznie edytowanym haśle.
+const NON_UTF8_DOTENV: &[u8] = b"KSEF_TOKEN='stary-token'\nSALDEO_PASSWORD='has\xb3o'\n";
+
+fn leftover_temps(dir: &Path) -> Vec<String> {
+    fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".lab-tmp-"))
+        .collect()
+}
+
+#[test]
+fn non_utf8_dotenv_blocks_upsert_and_stays_byte_identical() {
+    let (root, _store, _guard) = setup("dotenv-latin2", &[], StoreMode::Unavailable);
+    let dotenv = root.join(".env");
+    write_private_file(&dotenv, NON_UTF8_DOTENV).unwrap();
+
+    let err = save_secret(Secret::OpenRouterApiKey, "nowy-klucz").unwrap_err();
+    let text = format!("{err}");
+    assert!(text.contains(&dotenv.display().to_string()), "{text}");
+    assert!(!format!("{err:#}").contains("nowy-klucz"));
+    assert_eq!(fs::read(&dotenv).unwrap(), NON_UTF8_DOTENV);
+    assert!(leftover_temps(&root).is_empty());
+
+    // Zwykły odczyt: brak wartości (z komunikatem na stderr), bez błędu i bez zapisu.
+    assert_eq!(secret_value(Secret::KsefToken).unwrap(), None);
+    assert_eq!(secret_source(Secret::KsefToken), SecretSource::Missing);
+    assert_eq!(dotenv_secret("KSEF_TOKEN"), None);
+    assert_eq!(fs::read(&dotenv).unwrap(), NON_UTF8_DOTENV);
+}
+
+#[test]
+fn env_file_secret_is_not_migrated_into_unreadable_dotenv() {
+    let (root, _store, _guard) = setup("dotenv-migracja", &[], StoreMode::Unavailable);
+    let dotenv = root.join(".env");
+    write_private_file(&dotenv, NON_UTF8_DOTENV).unwrap();
+    let env_text =
+        "KSEF_CERT_PASSWORD='haslo-cert'\nKSEF_BASE_URL='https://api.ksef.mf.gov.pl/v2'\n";
+    write_secret_text(root.join("env"), env_text).unwrap();
+
+    assert_eq!(
+        secret_value(Secret::KsefCertPassword).unwrap().as_deref(),
+        Some("haslo-cert")
+    );
+    // Migracja do `.env` się nie udała, więc sekret zostaje w pliku env, a `.env` jest nietknięty.
+    assert_eq!(fs::read(&dotenv).unwrap(), NON_UTF8_DOTENV);
+    assert_eq!(env_file_text(&root), env_text);
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_dotenv_blocks_upsert_and_stays_byte_identical() {
+    let (root, _store, _guard) = setup("dotenv-000", &[], StoreMode::Unavailable);
+    let dotenv = root.join(".env");
+    write_secret_text(dotenv.clone(), "KSEF_TOKEN='stary-token'\n").unwrap();
+    set_mode(&dotenv, 0o000);
+    if fs::read(&dotenv).is_ok() {
+        // root ignoruje prawa; test nie ma tu sensu.
+        set_mode(&dotenv, 0o600);
+        return;
+    }
+
+    let err = save_secret(Secret::KsefToken, "nowy-token").unwrap_err();
+    assert!(format!("{err}").contains(&dotenv.display().to_string()));
+    assert_eq!(secret_value(Secret::KsefToken).unwrap(), None);
+
+    set_mode(&dotenv, 0o600);
+    assert_eq!(
+        fs::read_to_string(&dotenv).unwrap(),
+        "KSEF_TOKEN='stary-token'\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn world_readable_dotenv_is_rejected_and_reported_insecure() {
+    let (root, store, _guard) = setup("dotenv-644", &[], StoreMode::Available);
+    let dotenv = root.join(".env");
+    write_secret_text(dotenv.clone(), "KSEF_TOKEN='tajne-z-dotenv'\n").unwrap();
+    set_mode(&dotenv, 0o644);
+    store.set(ACCOUNT_KSEF_TOKEN, "z-keychaina").unwrap();
+
+    let err = secret_value(Secret::KsefToken).unwrap_err().to_string();
+    assert!(err.contains(&dotenv.display().to_string()), "{err}");
+    assert!(err.contains("644"));
+    assert!(!err.contains("tajne-z-dotenv"));
+
+    let source = secret_source(Secret::KsefToken);
+    assert_eq!(source, SecretSource::Insecure(dotenv.clone()));
+    assert_ne!(source.as_str(), "missing");
+    assert_eq!(
+        source.problem().unwrap(),
+        format!("insecure permissions: {}", dotenv.display())
+    );
+    let suffix = secret_source_suffix(&source);
+    assert!(suffix.contains("insecure permissions"));
+    assert!(suffix.contains(&dotenv.display().to_string()));
+    assert!(!suffix.contains("tajne"));
+
+    // Zapis też odmawia; plik zostaje bez zmian (z szerokimi prawami, do naprawy przez użytkownika).
+    let before = fs::read(&dotenv).unwrap();
+    assert!(save_secret(Secret::KsefToken, "nowy").is_err());
+    assert_eq!(fs::read(&dotenv).unwrap(), before);
+    // Zwykły odczyt konfiguracji nie używa odrzuconego pliku.
+    assert_eq!(dotenv_secret("KSEF_TOKEN"), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn dotenv_symlink_is_checked_on_its_target_and_survives_save() {
+    let (root, _store, _guard) = setup("dotenv-link", &[], StoreMode::Unavailable);
+    let store_dir = root.join("config-lab");
+    fs::create_dir_all(&store_dir).unwrap();
+    let target = store_dir.join(".env");
+    write_secret_text(target.clone(), "KSEF_TOKEN='z-celu'\n").unwrap();
+    let link = root.join(".env");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    assert_eq!(
+        secret_value(Secret::KsefToken).unwrap().as_deref(),
+        Some("z-celu")
+    );
+    save_secret(Secret::OpenRouterApiKey, "klucz-dummy").unwrap();
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let text = fs::read_to_string(&target).unwrap();
+    assert!(text.contains("KSEF_TOKEN='z-celu'"));
+    assert!(text.contains("OPENROUTER_API_KEY='klucz-dummy'"));
+
+    set_mode(&target, 0o644);
+    assert_eq!(
+        secret_source(Secret::KsefToken),
+        SecretSource::Insecure(link.clone())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn lab_env_file_problems_are_errors_for_read_modify_write() {
+    let (root, _store, _guard) = setup("env-644", &[], StoreMode::Unavailable);
+    let env_path = root.join("env");
+    write_secret_text(
+        env_path.clone(),
+        "KSEF_BASE_URL='https://api.ksef.mf.gov.pl/v2'\n",
+    )
+    .unwrap();
+    set_mode(&env_path, 0o644);
+    let err = read_lab_env_file().unwrap_err().to_string();
+    assert!(err.contains(&env_path.display().to_string()), "{err}");
+    assert_eq!(lab_config_var("KSEF_BASE_URL"), None);
+
+    write_private_file(&env_path, b"KSEF_DATA_DIR='/tmp/dane-\xb3'\n").unwrap();
+    let err = format!("{:#}", read_lab_env_file().unwrap_err());
+    assert!(err.contains(&env_path.display().to_string()), "{err}");
+    assert_eq!(
+        fs::read(&env_path).unwrap(),
+        b"KSEF_DATA_DIR='/tmp/dane-\xb3'\n"
+    );
+}
+
+#[test]
+fn keychain_hit_is_not_copied_into_dotenv() {
+    let (root, store, _guard) = setup(
+        "keychain-bez-dotenv",
+        &[("LAB_USE_KEYCHAIN", "1")],
+        StoreMode::Available,
+    );
+    store.set(ACCOUNT_KSEF_TOKEN, "z-keychaina").unwrap();
+    store
+        .set(ACCOUNT_SALDEO_PASSWORD, "haslo-z-keychaina")
+        .unwrap();
+
+    prepare_secret_store();
+    assert!(!root.join(".env").exists());
+
+    assert_eq!(
+        secret_value(Secret::KsefToken).unwrap().as_deref(),
+        Some("z-keychaina")
+    );
+    assert_eq!(secret_source(Secret::KsefToken), SecretSource::Keychain);
+    assert_eq!(
+        secret_value(Secret::SaldeoPassword).unwrap().as_deref(),
+        Some("haslo-z-keychaina")
+    );
+    assert!(!root.join(".env").exists());
+
+    // Istniejący `.env` też nie dostaje kopii z Keychain.
+    write_secret_text(root.join(".env"), "OPENROUTER_API_KEY='klucz'\n").unwrap();
+    let before = fs::read(root.join(".env")).unwrap();
+    prepare_secret_store();
+    assert_eq!(secret_source(Secret::KsefToken), SecretSource::Keychain);
+    assert_eq!(fs::read(root.join(".env")).unwrap(), before);
+}
+
+#[test]
+fn keychain_save_reports_where_secret_went() {
+    let (root, store, _guard) = setup(
+        "keychain-zapis",
+        &[("LAB_USE_KEYCHAIN", "1")],
+        StoreMode::Available,
+    );
+    let saved = save_secret(Secret::KsefToken, "token-dummy").unwrap();
+    assert_eq!(
+        saved,
+        SavedSecret {
+            file: Some(root.join(".env")),
+            keychain: true
+        }
+    );
+    assert_eq!(
+        store.stored(ACCOUNT_KSEF_TOKEN).as_deref(),
+        Some("token-dummy")
+    );
+    let text = saved.describe();
+    assert!(text.contains(&root.join(".env").display().to_string()));
+    assert!(text.contains("Keychain"));
+    assert!(!text.contains("token-dummy"));
+}
+
+#[test]
+fn keychain_failure_is_not_reported_as_keychain_save() {
+    let (root, _store, _guard) = setup(
+        "keychain-blad",
+        &[("LAB_USE_KEYCHAIN", "1")],
+        StoreMode::Failing,
+    );
+    let saved = save_secret(Secret::KsefToken, "token-dummy").unwrap();
+    assert_eq!(saved.file, Some(root.join(".env")));
+    assert!(!saved.keychain);
+    assert!(!saved.describe().contains("Keychain"));
+}
+
+#[test]
+fn dotenv_git_command_is_absolute_and_hardened() {
+    let git = Path::new("/usr/bin/git");
+    let cwd = Path::new("/tmp");
+    let command = dotenv_git_command(git, cwd, &["ls-files", "--", ".env"]);
+    assert_eq!(command.get_program(), git.as_os_str());
+    assert_eq!(command.get_current_dir(), Some(cwd));
+    let args = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let subcommand = args.iter().position(|arg| arg == "ls-files").unwrap();
+    let before = &args[..subcommand];
+    for pair in [
+        ["-c", "core.fsmonitor=false"],
+        ["-c", "core.hooksPath=/dev/null"],
+    ] {
+        assert!(
+            before.windows(2).any(|window| window == pair),
+            "{pair:?} przed podpoleceniem: {args:?}"
+        );
+    }
+    assert_eq!(&args[subcommand..], ["ls-files", "--", ".env"]);
+
+    let envs = command
+        .get_envs()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.map(|v| v.to_string_lossy().into_owned()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    assert_eq!(envs.get("PATH"), Some(&Some("/usr/bin:/bin".to_string())));
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_EXEC_PATH",
+    ] {
+        assert!(!matches!(envs.get(key), Some(Some(_))), "{key}");
+    }
+
+    let check = dotenv_git_command(
+        git,
+        cwd,
+        &["check-ignore", "--quiet", "--no-index", "--", ".env"],
+    );
+    let check_args = check
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(check_args.starts_with(&DOTENV_GIT_HARDENING.map(String::from)));
+
+    let source = include_str!("credentials.rs");
+    assert!(!source.contains(&format!("Command::new({:?})", "git")));
+    assert!(source.contains("system_tool(\"git\")"));
+}
+
+#[test]
+fn trusted_git_is_absolute_system_binary() {
+    if let Some(git) = crate::hardening::system_tool("git") {
+        assert!(git.is_absolute());
+        assert!(
+            ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+                .iter()
+                .any(|dir| git.parent() == Some(Path::new(dir))),
+            "{}",
+            git.display()
+        );
+    }
+}
+
+#[test]
+fn doctor_ppmlx_check_does_not_spawn_python() {
+    let source = include_str!("onboard.rs");
+    assert!(!source.contains(&format!("Command::new({:?})", "python3")));
+    assert!(!source.contains(&format!("shutil.{}", "which")));
+    assert!(source.contains("tool_present_for_status(\"ppmlx\")"));
+}
+
+#[test]
+fn npm_install_output_goes_to_stderr() {
+    let source = include_str!("onboard.rs");
+    let npm = source.find("Command::new(\"npm\")").unwrap();
+    let status = npm + source[npm..].find(".status()").unwrap();
+    let block = &source[npm..status];
+    assert!(block.contains(".stdout(Stdio::from(std::io::stderr()))"));
+    assert!(block.contains(".stdin(Stdio::null())"));
+}
+
+#[test]
+fn temp_roots_are_unique_and_removed() {
+    let (first, second);
+    {
+        let (root_a, _store, _guard) = setup("unikalny", &[], StoreMode::Unavailable);
+        let root_b = temp_root("unikalny");
+        assert_ne!(root_a, root_b);
+        first = root_a;
+        second = root_b;
+        let _ = fs::remove_dir_all(&second);
+    }
+    assert!(!first.exists());
+    assert!(!second.exists());
 }

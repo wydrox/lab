@@ -32,41 +32,95 @@ pub(crate) enum Secret {
 }
 
 /// Skąd pochodzi sekret; bez wartości, do raportów `doctor` i `onboard`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SecretSource {
     Env,
     Keychain,
     File,
     Missing,
+    /// Plik z sekretem ma prawa szersze niż 600; LAB go nie użył.
+    Insecure(PathBuf),
 }
 
 impl SecretSource {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             SecretSource::Env => "env",
             SecretSource::Keychain => "keychain",
             SecretSource::File => "file",
             SecretSource::Missing => "missing",
+            SecretSource::Insecure(_) => "insecure",
         }
     }
 
-    pub(crate) fn is_set(self) -> bool {
-        self != SecretSource::Missing
+    pub(crate) fn is_set(&self) -> bool {
+        matches!(
+            self,
+            SecretSource::Env | SecretSource::Keychain | SecretSource::File
+        )
+    }
+
+    /// Opis problemu do raportu; nigdy nie zawiera wartości sekretu.
+    pub(crate) fn problem(&self) -> Option<String> {
+        match self {
+            SecretSource::Insecure(path) => {
+                Some(format!("insecure permissions: {}", path.display()))
+            }
+            _ => None,
+        }
     }
 }
 
-impl Secret {
-    pub(crate) const ALL: [Secret; 8] = [
-        Secret::GmailToken,
-        Secret::SaldeoStorageState,
-        Secret::KsefToken,
-        Secret::KsefCertPassword,
-        Secret::KsefAccessToken,
-        Secret::SaldeoUsername,
-        Secret::SaldeoPassword,
-        Secret::OpenRouterApiKey,
-    ];
+/// Gdzie `save_secret` faktycznie zapisał sekret.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SavedSecret {
+    pub(crate) file: Option<PathBuf>,
+    pub(crate) keychain: bool,
+}
 
+impl SavedSecret {
+    pub(crate) fn describe(&self) -> String {
+        match (&self.file, self.keychain) {
+            (Some(path), true) => format!(
+                "w {} (plik 600) i w macOS Keychain (lab-cli)",
+                path.display()
+            ),
+            (Some(path), false) => format!("w {} (plik 600)", path.display()),
+            (None, true) => "w macOS Keychain (lab-cli)".to_string(),
+            (None, false) => "nigdzie".to_string(),
+        }
+    }
+}
+
+/// Plik sekretu czytelny dla innych; komunikat podaje ścieżkę, nigdy wartość.
+#[derive(Debug)]
+pub(crate) struct InsecureSecretFile {
+    pub(crate) path: PathBuf,
+    what: String,
+    mode: u32,
+}
+
+impl std::fmt::Display for InsecureSecretFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: plik {} ma prawa {:o}; wymagane 600 (chmod 600 {})",
+            self.what,
+            self.path.display(),
+            self.mode,
+            self.path.display()
+        )
+    }
+}
+
+impl std::error::Error for InsecureSecretFile {}
+
+fn insecure_secret_file(err: &anyhow::Error) -> Option<&InsecureSecretFile> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<InsecureSecretFile>())
+}
+
+impl Secret {
     pub(crate) fn account(self) -> &'static str {
         match self {
             Secret::GmailToken => ACCOUNT_GMAIL_TOKEN,
@@ -167,35 +221,44 @@ pub(crate) fn secret_value(secret: Secret) -> Result<Option<String>> {
     Ok(resolve_secret(secret)?.0)
 }
 
+/// Źródło sekretu do raportu. Plik z za szerokimi prawami daje `Insecure`, nie `Missing`.
 pub(crate) fn secret_source(secret: Secret) -> SecretSource {
-    resolve_secret(secret)
-        .map(|(_, source)| source)
-        .unwrap_or(SecretSource::Missing)
+    match resolve_secret(secret) {
+        Ok((_, source)) => source,
+        Err(err) => {
+            if let Some(insecure) = insecure_secret_file(&err) {
+                return SecretSource::Insecure(insecure.path.clone());
+            }
+            warn_once(
+                format!("secret:{}", secret.account()),
+                &format!("pomijam {}: {err:#}", secret.label()),
+            );
+            SecretSource::Missing
+        }
+    }
 }
 
 pub(crate) fn secret_is_set(secret: Secret) -> bool {
     secret_source(secret).is_set()
 }
 
+/// Start procesu. Przy `LAB_USE_KEYCHAIN=1` odtwarza z Keychain brakujące pliki 600
+/// (token Gmail, sesja Saldeo, cache KSeF). Sekretów tekstowych nie kopiuje do `.env`.
 pub(crate) fn prepare_secret_store() {
     if !keychain_enabled() {
         return;
     }
-    let _ = export_keychain_secrets_to_dotenv();
     let _ = export_file_backed_secrets();
 }
 
 fn resolve_secret(secret: Secret) -> Result<(Option<String>, SecretSource)> {
-    if let Some(key) = secret.env_key()
-        && let Some(value) = process_env(key)
-    {
-        return Ok((Some(value), SecretSource::Env));
-    }
-
-    if let Some(key) = secret.env_key()
-        && let Some(value) = dotenv_secret(key)
-    {
-        return Ok((Some(value), SecretSource::File));
+    if let Some(key) = secret.env_key() {
+        if let Some(value) = process_env(key) {
+            return Ok((Some(value), SecretSource::Env));
+        }
+        if let Some(value) = dotenv_lookup(key)? {
+            return Ok((Some(value), SecretSource::File));
+        }
     }
 
     if let Some(path) = secret.file_path().filter(|path| path.is_file()) {
@@ -206,56 +269,62 @@ fn resolve_secret(secret: Secret) -> Result<(Option<String>, SecretSource)> {
     }
 
     if let Some(key) = secret.env_key()
-        && let Some(value) = env_file_secret(key)
+        && let Some(value) = env_file_lookup(key)?
     {
-        let _ = migrate_env_file_secret(secret, key, &value);
+        let _ = migrate_env_file_secret(key, &value);
         return Ok((Some(value), SecretSource::File));
     }
 
+    // Trafienie w Keychain nie jest kopiowane do `.env`.
     if keychain_enabled()
         && let Some(value) = store_get(secret)
     {
-        if let Some(key) = secret.env_key() {
-            let _ = upsert_dotenv_secret(key, &value);
-        }
         return Ok((Some(value), SecretSource::Keychain));
     }
 
     Ok((None, SecretSource::Missing))
 }
 
-/// Zapis sekretu: `.env` albo plik 0600. Keychain tylko przy `LAB_USE_KEYCHAIN=1`.
-pub(crate) fn save_secret(secret: Secret, value: &str) -> Result<SecretSource> {
+/// Zapis sekretu: `.env` albo plik 0600; przy `LAB_USE_KEYCHAIN=1` także kopia w Keychain.
+/// Wynik mówi, gdzie sekret faktycznie trafił.
+pub(crate) fn save_secret(secret: Secret, value: &str) -> Result<SavedSecret> {
     if value.trim().is_empty() {
         return Err(anyhow!("{} jest puste; nie zapisuję", secret.label()));
     }
 
-    if let Some(key) = secret.env_key() {
+    let file = if let Some(key) = secret.env_key() {
         upsert_dotenv_secret(key, value)?;
-        if keychain_enabled() {
-            let _ = store_set(secret, value);
-        }
-        return Ok(SecretSource::File);
-    }
-
-    if let Some(path) = secret.file_path() {
+        Some(lab_dotenv_path())
+    } else if let Some(path) = secret.file_path() {
         write_private_file(&path, value.as_bytes())?;
-        if keychain_enabled() {
-            let _ = store_set(secret, value);
-        }
-        return Ok(SecretSource::File);
+        Some(path)
+    } else {
+        None
+    };
+    let keychain = keychain_enabled() && store_set(secret, value).unwrap_or(false);
+    if file.is_none() && !keychain {
+        return Err(anyhow!(
+            "nie mogę zapisać {}; użyj .env albo pliku 0600",
+            secret.label()
+        ));
     }
-
-    if keychain_enabled() && store_set(secret, value).unwrap_or(false) {
-        return Ok(SecretSource::Keychain);
-    }
-    Err(anyhow!(
-        "nie mogę zapisać {}; użyj .env albo pliku 0600",
-        secret.label()
-    ))
+    Ok(SavedSecret { file, keychain })
 }
 
-/// Usuwa sekrety z mapy pliku env i przenosi je do Keychain.
+pub(crate) fn keychain_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(ctx) = testing::current() {
+        return ctx
+            .env
+            .get("LAB_USE_KEYCHAIN")
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    }
+    std::env::var("LAB_USE_KEYCHAIN")
+        .ok()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+/// Usuwa sekrety z mapy pliku env i zapisuje je przez `save_secret` (`.env`).
 pub(crate) fn strip_secret_env_keys(vars: &mut HashMap<String, String>) -> Result<()> {
     for key in SECRET_ENV_KEYS {
         let Some(value) = vars.remove(key) else {
@@ -278,6 +347,7 @@ pub(crate) fn read_secret_file(path: &Path, what: &str) -> Result<String> {
     fs::read_to_string(path).with_context(|| format!("odczyt {what} {}", path.display()))
 }
 
+/// Dla dowiązania symbolicznego sprawdza prawa jego celu.
 fn ensure_private_mode(path: &Path, what: &str) -> Result<()> {
     #[cfg(unix)]
     {
@@ -288,18 +358,78 @@ fn ensure_private_mode(path: &Path, what: &str) -> Result<()> {
             .mode()
             & 0o777;
         if mode & 0o077 != 0 {
-            return Err(anyhow!(
-                "{what}: plik {} ma prawa {mode:o}; wymagane 600 (chmod 600 {})",
-                path.display(),
-                path.display()
-            ));
+            return Err(anyhow::Error::new(InsecureSecretFile {
+                path: path.to_path_buf(),
+                what: what.to_string(),
+                mode,
+            }));
         }
     }
     let _ = (path, what);
     Ok(())
 }
 
-fn migrate_env_file_secret(_secret: Secret, key: &str, value: &str) -> Result<bool> {
+/// Odczyt pliku `KLUCZ=wartość` z sekretami (`.env`, `~/.config/lab/env`).
+/// Brak pliku to pusta mapa; prawa szersze niż 600, błąd odczytu albo tekst spoza UTF-8
+/// to błąd podający ścieżkę, nigdy pusta mapa.
+pub(crate) fn read_private_env_file(path: &Path, what: &str) -> Result<HashMap<String, String>> {
+    match fs::metadata(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("odczyt {what} {}", path.display()));
+        }
+        Ok(meta) if !meta.is_file() => {
+            return Err(anyhow!(
+                "{what}: {} nie jest zwykłym plikiem",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+    }
+    let text = read_secret_file(path, what)?;
+    Ok(parse_env_text(&text))
+}
+
+/// Komunikat na stderr najwyżej raz na proces dla danego klucza; bez wartości sekretów.
+pub(crate) fn warn_once(key: String, message: &str) {
+    static WARNED: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    let warned = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+    let first = warned.lock().map(|mut set| set.insert(key)).unwrap_or(true);
+    if first {
+        eprintln!("  [LAB] {message}");
+    }
+}
+
+/// Zwykły odczyt bez zapisu: problem z plikiem = brak wartości plus jednorazowy komunikat.
+pub(crate) fn warn_unreadable_secret_file(path: &Path, err: &anyhow::Error) {
+    warn_once(
+        format!("file:{}", path.display()),
+        &format!("pomijam {}: {err:#}", path.display()),
+    );
+}
+
+/// Odczyt klucza z pliku env do rozwiązywania sekretu. Za szerokie prawa to błąd
+/// (plik sekretu jest odrzucany); nieczytelny plik traktujemy jak brak wartości.
+fn lookup_private_env_file(path: &Path, what: &str, key: &str) -> Result<Option<String>> {
+    match read_private_env_file(path, what) {
+        Ok(mut vars) => Ok(vars.remove(key).filter(|value| !value.trim().is_empty())),
+        Err(err) if insecure_secret_file(&err).is_some() => Err(err),
+        Err(err) => {
+            warn_unreadable_secret_file(path, &err);
+            Ok(None)
+        }
+    }
+}
+
+fn dotenv_lookup(key: &str) -> Result<Option<String>> {
+    lookup_private_env_file(&lab_dotenv_path(), "plik .env", key)
+}
+
+fn env_file_lookup(key: &str) -> Result<Option<String>> {
+    lookup_private_env_file(&lab_env_file_path(), "plik env LAB", key)
+}
+
+fn migrate_env_file_secret(key: &str, value: &str) -> Result<bool> {
     upsert_dotenv_secret(key, value)?;
     let mut vars = read_lab_env_file()?;
     if vars.remove(key).is_some() {
@@ -308,30 +438,23 @@ fn migrate_env_file_secret(_secret: Secret, key: &str, value: &str) -> Result<bo
     Ok(true)
 }
 
-fn keychain_enabled() -> bool {
-    #[cfg(test)]
-    if let Some(ctx) = testing::current() {
-        return ctx
-            .env
-            .get("LAB_USE_KEYCHAIN")
-            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
-    }
-    std::env::var("LAB_USE_KEYCHAIN")
-        .ok()
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-}
-
+/// Ścieżka `.env`, liczona raz na proces (wybór lokalnego `.env` pyta Git).
 pub(crate) fn lab_dotenv_path() -> PathBuf {
     #[cfg(test)]
     if let Some(ctx) = testing::current() {
         return ctx.root.join(".env");
     }
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let override_path = std::env::var_os("LAB_DOTENV").map(PathBuf::from);
-    select_lab_dotenv_path(&cwd, &home, override_path.as_deref())
+    static DOTENV_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DOTENV_PATH
+        .get_or_init(|| {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let override_path = std::env::var_os("LAB_DOTENV").map(PathBuf::from);
+            select_lab_dotenv_path(&cwd, &home, override_path.as_deref())
+        })
+        .clone()
 }
 
 pub(crate) fn select_lab_dotenv_path(
@@ -383,32 +506,65 @@ fn cwd_is_lab_package(cwd: &Path) -> bool {
     name_matches == Some(true)
 }
 
+/// Konfiguracja Git z linii poleceń; wygrywa z `.git/config` repozytorium, więc dwa
+/// polecenia tylko do odczytu nie uruchomią programów wskazanych przez repozytorium.
+pub(crate) const DOTENV_GIT_HARDENING: [&str; 10] = [
+    "--no-pager",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.pager=cat",
+    "-c",
+    "core.untrackedCache=false",
+    "--no-optional-locks",
+];
+
 fn cwd_dotenv_is_untracked_and_ignored(cwd: &Path) -> bool {
-    let git_command = || {
-        let mut command = Command::new("git");
-        command
-            .current_dir(cwd)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .env_remove("GIT_COMMON_DIR")
-            .stdin(Stdio::null())
-            .stderr(Stdio::null());
-        command
+    // Tylko bezwzględna ścieżka z katalogów systemowych; bez Git zostaje ~/.config/lab/.env.
+    let Some(git) = crate::hardening::system_tool("git") else {
+        return false;
     };
-    let Ok(tracked) = git_command().args(["ls-files", "--", ".env"]).output() else {
+    let Ok(tracked) = dotenv_git_command(&git, cwd, &["ls-files", "--", ".env"]).output() else {
         return false;
     };
     if !tracked.status.success() || !tracked.stdout.is_empty() {
         return false;
     }
-    git_command()
-        .args(["check-ignore", "--quiet", "--no-index", "--", ".env"])
-        .status()
-        .is_ok_and(|status| status.success())
+    dotenv_git_command(
+        &git,
+        cwd,
+        &["check-ignore", "--quiet", "--no-index", "--", ".env"],
+    )
+    .stdout(Stdio::null())
+    .status()
+    .is_ok_and(|status| status.success())
 }
 
-fn parse_env_text(text: &str) -> HashMap<String, String> {
+/// Polecenie Git do wyboru `.env`: czyste środowisko, flagi z `DOTENV_GIT_HARDENING`.
+pub(crate) fn dotenv_git_command(git: &Path, cwd: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(git);
+    command.current_dir(cwd).env_clear();
+    // HOME i XDG_CONFIG_HOME zostają: globalny gitignore użytkownika nadal się liczy.
+    for key in ["HOME", "XDG_CONFIG_HOME", "TMPDIR"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    command
+        .env("PATH", "/usr/bin:/bin")
+        .env("LC_ALL", "C")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(DOTENV_GIT_HARDENING)
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+pub(crate) fn parse_env_text(text: &str) -> HashMap<String, String> {
     let mut vars = HashMap::new();
     for line in text.lines() {
         let line = line.trim();
@@ -424,34 +580,36 @@ fn parse_env_text(text: &str) -> HashMap<String, String> {
     vars
 }
 
-fn read_dotenv() -> HashMap<String, String> {
-    let path = lab_dotenv_path();
-    if !path.is_file() {
-        return HashMap::new();
-    }
-    fs::read_to_string(&path)
-        .ok()
-        .map(|text| parse_env_text(&text))
-        .unwrap_or_default()
+fn read_dotenv() -> Result<HashMap<String, String>> {
+    read_private_env_file(&lab_dotenv_path(), "plik .env")
 }
 
+/// Zwykły odczyt klucza z `.env`; problem z plikiem = brak wartości i komunikat na stderr.
 pub(crate) fn dotenv_secret(key: &str) -> Option<String> {
-    read_dotenv()
-        .remove(key)
-        .filter(|value| !value.trim().is_empty())
+    let path = lab_dotenv_path();
+    match read_private_env_file(&path, "plik .env") {
+        Ok(mut vars) => vars.remove(key).filter(|value| !value.trim().is_empty()),
+        Err(err) => {
+            warn_unreadable_secret_file(&path, &err);
+            None
+        }
+    }
 }
 
+/// Odczyt-modyfikacja-zapis: gdy `.env` istnieje, ale nie da się go odczytać, nic nie zapisuje.
 fn upsert_dotenv_secret(key: &str, value: &str) -> Result<()> {
-    let mut vars = read_dotenv();
+    let mut vars = read_dotenv().with_context(|| {
+        format!(
+            "nie zapisuję {key}: nie mogę odczytać obecnego pliku {}",
+            lab_dotenv_path().display()
+        )
+    })?;
     vars.insert(key.to_string(), value.to_string());
     write_dotenv(&vars)
 }
 
 fn write_dotenv(vars: &HashMap<String, String>) -> Result<()> {
     let path = lab_dotenv_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-    }
     let mut keys = vars.keys().cloned().collect::<Vec<_>>();
     keys.sort();
     let mut out = String::from("# LAB secrets. Do not commit. chmod 600.\n");
@@ -461,37 +619,6 @@ fn write_dotenv(vars: &HashMap<String, String>) -> Result<()> {
         }
     }
     write_private_file(&path, out.as_bytes())
-}
-
-fn export_keychain_secrets_to_dotenv() -> Result<usize> {
-    if lab_dotenv_path().is_file() {
-        return Ok(0);
-    }
-    let mut vars = read_dotenv();
-    let mut added = 0usize;
-    for secret in Secret::ALL {
-        let Some(key) = secret.env_key() else {
-            continue;
-        };
-        if vars.get(key).is_some_and(|value| !value.trim().is_empty()) {
-            continue;
-        }
-        let Some(value) = store_get(secret) else {
-            continue;
-        };
-        vars.insert(key.to_string(), value);
-        added += 1;
-    }
-    if added > 0 || (!vars.is_empty() && !lab_dotenv_path().is_file()) {
-        write_dotenv(&vars)?;
-    }
-    if added > 0 {
-        eprintln!(
-            "  [LAB] zapisano {added} sekretów do {} (poza git)",
-            lab_dotenv_path().display()
-        );
-    }
-    Ok(added)
 }
 
 fn export_file_backed_secrets() -> Result<usize> {
@@ -514,13 +641,6 @@ fn export_file_backed_secrets() -> Result<usize> {
         added += 1;
     }
     Ok(added)
-}
-
-fn env_file_secret(key: &str) -> Option<String> {
-    read_lab_env_file()
-        .ok()?
-        .remove(key)
-        .filter(|value| !value.trim().is_empty())
 }
 
 fn process_env(key: &str) -> Option<String> {

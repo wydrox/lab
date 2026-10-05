@@ -330,6 +330,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "tworzy i usuwa wpis w prawdziwym login Keychain; uruchom: cargo test -- --ignored roundtrip_uses_security_framework"]
     fn roundtrip_uses_security_framework() {
         let account = format!("lab-test-{}", std::process::id());
         macos::delete(KEYCHAIN_SERVICE, &account).unwrap();
