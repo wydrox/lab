@@ -2,6 +2,9 @@ use crate::*;
 use dialoguer::{Confirm, Input};
 use std::collections::{HashMap, HashSet};
 
+#[cfg(test)]
+mod upload_tests;
+
 pub(crate) struct SaldeoSyncPlanConfig<'a> {
     pub(crate) year: i32,
     pub(crate) tri_report: Option<&'a Path>,
@@ -15,6 +18,13 @@ pub(crate) struct SaldeoSyncPlanConfig<'a> {
 }
 
 pub(crate) fn saldeo_sync_plan(config: SaldeoSyncPlanConfig<'_>) -> Result<SaldeoSyncPlan> {
+    saldeo_sync_plan_at(config, Utc::now().date_naive())
+}
+
+pub(crate) fn saldeo_sync_plan_at(
+    config: SaldeoSyncPlanConfig<'_>,
+    today: NaiveDate,
+) -> Result<SaldeoSyncPlan> {
     let report = if let Some(path) = config.tri_report {
         read_tri_report(path)?
     } else {
@@ -37,6 +47,12 @@ pub(crate) fn saldeo_sync_plan(config: SaldeoSyncPlanConfig<'_>) -> Result<Salde
             config.review_score,
         )
     };
+    let saldeo_record_count = report
+        .rows
+        .iter()
+        .filter(|row| row.saldeo.is_some())
+        .count();
+    let ledger = config.db_path.map(open_db).transpose()?;
     let mut seen = HashSet::new();
     let mut items = Vec::new();
     for row in &report.rows {
@@ -58,13 +74,19 @@ pub(crate) fn saldeo_sync_plan(config: SaldeoSyncPlanConfig<'_>) -> Result<Salde
         if !seen.insert(key) {
             continue;
         }
-        items.push(saldeo_sync_item_from_record(
-            &row.status,
-            record,
-            related_sources,
-        ));
+        let mut item = saldeo_sync_item_from_record(&row.status, record, related_sources);
+        saldeo_apply_plan_guards(&mut item, config.year, today, ledger.as_ref())?;
+        items.push(item);
     }
     let summary = saldeo_sync_summary(&items);
+    let mut warnings = Vec::new();
+    if let Err(err) = saldeo_empty_saldeo_guard(
+        Some(saldeo_record_count),
+        summary.uploadable_count,
+        saldeo_allow_empty_from_env(),
+    ) {
+        warnings.push(err.to_string());
+    }
     Ok(SaldeoSyncPlan {
         generated_at: Utc::now(),
         year: config.year,
@@ -75,6 +97,9 @@ pub(crate) fn saldeo_sync_plan(config: SaldeoSyncPlanConfig<'_>) -> Result<Salde
         summary,
         items,
         ksef_approve: None,
+        warnings,
+        saldeo_record_count: Some(saldeo_record_count),
+        ledger_db_path: config.db_path.map(Path::to_path_buf),
     })
 }
 
@@ -111,24 +136,312 @@ pub(crate) fn saldeo_sync_item_from_record(
         saldeo_response_status: None,
         saldeo_response_body: None,
         error: None,
+        file_sha256: None,
+        saldeo_year: None,
+        saldeo_month: None,
+        saldeo_doc_upload_id: None,
+        skip_reason: None,
     }
 }
 
+/// Pozycja wysłana w tym przebiegu bez sukcesu: błąd uploadu albo brak potwierdzenia.
+/// `unconfirmed` z rejestru (poprzedni przebieg) ma `can_upload == false` i nie jest liczone.
+pub(crate) fn saldeo_sync_item_failed(item: &SaldeoSyncItem) -> bool {
+    item.upload_status == "failed" || (item.upload_status == "unconfirmed" && item.can_upload)
+}
+
 pub(crate) fn saldeo_sync_summary(items: &[SaldeoSyncItem]) -> SaldeoSyncSummary {
+    let count = |status: &str| items.iter().filter(|i| i.upload_status == status).count();
     SaldeoSyncSummary {
         total_missing_saldeo: items.len(),
         uploadable_count: items.iter().filter(|i| i.can_upload).count(),
-        missing_file_count: items.iter().filter(|i| !i.can_upload).count(),
-        uploaded_count: items
-            .iter()
-            .filter(|i| i.upload_status == "uploaded")
-            .count(),
-        failed_count: items.iter().filter(|i| i.upload_status == "failed").count(),
+        missing_file_count: count("missing_local_file"),
+        already_uploaded_count: count("already_uploaded"),
+        unconfirmed_count: count("unconfirmed"),
+        other_year_count: count("other_year"),
+        uploaded_count: count("uploaded"),
+        failed_count: items.iter().filter(|i| saldeo_sync_item_failed(i)).count(),
     }
 }
 
 pub(crate) const DEFAULT_SALDEO_UPLOAD_URL: &str =
     "https://saldeo.brainshare.pl/rest/client/document/generate-urls-for-upload";
+
+pub(crate) const SALDEO_LEDGER_UPLOADED: &str = "uploaded";
+pub(crate) const SALDEO_LEDGER_UNCONFIRMED: &str = "unconfirmed";
+
+/// Rejestr plików wysłanych do Saldeo. Klucz: sha256 bajtów pliku.
+pub(crate) fn ensure_saldeo_upload_ledger_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS saldeo_upload_ledger (
+            file_sha256 TEXT PRIMARY KEY,
+            source_path TEXT,
+            invoice_number TEXT,
+            saldeo_year INTEGER NOT NULL,
+            saldeo_month INTEGER NOT NULL,
+            doc_upload_id INTEGER,
+            response_status INTEGER,
+            state TEXT NOT NULL CHECK (state IN ('uploaded', 'unconfirmed')),
+            error TEXT,
+            uploaded_at TEXT NOT NULL
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SaldeoUploadLedgerEntry {
+    pub file_sha256: String,
+    pub source_path: Option<String>,
+    pub invoice_number: Option<String>,
+    pub saldeo_year: i32,
+    pub saldeo_month: u32,
+    pub doc_upload_id: Option<i64>,
+    pub response_status: Option<u16>,
+    pub state: String,
+    pub error: Option<String>,
+    pub uploaded_at: DateTime<Utc>,
+}
+
+pub(crate) fn saldeo_file_sha256(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+pub(crate) fn saldeo_upload_ledger_get(
+    conn: &Connection,
+    file_sha256: &str,
+) -> Result<Option<SaldeoUploadLedgerEntry>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT file_sha256, source_path, invoice_number, saldeo_year, saldeo_month,
+               doc_upload_id, response_status, state, error, uploaded_at
+        FROM saldeo_upload_ledger WHERE file_sha256 = ?1
+        "#,
+    )?;
+    let mut rows = stmt.query(params![file_sha256])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let uploaded_at: String = row.get(9)?;
+    Ok(Some(SaldeoUploadLedgerEntry {
+        file_sha256: row.get(0)?,
+        source_path: row.get(1)?,
+        invoice_number: row.get(2)?,
+        saldeo_year: row.get(3)?,
+        saldeo_month: row.get(4)?,
+        doc_upload_id: row.get(5)?,
+        response_status: row.get(6)?,
+        state: row.get(7)?,
+        error: row.get(8)?,
+        uploaded_at: DateTime::parse_from_rfc3339(&uploaded_at)
+            .with_context(|| format!("niepoprawna data w saldeo_upload_ledger: {uploaded_at}"))?
+            .with_timezone(&Utc),
+    }))
+}
+
+pub(crate) fn saldeo_upload_ledger_put(
+    conn: &Connection,
+    entry: &SaldeoUploadLedgerEntry,
+) -> Result<()> {
+    conn.execute(
+        r#"
+        INSERT OR REPLACE INTO saldeo_upload_ledger (
+            file_sha256, source_path, invoice_number, saldeo_year, saldeo_month,
+            doc_upload_id, response_status, state, error, uploaded_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "#,
+        params![
+            entry.file_sha256,
+            entry.source_path,
+            entry.invoice_number,
+            entry.saldeo_year,
+            entry.saldeo_month,
+            entry.doc_upload_id,
+            entry.response_status,
+            entry.state,
+            entry.error,
+            entry.uploaded_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Okres Saldeo dla pliku w planie roku `plan_year`. Plik z datą wystawienia spoza roku
+/// planu nie jest wysyłany (folder Gmail roku Y zawiera też faktury z grudnia Y-1).
+/// Plik bez daty idzie do bieżącego okresu i tylko w planie bieżącego roku.
+pub(crate) fn saldeo_upload_target_period(
+    issue_date: Option<NaiveDate>,
+    plan_year: i32,
+    today: NaiveDate,
+) -> std::result::Result<(i32, u32), String> {
+    match issue_date {
+        Some(date) if date.year() == plan_year => Ok((date.year(), date.month())),
+        Some(date) => Err(format!(
+            "data wystawienia {date} jest poza rokiem planu {plan_year}; wyślij z planu roku {}",
+            date.year()
+        )),
+        None if plan_year == today.year() => Ok((today.year(), today.month())),
+        None => Err(format!(
+            "brak daty wystawienia; plik bez daty trafia do bieżącego okresu i jest wysyłany tylko w planie roku {}",
+            today.year()
+        )),
+    }
+}
+
+fn saldeo_apply_period_rule(
+    item: &mut SaldeoSyncItem,
+    plan_year: i32,
+    today: NaiveDate,
+) -> Option<(i32, u32)> {
+    match saldeo_upload_target_period(item.issue_date, plan_year, today) {
+        Ok((year, month)) => {
+            item.saldeo_year = Some(year);
+            item.saldeo_month = Some(month);
+            Some((year, month))
+        }
+        Err(reason) => {
+            item.can_upload = false;
+            item.upload_status = "other_year".to_string();
+            item.skip_reason = Some(reason);
+            None
+        }
+    }
+}
+
+fn saldeo_mark_ledger_hit(item: &mut SaldeoSyncItem, entry: &SaldeoUploadLedgerEntry) {
+    item.can_upload = false;
+    item.saldeo_year = Some(entry.saldeo_year);
+    item.saldeo_month = Some(entry.saldeo_month);
+    item.saldeo_doc_upload_id = entry.doc_upload_id;
+    let when = entry.uploaded_at.format("%Y-%m-%d %H:%M UTC");
+    let period = format!("{}-{:02}", entry.saldeo_year, entry.saldeo_month);
+    if entry.state == SALDEO_LEDGER_UNCONFIRMED {
+        item.upload_status = "unconfirmed".to_string();
+        item.skip_reason = Some(format!(
+            "plik wysłany {when} do okresu {period} bez potwierdzenia Saldeo; sprawdź ręcznie — LAB nie ponawia takiego uploadu"
+        ));
+    } else {
+        item.upload_status = "already_uploaded".to_string();
+        item.skip_reason = Some(format!(
+            "ten sam plik (sha256) wysłano do Saldeo {when} do okresu {period}"
+        ));
+    }
+}
+
+fn saldeo_apply_plan_guards(
+    item: &mut SaldeoSyncItem,
+    plan_year: i32,
+    today: NaiveDate,
+    ledger: Option<&Connection>,
+) -> Result<()> {
+    if !item.can_upload {
+        return Ok(());
+    }
+    let Some(source_path) = item.source_path.clone() else {
+        return Ok(());
+    };
+    let bytes = match fs::read(&source_path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            item.can_upload = false;
+            item.upload_status = "missing_local_file".to_string();
+            item.error = Some(format!("odczyt {source_path}: {err}"));
+            return Ok(());
+        }
+    };
+    let file_sha256 = saldeo_file_sha256(&bytes);
+    item.file_sha256 = Some(file_sha256.clone());
+    if let Some(conn) = ledger
+        && let Some(entry) = saldeo_upload_ledger_get(conn, &file_sha256)?
+    {
+        saldeo_mark_ledger_hit(item, &entry);
+        return Ok(());
+    }
+    saldeo_apply_period_rule(item, plan_year, today);
+    Ok(())
+}
+
+/// Pusty zbiór Saldeo przy pozycjach do wysłania zwykle oznacza nieudany odczyt Saldeo,
+/// a nie pustą księgowość — wtedy upload wysłałby wszystko jeszcze raz.
+pub(crate) fn saldeo_empty_saldeo_guard(
+    saldeo_record_count: Option<usize>,
+    uploadable_count: usize,
+    allow_empty: bool,
+) -> Result<()> {
+    if saldeo_record_count == Some(0) && uploadable_count > 0 && !allow_empty {
+        return Err(anyhow!(
+            "brak rekordów Saldeo dla roku przy {uploadable_count} plikach do wysłania — LAB nie odróżni pustego Saldeo od nieudanego odczytu; odśwież Saldeo albo ustaw LAB_ALLOW_EMPTY_SALDEO=1"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn saldeo_allow_empty_from_env() -> bool {
+    std::env::var("LAB_ALLOW_EMPTY_SALDEO").as_deref() == Ok("1")
+}
+
+/// Wyłączny lock zapisu do Saldeo (flock na pliku w ~/.config/lab). Zwalniany przy drop.
+pub(crate) struct SaldeoWriteLock {
+    file: fs::File,
+}
+
+impl Drop for SaldeoWriteLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+pub(crate) fn default_saldeo_write_lock_path() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".config").join("lab").join("saldeo-write.lock")
+}
+
+pub(crate) fn saldeo_write_lock() -> Result<SaldeoWriteLock> {
+    saldeo_write_lock_at(&default_saldeo_write_lock_path())
+}
+
+pub(crate) fn saldeo_write_lock_at(path: &Path) -> Result<SaldeoWriteLock> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("otwarcie locka Saldeo {}", path.display()))?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            let holder = fs::read_to_string(path)
+                .ok()
+                .map(|pid| pid.trim().to_string())
+                .filter(|pid| !pid.is_empty())
+                .map(|pid| format!(" (PID {pid})"))
+                .unwrap_or_default();
+            return Err(anyhow!(
+                "inny proces LAB{holder} zapisuje teraz do Saldeo (TUI, CLI, MCP albo zadanie launchd); lock {} jest zajęty — spróbuj po jego zakończeniu",
+                path.display()
+            ));
+        }
+        return Err(err).with_context(|| format!("flock {}", path.display()));
+    }
+    let _ = file.set_len(0);
+    let _ = writeln!(file, "{}", std::process::id());
+    Ok(SaldeoWriteLock { file })
+}
 
 pub(crate) fn saldeo_upload_plan(
     plan: &mut SaldeoSyncPlan,
@@ -146,21 +459,87 @@ pub(crate) fn saldeo_upload_plan_with_progress(
     _file_field: &str,
     progress: Option<Arc<Mutex<String>>>,
 ) -> Result<()> {
+    let _lock = saldeo_write_lock()?;
+    let db_path = plan.ledger_db_path.clone().ok_or_else(|| {
+        anyhow!(
+            "upload Saldeo wymaga bazy LAB z rejestrem wysłanych plików; plan nie wskazuje bazy"
+        )
+    })?;
+    let uploadable_count = plan.items.iter().filter(|item| item.can_upload).count();
+    saldeo_empty_saldeo_guard(
+        plan.saldeo_record_count,
+        uploadable_count,
+        saldeo_allow_empty_from_env(),
+    )?;
+    if uploadable_count == 0 {
+        plan.summary = saldeo_sync_summary(&plan.items);
+        return Ok(());
+    }
+    let conn = open_db(&db_path)?;
     ensure_saldeo_session_or_auth(progress.clone())?;
     let session = read_saldeo_session(storage_state)?;
     let client = Client::builder().build()?;
+    let today = Utc::now().date_naive();
+    let result = saldeo_upload_items_with(
+        plan,
+        &conn,
+        today,
+        progress.as_ref(),
+        |path, bytes, year, month| {
+            saldeo_upload_bytes(
+                &client, &session, upload_url, path, bytes, year, month, today,
+            )
+        },
+    );
+    plan.summary = saldeo_sync_summary(&plan.items);
+    result
+}
+
+/// Wynik wysłania jednego pliku.
+#[derive(Debug)]
+pub(crate) enum SaldeoUploadOutcome {
+    /// PUT i confirm zakończone sukcesem.
+    Uploaded {
+        year: i32,
+        month: u32,
+        doc_upload_id: i64,
+        response_status: u16,
+        body: String,
+    },
+    /// PUT się udał, confirm nie (błąd, timeout, nieoczekiwana odpowiedź) — Saldeo może mieć plik.
+    Unconfirmed {
+        year: i32,
+        month: u32,
+        doc_upload_id: i64,
+        response_status: Option<u16>,
+        error: String,
+    },
+    /// Plik nie trafił do Saldeo (generate albo PUT nie powiodły się).
+    Failed { error: String },
+}
+
+/// Pętla uploadu z wstrzykiwanym transportem. Rejestr jest sprawdzany przed każdym plikiem
+/// i zapisywany zaraz po nim; błąd zapisu rejestru przerywa resztę przebiegu.
+pub(crate) fn saldeo_upload_items_with(
+    plan: &mut SaldeoSyncPlan,
+    conn: &Connection,
+    today: NaiveDate,
+    progress: Option<&Arc<Mutex<String>>>,
+    mut upload: impl FnMut(&Path, Vec<u8>, i32, u32) -> SaldeoUploadOutcome,
+) -> Result<()> {
+    let plan_year = plan.year;
     let uploadable_count = plan.items.iter().filter(|item| item.can_upload).count();
     let mut upload_index = 0usize;
     for item in &mut plan.items {
         if !item.can_upload {
             continue;
         }
-        let Some(source_path) = &item.source_path else {
+        let Some(source_path) = item.source_path.clone() else {
             continue;
         };
         upload_index += 1;
-        if let Some(progress) = &progress {
-            let label = Path::new(source_path)
+        if let Some(progress) = progress {
+            let label = Path::new(&source_path)
                 .file_name()
                 .and_then(|name| name.to_str())
                 .or(item.invoice_number.as_deref())
@@ -170,31 +549,94 @@ pub(crate) fn saldeo_upload_plan_with_progress(
                 format!("Upload Saldeo {upload_index}/{uploadable_count}: {label}"),
             );
         }
-        let upload_year = item.issue_date.map(|d| d.year()).unwrap_or(plan.year);
-        let upload_month = item
-            .issue_date
-            .map(|d| d.month())
-            .unwrap_or_else(|| Utc::now().month());
-        match saldeo_upload_file(
-            &client,
-            &session,
-            upload_url,
-            Path::new(source_path),
-            upload_year,
-            upload_month,
-        ) {
-            Ok((status, body)) => {
-                item.upload_status = "uploaded".to_string();
-                item.saldeo_response_status = Some(status);
-                item.saldeo_response_body = Some(body);
-            }
+        let bytes = match fs::read(&source_path) {
+            Ok(bytes) => bytes,
             Err(err) => {
                 item.upload_status = "failed".to_string();
-                item.error = Some(err.to_string());
+                item.error = Some(format!("odczyt {source_path}: {err}"));
+                continue;
             }
+        };
+        let file_sha256 = saldeo_file_sha256(&bytes);
+        item.file_sha256 = Some(file_sha256.clone());
+        if let Some(entry) = saldeo_upload_ledger_get(conn, &file_sha256)? {
+            saldeo_mark_ledger_hit(item, &entry);
+            continue;
+        }
+        let Some((year, month)) = saldeo_apply_period_rule(item, plan_year, today) else {
+            continue;
+        };
+        let entry = match upload(Path::new(&source_path), bytes, year, month) {
+            SaldeoUploadOutcome::Uploaded {
+                year,
+                month,
+                doc_upload_id,
+                response_status,
+                body,
+            } => {
+                item.upload_status = "uploaded".to_string();
+                item.saldeo_response_status = Some(response_status);
+                item.saldeo_response_body = Some(body);
+                item.saldeo_year = Some(year);
+                item.saldeo_month = Some(month);
+                item.saldeo_doc_upload_id = Some(doc_upload_id);
+                SaldeoUploadLedgerEntry {
+                    file_sha256,
+                    source_path: Some(source_path.clone()),
+                    invoice_number: item.invoice_number.clone(),
+                    saldeo_year: year,
+                    saldeo_month: month,
+                    doc_upload_id: Some(doc_upload_id),
+                    response_status: Some(response_status),
+                    state: SALDEO_LEDGER_UPLOADED.to_string(),
+                    error: None,
+                    uploaded_at: Utc::now(),
+                }
+            }
+            SaldeoUploadOutcome::Unconfirmed {
+                year,
+                month,
+                doc_upload_id,
+                response_status,
+                error,
+            } => {
+                item.upload_status = "unconfirmed".to_string();
+                item.saldeo_response_status = response_status;
+                item.saldeo_year = Some(year);
+                item.saldeo_month = Some(month);
+                item.saldeo_doc_upload_id = Some(doc_upload_id);
+                item.error = Some(error.clone());
+                SaldeoUploadLedgerEntry {
+                    file_sha256,
+                    source_path: Some(source_path.clone()),
+                    invoice_number: item.invoice_number.clone(),
+                    saldeo_year: year,
+                    saldeo_month: month,
+                    doc_upload_id: Some(doc_upload_id),
+                    response_status,
+                    state: SALDEO_LEDGER_UNCONFIRMED.to_string(),
+                    error: Some(error),
+                    uploaded_at: Utc::now(),
+                }
+            }
+            SaldeoUploadOutcome::Failed { error } => {
+                item.upload_status = "failed".to_string();
+                item.error = Some(error);
+                continue;
+            }
+        };
+        if let Err(err) = saldeo_upload_ledger_put(conn, &entry) {
+            let message =
+                format!("plik jest w Saldeo, ale zapis rejestru uploadów nie powiódł się: {err:#}");
+            item.error = Some(match item.error.take() {
+                Some(previous) => format!("{previous}; {message}"),
+                None => message,
+            });
+            return Err(err.context(format!(
+                "zapis rejestru uploadów Saldeo dla {source_path}; przerywam, żeby nie wysłać pliku ponownie"
+            )));
         }
     }
-    plan.summary = saldeo_sync_summary(&plan.items);
     Ok(())
 }
 
@@ -271,6 +713,7 @@ pub(crate) fn saldeo_fallback_upload_period(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn saldeo_generate_upload_urls(
     client: &Client,
     session: &SaldeoSession,
@@ -306,37 +749,20 @@ fn saldeo_generate_upload_urls(
         .map_err(Into::into)
 }
 
-pub(crate) fn saldeo_upload_file(
-    client: &Client,
-    session: &SaldeoSession,
-    upload_url: &str,
-    path: &Path,
+/// Prosi Saldeo o URL uploadu, przechodząc z zamkniętego miesiąca do następnego otwartego.
+/// Zwraca okres faktycznie użyty i odpowiedź `generate` (status `SUCCESS`).
+pub(crate) fn saldeo_resolve_upload_period(
     year: i32,
     month: u32,
-) -> Result<(u16, String)> {
-    let file_name = path
-        .file_name()
-        .and_then(|v| v.to_str())
-        .ok_or_else(|| anyhow!("brak nazwy pliku: {}", path.display()))?;
-    let bytes = fs::read(path).with_context(|| format!("odczyt {}", path.display()))?;
-    let content_type = content_type_for_path(path);
+    today: NaiveDate,
+    mut generate: impl FnMut(i32, u32) -> Result<Value>,
+) -> Result<(i32, u32, Value)> {
     let mut year = year;
     let mut month = month;
-    let mut response = None;
     for _ in 0..14 {
-        let generated = saldeo_generate_upload_urls(
-            client,
-            session,
-            upload_url,
-            file_name,
-            content_type,
-            bytes.len(),
-            year,
-            month,
-        )?;
+        let generated = generate(year, month)?;
         if saldeo_period_is_closed(&generated) {
-            let (next_year, next_month) =
-                saldeo_fallback_upload_period(year, month, Utc::now().date_naive());
+            let (next_year, next_month) = saldeo_fallback_upload_period(year, month, today);
             if (next_year, next_month) == (year, month) {
                 return Err(anyhow!("Saldeo generate upload URL failed: {generated}"));
             }
@@ -344,27 +770,92 @@ pub(crate) fn saldeo_upload_file(
             month = next_month;
             continue;
         }
-        response = Some(generated);
-        break;
+        if generated.get("status").and_then(Value::as_str) != Some("SUCCESS") {
+            return Err(anyhow!("Saldeo generate upload URL failed: {generated}"));
+        }
+        return Ok((year, month, generated));
     }
-    let response = response.ok_or_else(|| {
-        anyhow!("Saldeo generate upload URL failed: brak otwartego miesiąca do zapisu")
-    })?;
-    if response.get("status").and_then(|v| v.as_str()) != Some("SUCCESS") {
-        return Err(anyhow!("Saldeo generate upload URL failed: {}", response));
+    Err(anyhow!(
+        "Saldeo generate upload URL failed: brak otwartego miesiąca do zapisu"
+    ))
+}
+
+/// Ocena odpowiedzi `doc-upload/{id}/confirm`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SaldeoConfirmCheck {
+    Confirmed,
+    /// Saldeo jednoznacznie odrzuciło potwierdzenie (HTTP != 2xx albo status != SUCCESS).
+    Rejected(String),
+    /// Odpowiedź bez rozpoznawalnego statusu — nie wiadomo, czy dokument powstał.
+    Unknown(String),
+}
+
+pub(crate) fn saldeo_check_confirm_response(http_status: u16, body: &str) -> SaldeoConfirmCheck {
+    let snippet = body.chars().take(500).collect::<String>();
+    if !(200..300).contains(&http_status) {
+        return SaldeoConfirmCheck::Rejected(format!(
+            "Saldeo confirm failed HTTP {http_status}: {snippet}"
+        ));
     }
-    let upload = response
-        .get("data")
-        .and_then(|v| v.get(file_name))
-        .ok_or_else(|| anyhow!("Saldeo response missing file entry for {file_name}: {response}"))?;
-    let doc_upload_id = upload
-        .get("docUploadId")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| anyhow!("Saldeo response missing docUploadId: {upload}"))?;
-    let signed_url = upload
-        .get("url")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("Saldeo response missing upload url: {upload}"))?;
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return SaldeoConfirmCheck::Unknown(format!(
+            "Saldeo confirm HTTP {http_status} bez odpowiedzi JSON: {snippet:?}"
+        ));
+    };
+    match value.get("status").and_then(Value::as_str) {
+        Some("SUCCESS") => SaldeoConfirmCheck::Confirmed,
+        Some(status) => {
+            SaldeoConfirmCheck::Rejected(format!("Saldeo confirm status {status}: {snippet}"))
+        }
+        None => SaldeoConfirmCheck::Unknown(format!(
+            "Saldeo confirm HTTP {http_status} bez pola status: {snippet}"
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn saldeo_upload_bytes(
+    client: &Client,
+    session: &SaldeoSession,
+    upload_url: &str,
+    path: &Path,
+    bytes: Vec<u8>,
+    year: i32,
+    month: u32,
+    today: NaiveDate,
+) -> SaldeoUploadOutcome {
+    let failed = |error: String| SaldeoUploadOutcome::Failed { error };
+    let Some(file_name) = path.file_name().and_then(|v| v.to_str()) else {
+        return failed(format!("brak nazwy pliku: {}", path.display()));
+    };
+    let content_type = content_type_for_path(path);
+    let (year, month, response) =
+        match saldeo_resolve_upload_period(year, month, today, |year, month| {
+            saldeo_generate_upload_urls(
+                client,
+                session,
+                upload_url,
+                file_name,
+                content_type,
+                bytes.len(),
+                year,
+                month,
+            )
+        }) {
+            Ok(resolved) => resolved,
+            Err(err) => return failed(format!("{err:#}")),
+        };
+    let Some(upload) = response.get("data").and_then(|v| v.get(file_name)) else {
+        return failed(format!(
+            "Saldeo response missing file entry for {file_name}: {response}"
+        ));
+    };
+    let Some(doc_upload_id) = upload.get("docUploadId").and_then(|v| v.as_i64()) else {
+        return failed(format!("Saldeo response missing docUploadId: {upload}"));
+    };
+    let Some(signed_url) = upload.get("url").and_then(|v| v.as_str()) else {
+        return failed(format!("Saldeo response missing upload url: {upload}"));
+    };
     let download_filename = upload
         .get("downloadFilename")
         .and_then(|v| v.as_str())
@@ -392,13 +883,25 @@ pub(crate) fn saldeo_upload_file(
     };
 
     if let Err(err) = upload_result.and_then(|r| r.error_for_status()) {
-        let _ = saldeo_reject_upload(client, session, doc_upload_id, &err.to_string());
-        return Err(anyhow!("Saldeo signed upload failed: {err}"));
+        let reject = saldeo_reject_upload(client, session, doc_upload_id, &err.to_string());
+        let reject_note = match reject {
+            Ok(()) => String::new(),
+            Err(reject_err) => format!(" (reject docUploadId {doc_upload_id}: {reject_err})"),
+        };
+        return failed(format!("Saldeo signed upload failed: {err}{reject_note}"));
     }
 
     let confirm_url =
         format!("https://saldeo.brainshare.pl/rest/doc-upload/{doc_upload_id}/confirm");
-    let confirm = client
+    let unconfirmed =
+        |response_status: Option<u16>, error: String| SaldeoUploadOutcome::Unconfirmed {
+            year,
+            month,
+            doc_upload_id,
+            response_status,
+            error,
+        };
+    let confirm = match client
         .post(&confirm_url)
         .header("Cookie", &session.cookie_header)
         .header("X-SALDEO-XSRF-H-TOKEN", &session.xsrf)
@@ -406,14 +909,45 @@ pub(crate) fn saldeo_upload_file(
         .header("timeout", "60000")
         .json(&serde_json::json!({}))
         .send()
-        .with_context(|| format!("Saldeo confirm upload {doc_upload_id}"))?;
+    {
+        Ok(confirm) => confirm,
+        Err(err) => {
+            return unconfirmed(
+                None,
+                format!("Saldeo confirm upload {doc_upload_id}: {err}"),
+            );
+        }
+    };
     let status = confirm.status().as_u16();
-    let text = confirm.text().unwrap_or_default();
-    if !(200..300).contains(&status) {
-        let _ = saldeo_reject_upload(client, session, doc_upload_id, &text);
-        return Err(anyhow!("Saldeo confirm failed HTTP {status}: {text}"));
+    let text = match confirm.text() {
+        Ok(text) => text,
+        Err(err) => {
+            return unconfirmed(
+                Some(status),
+                format!("Saldeo confirm upload {doc_upload_id}: odczyt odpowiedzi: {err}"),
+            );
+        }
+    };
+    match saldeo_check_confirm_response(status, &text) {
+        SaldeoConfirmCheck::Confirmed => SaldeoUploadOutcome::Uploaded {
+            year,
+            month,
+            doc_upload_id,
+            response_status: status,
+            body: text.chars().take(2000).collect(),
+        },
+        SaldeoConfirmCheck::Rejected(error) => {
+            let reject = saldeo_reject_upload(client, session, doc_upload_id, &text);
+            let reject_note = match reject {
+                Ok(()) => format!(" (wysłano reject docUploadId {doc_upload_id})"),
+                Err(reject_err) => {
+                    format!(" (reject docUploadId {doc_upload_id} nieudany: {reject_err})")
+                }
+            };
+            unconfirmed(Some(status), format!("{error}{reject_note}"))
+        }
+        SaldeoConfirmCheck::Unknown(error) => unconfirmed(Some(status), error),
     }
-    Ok((status, text.chars().take(2000).collect()))
 }
 
 pub(crate) fn saldeo_reject_upload(
@@ -467,6 +1001,9 @@ pub(crate) fn write_saldeo_sync_csv(plan: &SaldeoSyncPlan, path: &Path) -> Resul
         "can_upload",
         "saldeo_response_status",
         "error",
+        "saldeo_period",
+        "file_sha256",
+        "skip_reason",
     ])?;
     for item in &plan.items {
         writer.write_record([
@@ -487,6 +1024,12 @@ pub(crate) fn write_saldeo_sync_csv(plan: &SaldeoSyncPlan, path: &Path) -> Resul
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
             item.error.clone().unwrap_or_default(),
+            match (item.saldeo_year, item.saldeo_month) {
+                (Some(year), Some(month)) => format!("{year}-{month:02}"),
+                _ => String::new(),
+            },
+            item.file_sha256.clone().unwrap_or_default(),
+            item.skip_reason.clone().unwrap_or_default(),
         ])?;
     }
     writer.flush()?;
@@ -1146,13 +1689,11 @@ pub(crate) fn saldeo_fetch_with_progress(
                     anyhow!("Saldeo document/list/search month={month}: {e}")
                 }
             })?
-            .json()?;
-        let items = value
-            .get("data")
-            .and_then(|d| d.get("resultCollection"))
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
+            .json()
+            .with_context(|| {
+                format!("Saldeo document/list/search {year}-{month:02}: odpowiedź nie jest JSON")
+            })?;
+        let items = saldeo_document_list_items(&value, year, month)?;
         let month_count = items.len();
         for mut item in items {
             if let Value::Object(ref mut map) = item {
@@ -1199,15 +1740,17 @@ pub(crate) fn saldeo_fetch_with_progress(
             format!("Saldeo: zapis {} rekordów...", records.len()),
         );
     }
+    // Pliki podmieniamy dopiero po pobraniu wszystkich 12 miesięcy (każdy błąd wyżej kończy
+    // funkcję przed zapisem), atomowo: tmp + rename. Bazę zapisują wywołujący po Ok.
     let raw_output = out_dir.join("documents.json");
     let records_output = out_dir.join("records.jsonl");
-    fs::write(&raw_output, serde_json::to_vec_pretty(&documents)?)?;
     let mut jsonl = Vec::new();
     for record in &records {
         serde_json::to_writer(&mut jsonl, record)?;
         jsonl.push(b'\n');
     }
-    fs::write(&records_output, jsonl)?;
+    write_private_file(&raw_output, &serde_json::to_vec_pretty(&documents)?)?;
+    write_private_file(&records_output, &jsonl)?;
 
     Ok(SaldeoFetchResult {
         summary: SaldeoFetchSummary {
@@ -1219,6 +1762,52 @@ pub(crate) fn saldeo_fetch_with_progress(
         },
         records,
     })
+}
+
+/// Walidacja odpowiedzi `document/list/search` dla jednego miesiąca. HTTP 200 nie wystarcza:
+/// treść z błędem albo bez `data.resultCollection` wyglądałaby jak pusty miesiąc, a wtedy
+/// każda faktura z Gmaila trafiłaby do planu uploadu.
+pub(crate) fn saldeo_document_list_items(
+    value: &Value,
+    year: i32,
+    month: u32,
+) -> Result<Vec<Value>> {
+    let context = format!("Saldeo document/list/search {year}-{month:02}");
+    let snippet = || value.to_string().chars().take(500).collect::<String>();
+    if let Some(status) = value.get("status")
+        && status.as_str() != Some("SUCCESS")
+    {
+        return Err(anyhow!("{context}: status {status}: {}", snippet()));
+    }
+    let data = value.get("data");
+    let items = data
+        .and_then(|d| d.get("resultCollection"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            anyhow!(
+                "{context}: brak tablicy data.resultCollection: {}",
+                snippet()
+            )
+        })?;
+    let total = data.and_then(|d| {
+        d.get("totalCount")
+            .map(|v| ("data.totalCount", v))
+            .or_else(|| {
+                d.get("pagination")
+                    .and_then(|p| p.get("totalCount"))
+                    .map(|v| ("data.pagination.totalCount", v))
+            })
+    });
+    if let Some((field, total)) = total
+        && let Some(total) = total.as_u64()
+        && total != items.len() as u64
+    {
+        return Err(anyhow!(
+            "{context}: {field} = {total}, a odpowiedź zawiera {} dokumentów — niepełna lista",
+            items.len()
+        ));
+    }
+    Ok(items.clone())
 }
 
 pub(crate) fn load_saldeo_records(

@@ -754,6 +754,8 @@ pub(crate) fn execute_invoice_table_actions(
             summary: saldeo_sync_summary(&selected_upload_items),
             items: selected_upload_items,
             ksef_approve: None,
+            ledger_db_path: Some(db_path.clone()),
+            ..Default::default()
         };
         saldeo_upload_plan_with_progress(
             &mut upload_plan,

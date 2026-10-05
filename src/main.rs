@@ -170,7 +170,7 @@ struct TriRow {
     saldeo: Option<InvoiceRecord>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 struct SaldeoSyncPlan {
     generated_at: DateTime<Utc>,
     year: i32,
@@ -180,6 +180,14 @@ struct SaldeoSyncPlan {
     items: Vec<SaldeoSyncItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ksef_approve: Option<SaldeoApprovePlan>,
+    /// Problemy przebiegu, które nie przerwały zapisu planu (np. nieudany refresh Saldeo).
+    warnings: Vec<String>,
+    /// Liczba rekordów Saldeo, z których policzono plan; `None`, gdy nieznana (plan z TUI).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    saldeo_record_count: Option<usize>,
+    /// Baza z rejestrem wysłanych plików (`saldeo_upload_ledger`); upload bez niej odmawia.
+    #[serde(skip)]
+    ledger_db_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -231,12 +239,16 @@ struct SaldeoDuplicateGroup {
     kept_content_hash: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 struct SaldeoSyncSummary {
     total_missing_saldeo: usize,
     uploadable_count: usize,
     missing_file_count: usize,
+    already_uploaded_count: usize,
+    unconfirmed_count: usize,
+    other_year_count: usize,
     uploaded_count: usize,
+    /// Pozycje, które w tym przebiegu nie trafiły do Saldeo albo nie mają potwierdzenia.
     failed_count: usize,
 }
 
@@ -256,6 +268,14 @@ struct SaldeoSyncItem {
     saldeo_response_status: Option<u16>,
     saldeo_response_body: Option<String>,
     error: Option<String>,
+    /// sha256 bajtów pliku — klucz rejestru `saldeo_upload_ledger`.
+    file_sha256: Option<String>,
+    /// Okres Saldeo planowany, a po uploadzie faktycznie użyty (po fallbacku z zamkniętego miesiąca).
+    saldeo_year: Option<i32>,
+    saldeo_month: Option<u32>,
+    saldeo_doc_upload_id: Option<i64>,
+    /// Dlaczego pozycja nie jest wysyłana (rejestr, inny rok).
+    skip_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -844,6 +864,31 @@ fn handle_upload_command(
     confirm: bool,
     approve: bool,
 ) -> Result<()> {
+    // Upload z domyślnych źródeł planuje się z świeżych danych Saldeo; bez nich plan
+    // z cache uznałby za brakujące pliki dodane do Saldeo od ostatniego odczytu.
+    if confirm && tri_report.is_none() && saldeo.is_none() {
+        eprintln!("  [Saldeo] odświeżam dane Saldeo przed planem uploadu...");
+        if let Err(err) = sync_reconcile_metadata(year, false, true, db_path) {
+            let err = err
+                .context("odświeżenie Saldeo przed uploadem nie powiodło się — upload przerwany");
+            // Pusty wynik z ostrzeżeniem zastępuje plik z poprzedniego przebiegu.
+            let aborted = SaldeoSyncPlan {
+                generated_at: Utc::now(),
+                year,
+                confirm,
+                warnings: vec![format!("{err:#}")],
+                ..Default::default()
+            };
+            if let Err(write_err) = write_json(&aborted, output.as_deref()).and_then(|_| {
+                csv.as_deref()
+                    .map(|csv_path| write_saldeo_sync_csv(&aborted, csv_path))
+                    .unwrap_or(Ok(()))
+            }) {
+                eprintln!("  [LAB] zapis wyniku uploadu nie powiódł się: {write_err:#}");
+            }
+            return Err(err);
+        }
+    }
     let mut plan = saldeo_sync_plan(SaldeoSyncPlanConfig {
         year,
         tri_report: tri_report.as_deref(),
@@ -855,39 +900,65 @@ fn handle_upload_command(
         confirm,
         upload_url: None,
     })?;
+    let mut run_error: Option<anyhow::Error> = None;
     if confirm {
-        ensure_saldeo_session()?;
-        saldeo_upload_plan(
-            &mut plan,
-            &default_saldeo_storage_state_path(),
-            DEFAULT_SALDEO_UPLOAD_URL,
-            "file",
-        )?;
-    }
-    let refresh_after_upload = confirm && plan.summary.uploaded_count > 0;
-    if refresh_after_upload || (confirm && approve) {
-        if let Err(err) = saldeo_fetch_with_progress(
-            year,
-            &default_saldeo_storage_state_path(),
-            &default_saldeo_out_path(year),
-            Some(db_path),
-            None,
-        ) {
-            eprintln!("  [Saldeo] refresh po uploadzie nie powiódł się: {err}");
+        let upload = ensure_saldeo_session().and_then(|_| {
+            saldeo_upload_plan(
+                &mut plan,
+                &default_saldeo_storage_state_path(),
+                DEFAULT_SALDEO_UPLOAD_URL,
+                "file",
+            )
+        });
+        if let Err(err) = upload {
+            plan.warnings
+                .push(format!("upload Saldeo przerwany: {err:#}"));
+            run_error = Some(err);
         }
     }
-    if approve {
-        plan.ksef_approve = Some(saldeo_approve_pending_ksef(
-            db_path,
-            year,
-            review_score,
-            confirm,
-        )?);
+    let refresh_after_upload = confirm && plan.summary.uploaded_count > 0;
+    if (refresh_after_upload || (confirm && approve && run_error.is_none()))
+        && let Err(err) = sync_reconcile_metadata(year, false, true, db_path)
+    {
+        eprintln!("  [Saldeo] refresh po uploadzie nie powiódł się: {err:#}");
+        plan.warnings.push(format!(
+            "refresh Saldeo po uploadzie nie powiódł się: {err:#}"
+        ));
     }
-    if let Some(csv_path) = csv {
-        write_saldeo_sync_csv(&plan, &csv_path)?;
+    if approve && run_error.is_none() {
+        match saldeo_approve_pending_ksef(db_path, year, review_score, confirm) {
+            Ok(approve_plan) => plan.ksef_approve = Some(approve_plan),
+            Err(err) => {
+                plan.warnings
+                    .push(format!("zatwierdzanie KSeF nie powiodło się: {err:#}"));
+                run_error = Some(err);
+            }
+        }
+    } else if approve {
+        plan.warnings
+            .push("zatwierdzanie KSeF pominięte, bo upload został przerwany".to_string());
     }
-    write_json(&plan, output.as_deref())?;
+    // Wynik przebiegu zapisujemy zawsze, także gdy coś wyżej się nie udało.
+    let json_result = write_json(&plan, output.as_deref());
+    let csv_result = csv
+        .as_deref()
+        .map(|csv_path| write_saldeo_sync_csv(&plan, csv_path))
+        .unwrap_or(Ok(()));
+    if let Some(err) = run_error {
+        for write_err in [json_result.err(), csv_result.err()].into_iter().flatten() {
+            eprintln!("  [LAB] zapis wyniku uploadu nie powiódł się: {write_err:#}");
+        }
+        return Err(err);
+    }
+    json_result?;
+    csv_result?;
+    let failed = plan.summary.failed_count;
+    if failed > 0 {
+        return Err(anyhow!(
+            "upload Saldeo: {failed} z {} plików nie trafiło do Saldeo albo nie ma potwierdzenia (szczegóły w wyniku: upload_status failed/unconfirmed)",
+            plan.summary.uploadable_count
+        ));
+    }
     Ok(())
 }
 
@@ -1230,6 +1301,7 @@ fn open_db(path: &Path) -> Result<Connection> {
         "#,
     )?;
     ensure_invoice_columns(&conn)?;
+    ensure_saldeo_upload_ledger_table(&conn)?;
     Ok(conn)
 }
 
