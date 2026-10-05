@@ -511,6 +511,14 @@ pub(crate) fn default_saldeo_storage_state_path() -> PathBuf {
 
 pub(crate) const SALDEO_OVERRIDE_WARNING_PREFIX: &str = "lab override applied";
 
+/// Local correction of a Saldeo record.
+///
+/// With `baseline: Some(_)` only the fields present in the baseline are overridden, and each
+/// one applies only while Saldeo still reports the value seen when the override was written;
+/// once Saldeo's own value changes, Saldeo wins and the field override is dropped.
+/// `baseline: None` is the legacy full-snapshot format (old SQLite rows and
+/// `saldeo-overrides.json`); it is migrated on load by taking Saldeo's current values as
+/// the baseline for the fields that differ.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SaldeoRecordOverride {
     pub content_hash: String,
@@ -522,6 +530,131 @@ pub(crate) struct SaldeoRecordOverride {
     pub issue_date: Option<NaiveDate>,
     pub gross_amount_minor: Option<i64>,
     pub currency: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<SaldeoOverrideBaseline>,
+}
+
+/// Saldeo value of one field at the time the override was written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SaldeoBaselineValue<T> {
+    pub saldeo: Option<T>,
+}
+
+/// Overridden fields of a [`SaldeoRecordOverride`]; a field is overridden iff it is `Some`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SaldeoOverrideBaseline {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invoice_number: Option<SaldeoBaselineValue<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seller_tax_id: Option<SaldeoBaselineValue<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buyer_tax_id: Option<SaldeoBaselineValue<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seller_name: Option<SaldeoBaselineValue<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buyer_name: Option<SaldeoBaselineValue<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_date: Option<SaldeoBaselineValue<NaiveDate>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gross_amount_minor: Option<SaldeoBaselineValue<i64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<SaldeoBaselineValue<String>>,
+}
+
+/// Calls `$m!(field, "field")` for every overridable Saldeo field.
+macro_rules! saldeo_override_fields {
+    ($m:ident) => {
+        $m!(invoice_number, "invoice_number");
+        $m!(seller_tax_id, "seller_tax_id");
+        $m!(buyer_tax_id, "buyer_tax_id");
+        $m!(seller_name, "seller_name");
+        $m!(buyer_name, "buyer_name");
+        $m!(issue_date, "issue_date");
+        $m!(gross_amount_minor, "gross_amount_minor");
+        $m!(currency, "currency");
+    };
+}
+
+impl SaldeoOverrideBaseline {
+    pub(crate) fn field_names(&self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        macro_rules! name {
+            ($field:ident, $name:literal) => {
+                if self.$field.is_some() {
+                    names.push($name);
+                }
+            };
+        }
+        saldeo_override_fields!(name);
+        names
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.field_names().is_empty()
+    }
+}
+
+impl SaldeoRecordOverride {
+    /// Field-level override with no fields yet.
+    pub(crate) fn empty(content_hash: &str) -> Self {
+        Self {
+            content_hash: content_hash.to_string(),
+            invoice_number: None,
+            seller_tax_id: None,
+            buyer_tax_id: None,
+            seller_name: None,
+            buyer_name: None,
+            issue_date: None,
+            gross_amount_minor: None,
+            currency: None,
+            baseline: Some(SaldeoOverrideBaseline::default()),
+        }
+    }
+
+    pub(crate) fn is_legacy(&self) -> bool {
+        self.baseline.is_none()
+    }
+
+    /// Field-level form of this override. Legacy snapshots take `current` (Saldeo's value
+    /// now) as the baseline of every field that differs from the snapshot.
+    pub(crate) fn with_baseline_from(&self, current: &InvoiceRecord) -> Self {
+        if !self.is_legacy() {
+            return self.clone();
+        }
+        let mut out = Self::empty(&self.content_hash);
+        let baseline = out.baseline.get_or_insert_with(Default::default);
+        macro_rules! migrate {
+            ($field:ident, $name:literal) => {
+                if current.$field != self.$field {
+                    out.$field = self.$field.clone();
+                    baseline.$field = Some(SaldeoBaselineValue {
+                        saldeo: current.$field.clone(),
+                    });
+                }
+            };
+        }
+        saldeo_override_fields!(migrate);
+        out
+    }
+
+    /// Copies the fields overridden by `newer` into `self` (both must be the same record).
+    fn merge_fields_from(&mut self, newer: &SaldeoRecordOverride) {
+        let Some(newer_baseline) = newer.baseline.as_ref() else {
+            *self = newer.clone();
+            return;
+        };
+        macro_rules! merge {
+            ($field:ident, $name:literal) => {
+                if let Some(seen) = &newer_baseline.$field {
+                    self.$field = newer.$field.clone();
+                    if let Some(baseline) = self.baseline.as_mut() {
+                        baseline.$field = Some(seen.clone());
+                    }
+                }
+            };
+        }
+        saldeo_override_fields!(merge);
+    }
 }
 
 pub(crate) fn default_saldeo_record_overrides_path() -> PathBuf {
@@ -537,6 +670,14 @@ fn saldeo_record_override_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<SaldeoRecordOverride> {
     let issue_date_text: Option<String> = row.get(6)?;
+    let baseline_json: Option<String> = row.get(9)?;
+    let baseline = baseline_json
+        .as_deref()
+        .map(serde_json::from_str::<SaldeoOverrideBaseline>)
+        .transpose()
+        .map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(err))
+        })?;
     Ok(SaldeoRecordOverride {
         content_hash: row.get(0)?,
         invoice_number: row.get(1)?,
@@ -547,7 +688,40 @@ fn saldeo_record_override_from_row(
         issue_date: issue_date_text.as_deref().and_then(parse_date),
         gross_amount_minor: row.get(7)?,
         currency: row.get(8)?,
+        baseline,
     })
+}
+
+/// Adds `baseline_json` (field-level overrides) to databases created before it existed.
+/// NULL marks a legacy full-snapshot row.
+fn ensure_saldeo_override_columns(conn: &Connection) -> Result<()> {
+    let has_baseline = |conn: &Connection| -> Result<bool> {
+        let mut stmt = conn.prepare("PRAGMA table_info(saldeo_overrides)")?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(names.iter().any(|name| name == "baseline_json"))
+    };
+    if has_baseline(conn)? {
+        return Ok(());
+    }
+    if let Err(err) = conn.execute(
+        "ALTER TABLE saldeo_overrides ADD COLUMN baseline_json TEXT",
+        [],
+    ) {
+        // Another process may have added the column in the meantime.
+        if !has_baseline(conn)? {
+            return Err(err.into());
+        }
+    }
+    Ok(())
+}
+
+fn open_saldeo_overrides_db(db_path: &Path) -> Result<Connection> {
+    let conn = open_db(db_path)?;
+    ensure_saldeo_override_columns(&conn)?;
+    let _ = import_legacy_saldeo_record_overrides(&conn)?;
+    Ok(conn)
 }
 
 fn import_legacy_saldeo_record_overrides(conn: &Connection) -> Result<usize> {
@@ -561,9 +735,12 @@ fn import_legacy_saldeo_record_overrides(conn: &Connection) -> Result<usize> {
     if legacy.is_empty() {
         return Ok(0);
     }
-    for override_row in legacy.values() {
-        upsert_saldeo_record_override(conn, override_row)?;
-    }
+    with_sqlite_transaction(conn, |conn| {
+        for override_row in legacy.values() {
+            upsert_saldeo_record_override(conn, override_row)?;
+        }
+        Ok(())
+    })?;
     Ok(legacy.len())
 }
 
@@ -587,11 +764,12 @@ fn load_saldeo_record_overrides_from_file() -> Result<HashMap<String, SaldeoReco
 fn load_saldeo_record_overrides_from_db(
     conn: &Connection,
 ) -> Result<HashMap<String, SaldeoRecordOverride>> {
+    ensure_saldeo_override_columns(conn)?;
     let _ = import_legacy_saldeo_record_overrides(conn)?;
     let mut stmt = conn.prepare(
         r#"
         SELECT content_hash, invoice_number, seller_tax_id, buyer_tax_id, seller_name, buyer_name,
-               issue_date, gross_amount_minor, currency
+               issue_date, gross_amount_minor, currency, baseline_json
         FROM saldeo_overrides ORDER BY updated_at DESC, content_hash ASC
         "#,
     )?;
@@ -621,12 +799,18 @@ fn upsert_saldeo_record_override(
     override_row: &SaldeoRecordOverride,
 ) -> Result<()> {
     let now = Utc::now().to_rfc3339();
+    let baseline_json = override_row
+        .baseline
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
     conn.execute(
         r#"
         INSERT INTO saldeo_overrides (
             content_hash, invoice_number, seller_tax_id, buyer_tax_id, seller_name,
-            buyer_name, issue_date, gross_amount_minor, currency, created_at, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+            buyer_name, issue_date, gross_amount_minor, currency, baseline_json,
+            created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
         ON CONFLICT(content_hash) DO UPDATE SET
             invoice_number = excluded.invoice_number,
             seller_tax_id = excluded.seller_tax_id,
@@ -636,6 +820,7 @@ fn upsert_saldeo_record_override(
             issue_date = excluded.issue_date,
             gross_amount_minor = excluded.gross_amount_minor,
             currency = excluded.currency,
+            baseline_json = excluded.baseline_json,
             updated_at = excluded.updated_at
         "#,
         params![
@@ -648,19 +833,74 @@ fn upsert_saldeo_record_override(
             override_row.issue_date.map(|d| d.to_string()),
             override_row.gross_amount_minor,
             override_row.currency,
+            baseline_json,
             now,
         ],
     )?;
     Ok(())
 }
 
+/// Stores `override_row` as the whole override of its record; a field-level override
+/// without any field deletes the row.
+fn write_saldeo_record_override(
+    conn: &Connection,
+    override_row: &SaldeoRecordOverride,
+) -> Result<()> {
+    if override_row
+        .baseline
+        .as_ref()
+        .is_some_and(SaldeoOverrideBaseline::is_empty)
+    {
+        conn.execute(
+            "DELETE FROM saldeo_overrides WHERE content_hash = ?1",
+            params![override_row.content_hash],
+        )?;
+        return Ok(());
+    }
+    upsert_saldeo_record_override(conn, override_row)
+}
+
+/// Saves overrides in one transaction. Field-level overrides are merged into the stored
+/// override of the record (fields they do not mention keep their stored state).
+pub(crate) fn save_saldeo_record_overrides(
+    db_path: &Path,
+    override_rows: &[SaldeoRecordOverride],
+) -> Result<()> {
+    let conn = open_saldeo_overrides_db(db_path)?;
+    with_sqlite_transaction(&conn, |conn| {
+        let mut stored = load_saldeo_record_overrides_from_db(conn)?;
+        for override_row in override_rows {
+            let merged = match stored.get(&override_row.content_hash) {
+                Some(existing) if !override_row.is_legacy() => {
+                    let mut merged = existing.clone();
+                    merged.merge_fields_from(override_row);
+                    merged
+                }
+                _ => override_row.clone(),
+            };
+            write_saldeo_record_override(conn, &merged)?;
+            stored.insert(merged.content_hash.clone(), merged);
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
 pub(crate) fn save_saldeo_record_override(
     db_path: &Path,
     override_row: &SaldeoRecordOverride,
 ) -> Result<()> {
-    let conn = open_db(db_path)?;
-    let _ = import_legacy_saldeo_record_overrides(&conn)?;
-    upsert_saldeo_record_override(&conn, override_row)
+    save_saldeo_record_overrides(db_path, std::slice::from_ref(override_row))
+}
+
+/// Replaces the whole stored override of the record (used by the manual correction,
+/// which computes the complete field set itself).
+fn replace_saldeo_record_override(
+    db_path: &Path,
+    override_row: &SaldeoRecordOverride,
+) -> Result<()> {
+    let conn = open_saldeo_overrides_db(db_path)?;
+    write_saldeo_record_override(&conn, override_row)
 }
 
 pub(crate) struct SaldeoRepairCandidate {
@@ -669,18 +909,40 @@ pub(crate) struct SaldeoRepairCandidate {
     pub(crate) changed_fields: Vec<String>,
 }
 
-pub(crate) fn saldeo_override_from_record(record: &InvoiceRecord) -> SaldeoRecordOverride {
-    SaldeoRecordOverride {
-        content_hash: record.content_hash.clone(),
-        invoice_number: record.invoice_number.clone(),
-        seller_tax_id: record.seller_tax_id.clone(),
-        buyer_tax_id: record.buyer_tax_id.clone(),
-        seller_name: record.seller_name.clone(),
-        buyer_name: record.buyer_name.clone(),
-        issue_date: record.issue_date,
-        gross_amount_minor: record.gross_amount_minor,
-        currency: record.currency.clone(),
+/// Field-level override holding only `fields` of `after`, each with the value `before`
+/// had (the Saldeo value the override was based on).
+pub(crate) fn saldeo_override_from_changes(
+    before: &InvoiceRecord,
+    after: &InvoiceRecord,
+    fields: &[&str],
+) -> SaldeoRecordOverride {
+    let mut out = SaldeoRecordOverride::empty(&before.content_hash);
+    let baseline = out.baseline.get_or_insert_with(Default::default);
+    macro_rules! take {
+        ($field:ident, $name:literal) => {
+            if fields.contains(&$name) && before.$field != after.$field {
+                out.$field = after.$field.clone();
+                baseline.$field = Some(SaldeoBaselineValue {
+                    saldeo: before.$field.clone(),
+                });
+            }
+        };
     }
+    saldeo_override_fields!(take);
+    out
+}
+
+/// Fields listed in the override marker of a record loaded with overrides applied.
+pub(crate) fn saldeo_override_applied_fields(record: &InvoiceRecord) -> Vec<String> {
+    record
+        .warnings
+        .iter()
+        .filter_map(|warning| warning.strip_prefix(SALDEO_OVERRIDE_WARNING_PREFIX))
+        .flat_map(|rest| rest.trim_start_matches(':').split(','))
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 pub(crate) fn saldeo_override_changed_fields(
@@ -733,13 +995,30 @@ pub(crate) fn repair_saldeo_items_from_report(
         if let Some(mail) = &row.mail {
             merge_missing_invoice_metadata(&mut saldeo, mail);
         }
-        let changed_fields = saldeo_override_changed_fields(&original, &saldeo);
+        // Fields already corrected locally (manual edit or earlier repair) are left alone,
+        // and a filename-like number is never written.
+        let already_overridden = saldeo_override_applied_fields(&original);
+        let changed_fields = saldeo_override_changed_fields(&original, &saldeo)
+            .into_iter()
+            .filter(|field| !already_overridden.iter().any(|done| done == field))
+            .filter(|field| {
+                *field != "invoice_number"
+                    || !saldeo
+                        .invoice_number
+                        .as_deref()
+                        .is_some_and(looks_like_filename_invoice_number)
+            })
+            .collect::<Vec<_>>();
         if changed_fields.is_empty() {
             continue;
         }
         items.push(SaldeoRepairCandidate {
-            invoice_number: saldeo.invoice_number.clone(),
-            override_row: saldeo_override_from_record(&saldeo),
+            invoice_number: if changed_fields.contains(&"invoice_number") {
+                saldeo.invoice_number.clone()
+            } else {
+                original.invoice_number.clone()
+            },
+            override_row: saldeo_override_from_changes(&original, &saldeo, &changed_fields),
             changed_fields: changed_fields.into_iter().map(str::to_string).collect(),
         });
     }
@@ -790,75 +1069,130 @@ pub(crate) fn saldeo_record_has_override(record: &InvoiceRecord) -> bool {
             .any(|warning| warning.starts_with(SALDEO_OVERRIDE_WARNING_PREFIX))
 }
 
+/// Applies stored overrides to freshly loaded Saldeo records. With a database, legacy
+/// snapshots are migrated to field-level overrides and fields whose Saldeo value moved
+/// away from the baseline are dropped; both are persisted.
 pub(crate) fn apply_saldeo_record_overrides(
     records: &mut [InvoiceRecord],
     db_path: Option<&Path>,
 ) -> Result<usize> {
-    let overrides = load_saldeo_record_overrides(db_path)?;
+    let conn = db_path.map(open_saldeo_overrides_db).transpose()?;
+    let mut overrides = match &conn {
+        Some(conn) => load_saldeo_record_overrides_from_db(conn)?,
+        None => load_saldeo_record_overrides_from_file()?,
+    };
     let mut applied = 0usize;
+    let mut updates = Vec::new();
     for record in records.iter_mut() {
         if record.source != SourceKind::Saldeo {
             continue;
         }
-        if let Some(override_row) = overrides.get(&record.content_hash)
-            && apply_saldeo_record_override(record, override_row)
-        {
+        let Some(stored) = overrides.get_mut(&record.content_hash) else {
+            continue;
+        };
+        let Some((changed, effective)) = resolve_saldeo_record_override(record, stored) else {
+            continue;
+        };
+        if !changed.is_empty() {
             applied += 1;
         }
+        if effective != *stored {
+            *stored = effective.clone();
+            updates.push(effective);
+        }
+    }
+    if let Some(conn) = &conn
+        && !updates.is_empty()
+    {
+        with_sqlite_transaction(conn, |conn| {
+            for update in &updates {
+                write_saldeo_record_override(conn, update)?;
+            }
+            Ok(())
+        })?;
     }
     Ok(applied)
 }
 
+/// Applies `override_row` to `record`; returns whether any field was overridden (the
+/// record then carries the `*` marker).
+#[cfg(test)]
 pub(crate) fn apply_saldeo_record_override(
     record: &mut InvoiceRecord,
     override_row: &SaldeoRecordOverride,
 ) -> bool {
-    if saldeo_record_has_override(record)
-        && record.invoice_number == override_row.invoice_number
-        && record.seller_tax_id == override_row.seller_tax_id
-        && record.buyer_tax_id == override_row.buyer_tax_id
-        && record.seller_name == override_row.seller_name
-        && record.buyer_name == override_row.buyer_name
-        && record.issue_date == override_row.issue_date
-        && record.gross_amount_minor == override_row.gross_amount_minor
-        && record.currency == override_row.currency
-    {
-        return false;
-    }
+    resolve_saldeo_record_override(record, override_row)
+        .is_some_and(|(changed, _)| !changed.is_empty())
+}
 
+/// Applies the fields of `override_row` whose baseline still equals Saldeo's current value.
+/// Returns the applied field names and the override as it should be stored from now on
+/// (legacy snapshot migrated, stale and no-op fields dropped). `None` when the record
+/// already went through overrides.
+fn resolve_saldeo_record_override(
+    record: &mut InvoiceRecord,
+    override_row: &SaldeoRecordOverride,
+) -> Option<(Vec<&'static str>, SaldeoRecordOverride)> {
+    if saldeo_record_has_override(record) {
+        return None;
+    }
+    let mut effective = override_row.with_baseline_from(record);
+    let baseline = effective.baseline.get_or_insert_with(Default::default);
     let mut changed_fields = Vec::new();
     macro_rules! set_field {
         ($field:ident, $name:literal) => {
-            if record.$field != override_row.$field {
-                changed_fields.push($name);
-                record.$field = override_row.$field.clone();
+            if let Some(seen) = &baseline.$field {
+                if record.$field == seen.saldeo && effective.$field != seen.saldeo {
+                    changed_fields.push($name);
+                    record.$field = effective.$field.clone();
+                } else {
+                    // Saldeo moved on (or the override is a no-op): Saldeo wins.
+                    baseline.$field = None;
+                    effective.$field = None;
+                }
             }
         };
     }
-    set_field!(invoice_number, "invoice_number");
-    set_field!(seller_tax_id, "seller_tax_id");
-    set_field!(buyer_tax_id, "buyer_tax_id");
-    set_field!(seller_name, "seller_name");
-    set_field!(buyer_name, "buyer_name");
-    set_field!(issue_date, "issue_date");
-    set_field!(gross_amount_minor, "gross_amount_minor");
-    set_field!(currency, "currency");
+    saldeo_override_fields!(set_field);
 
-    record
-        .warnings
-        .retain(|warning| !warning.starts_with(SALDEO_OVERRIDE_WARNING_PREFIX));
-    if changed_fields.is_empty() {
-        record
-            .warnings
-            .push(SALDEO_OVERRIDE_WARNING_PREFIX.to_string());
-    } else {
+    if !changed_fields.is_empty() {
         record.warnings.push(format!(
             "{}: {}",
             SALDEO_OVERRIDE_WARNING_PREFIX,
             changed_fields.join(",")
         ));
     }
-    true
+    Some((changed_fields, effective))
+}
+
+/// Override for a manual correction of `record` (as displayed, overrides applied):
+/// a field is overridden iff the requested value differs from Saldeo's own value, which
+/// is the stored baseline for fields currently overridden and the shown value otherwise.
+pub(crate) fn saldeo_override_from_edit(
+    record: &InvoiceRecord,
+    existing: Option<&SaldeoRecordOverride>,
+    requested: &SaldeoRecordOverride,
+) -> SaldeoRecordOverride {
+    let applied = saldeo_override_applied_fields(record);
+    let existing_baseline = existing.and_then(|existing| existing.baseline.as_ref());
+    let mut out = SaldeoRecordOverride::empty(&record.content_hash);
+    let baseline = out.baseline.get_or_insert_with(Default::default);
+    macro_rules! edit_field {
+        ($field:ident, $name:literal) => {
+            let saldeo_value = match existing_baseline.and_then(|b| b.$field.as_ref()) {
+                Some(seen) if applied.iter().any(|field| field == $name) => seen.saldeo.clone(),
+                _ => record.$field.clone(),
+            };
+            if requested.$field != saldeo_value {
+                out.$field = requested.$field.clone();
+                baseline.$field = Some(SaldeoBaselineValue {
+                    saldeo: saldeo_value,
+                });
+            }
+        };
+    }
+    saldeo_override_fields!(edit_field);
+    out
 }
 
 pub(crate) fn edit_saldeo_record_override(record: &InvoiceRecord, db_path: &Path) -> Result<bool> {
@@ -916,7 +1250,7 @@ pub(crate) fn edit_saldeo_record_override(record: &InvoiceRecord, db_path: &Path
     )?;
     let currency = prompt_string_value("Waluta", record.currency.as_deref(), normalize_currency)?;
 
-    let override_row = SaldeoRecordOverride {
+    let requested = SaldeoRecordOverride {
         content_hash: record.content_hash.clone(),
         invoice_number,
         seller_tax_id,
@@ -926,23 +1260,25 @@ pub(crate) fn edit_saldeo_record_override(record: &InvoiceRecord, db_path: &Path
         issue_date,
         gross_amount_minor,
         currency,
+        baseline: None,
     };
 
     let overrides = load_saldeo_record_overrides(Some(db_path))?;
-    if overrides.get(&override_row.content_hash) == Some(&override_row) {
-        eprintln!("⏭ Bez zmian.\n");
-        return Ok(false);
-    }
-    if overrides.get(&override_row.content_hash).is_none()
-        && override_row.invoice_number == record.invoice_number
-        && override_row.seller_tax_id == record.seller_tax_id
-        && override_row.buyer_tax_id == record.buyer_tax_id
-        && override_row.seller_name == record.seller_name
-        && override_row.buyer_name == record.buyer_name
-        && override_row.issue_date == record.issue_date
-        && override_row.gross_amount_minor == record.gross_amount_minor
-        && override_row.currency == record.currency
-    {
+    let existing = overrides.get(&record.content_hash);
+    let override_row = match existing {
+        // Not migrated yet (record was not loaded through the database): keep the legacy
+        // snapshot format; it is migrated on the next load.
+        Some(existing) if existing.is_legacy() => requested,
+        _ => saldeo_override_from_edit(record, existing, &requested),
+    };
+    let unchanged = match existing {
+        Some(existing) => *existing == override_row,
+        None => override_row
+            .baseline
+            .as_ref()
+            .is_some_and(SaldeoOverrideBaseline::is_empty),
+    };
+    if unchanged {
         eprintln!("⏭ Bez zmian.\n");
         return Ok(false);
     }
@@ -959,13 +1295,16 @@ pub(crate) fn edit_saldeo_record_override(record: &InvoiceRecord, db_path: &Path
         return Ok(false);
     }
 
-    save_saldeo_record_override(db_path, &override_row)?;
+    replace_saldeo_record_override(db_path, &override_row)?;
     eprintln!(
         "✓ Zapisano poprawki Saldeo w SQLite: {}\n",
         db_path.display()
     );
     Ok(true)
 }
+
+#[cfg(test)]
+mod override_tests;
 
 fn prompt_string_value(
     label: &str,

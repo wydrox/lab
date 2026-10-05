@@ -994,9 +994,13 @@ fn saldeo_repair_plan(
     let report = tri_reconcile(mail, ksef, saldeo, review_score);
     let items = repair_saldeo_items_from_report(&report);
     if confirm {
-        for item in &items {
-            save_saldeo_record_override(db_path, &item.override_row)?;
-        }
+        // Only the fields repair filled are stored, each with the Saldeo value it replaced,
+        // so a later change in Saldeo takes precedence over the repair.
+        let override_rows = items
+            .iter()
+            .map(|item| item.override_row.clone())
+            .collect::<Vec<_>>();
+        save_saldeo_record_overrides(db_path, &override_rows)?;
         eprintln!("  [LAB] zapisano {} poprawek Saldeo", items.len());
     }
     Ok(SaldeoRepairPlan {
@@ -1277,11 +1281,28 @@ fn source_from_db(value: &str) -> rusqlite::Result<SourceKind> {
     }
 }
 
+/// Runs `f` inside one IMMEDIATE transaction; any error rolls everything back.
+/// When the connection is already inside a transaction, `f` joins it instead.
+fn with_sqlite_transaction<T>(
+    conn: &Connection,
+    f: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    if !conn.is_autocommit() {
+        return f(conn);
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let value = f(&tx)?;
+    tx.commit()?;
+    Ok(value)
+}
+
 fn store_records(conn: &Connection, records: &[InvoiceRecord]) -> Result<Vec<i64>> {
-    records
-        .iter()
-        .map(|record| upsert_invoice(conn, record))
-        .collect()
+    with_sqlite_transaction(conn, |conn| {
+        records
+            .iter()
+            .map(|record| upsert_invoice(conn, record))
+            .collect()
+    })
 }
 
 fn upsert_invoice(conn: &Connection, record: &InvoiceRecord) -> Result<i64> {
@@ -1429,19 +1450,35 @@ fn store_tri_reconcile_report(
     year: i32,
     report: &TriReconcileReport,
 ) -> Result<TemporalDiffSummary> {
+    // Header and rows commit together: a failure leaves no partial run behind.
+    with_sqlite_transaction(conn, |conn| {
+        store_tri_reconcile_report_rows(conn, year, report)
+    })
+}
+
+fn store_tri_reconcile_report_rows(
+    conn: &Connection,
+    year: i32,
+    report: &TriReconcileReport,
+) -> Result<TemporalDiffSummary> {
+    use rusqlite::OptionalExtension;
     let previous_run_id: Option<i64> = conn
         .query_row(
             "SELECT id FROM tri_reconcile_runs WHERE year = ?1 ORDER BY id DESC LIMIT 1",
             params![year],
             |row| row.get(0),
         )
-        .ok();
+        .optional()?;
     let previous_rows = if let Some(run_id) = previous_run_id {
         load_tri_row_hashes(conn, run_id)?
     } else {
         HashMap::new()
     };
-    let current_rows = tri_row_hashes(report)?;
+    let entries = tri_row_entries(report)?;
+    let current_rows = entries
+        .iter()
+        .map(|entry| (entry.key.clone(), entry.hash.clone()))
+        .collect::<HashMap<_, _>>();
     let added_count = current_rows
         .keys()
         .filter(|key| !previous_rows.contains_key(*key))
@@ -1479,10 +1516,12 @@ fn store_tri_reconcile_report(
         ],
     )?;
     let run_id = conn.last_insert_rowid();
-    for row in &report.rows {
-        let row_key = tri_row_key(row);
-        let row_json = serde_json::to_string(row)?;
-        let row_hash = hex::encode(Sha256::digest(row_json.as_bytes()));
+    for (row, entry) in report.rows.iter().zip(entries) {
+        let TriRowEntry {
+            key: row_key,
+            hash: row_hash,
+            json: row_json,
+        } = entry;
         let primary = tri_row_display_record(row);
         let primary = primary.as_ref();
         conn.execute(
@@ -1528,16 +1567,107 @@ fn load_tri_row_hashes(conn: &Connection, run_id: i64) -> Result<HashMap<String,
     Ok(out)
 }
 
-fn tri_row_hashes(report: &TriReconcileReport) -> Result<HashMap<String, String>> {
-    let mut out = HashMap::new();
-    for row in &report.rows {
-        let json = serde_json::to_string(row)?;
-        out.insert(
-            tri_row_key(row),
-            hex::encode(Sha256::digest(json.as_bytes())),
-        );
+struct TriRowEntry {
+    key: String,
+    hash: String,
+    json: String,
+}
+
+/// Row keys unique within one report and stable across runs of the same data.
+/// Colliding base keys get the counterparty NIP, then the records' content hashes,
+/// and finally an ordinal ordered by row hash (so it does not depend on row order).
+fn tri_row_entries(report: &TriReconcileReport) -> Result<Vec<TriRowEntry>> {
+    let mut entries = report
+        .rows
+        .iter()
+        .map(|row| {
+            let json = serde_json::to_string(row)?;
+            Ok(TriRowEntry {
+                key: tri_row_key(row),
+                hash: hex::encode(Sha256::digest(json.as_bytes())),
+                json,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    disambiguate_tri_row_keys(&mut entries, |idx, _| {
+        tri_row_counterparty_suffix(&report.rows[idx])
+    });
+    disambiguate_tri_row_keys(&mut entries, |idx, key| {
+        if key.contains("|ids:") {
+            String::new()
+        } else {
+            tri_row_identity_suffix(&report.rows[idx])
+        }
+    });
+
+    let mut counts = HashMap::<String, usize>::new();
+    for entry in &entries {
+        *counts.entry(entry.key.clone()).or_default() += 1;
     }
-    Ok(out)
+    let mut order = (0..entries.len()).collect::<Vec<_>>();
+    order.sort_by(|&a, &b| {
+        entries[a]
+            .key
+            .cmp(&entries[b].key)
+            .then_with(|| entries[a].hash.cmp(&entries[b].hash))
+            .then(a.cmp(&b))
+    });
+    let mut ordinals = HashMap::<String, usize>::new();
+    for idx in order {
+        let key = entries[idx].key.clone();
+        if counts.get(&key).copied().unwrap_or(0) > 1 {
+            let ordinal = ordinals.entry(key.clone()).or_default();
+            entries[idx].key = format!("{key}|n:{ordinal}");
+            *ordinal += 1;
+        }
+    }
+    // A generated key could still equal another row's natural key; keep them apart.
+    let mut used = HashSet::new();
+    for entry in &mut entries {
+        while !used.insert(entry.key.clone()) {
+            entry.key.push('+');
+        }
+    }
+    Ok(entries)
+}
+
+fn disambiguate_tri_row_keys(entries: &mut [TriRowEntry], suffix: impl Fn(usize, &str) -> String) {
+    let mut counts = HashMap::<String, usize>::new();
+    for entry in entries.iter() {
+        *counts.entry(entry.key.clone()).or_default() += 1;
+    }
+    for (idx, entry) in entries.iter_mut().enumerate() {
+        if counts.get(&entry.key).copied().unwrap_or(0) > 1 {
+            let suffix = suffix(idx, &entry.key);
+            entry.key.push_str(&suffix);
+        }
+    }
+}
+
+fn tri_row_counterparty_suffix(row: &TriRow) -> String {
+    let Some(record) = tri_row_display_record(row) else {
+        return String::new();
+    };
+    let seller = record.seller_tax_id.unwrap_or_default();
+    let buyer = record.buyer_tax_id.unwrap_or_default();
+    if seller.is_empty() && buyer.is_empty() {
+        return String::new();
+    }
+    format!("|nip:{seller}/{buyer}")
+}
+
+fn tri_row_identity_suffix(row: &TriRow) -> String {
+    let hash = |record: Option<&InvoiceRecord>| {
+        record
+            .map(|record| record.content_hash.clone())
+            .unwrap_or_default()
+    };
+    format!(
+        "|ids:{}/{}/{}",
+        hash(row.mail.as_ref()),
+        hash(row.ksef.as_ref()),
+        hash(row.saldeo.as_ref())
+    )
 }
 
 fn tri_row_key(row: &TriRow) -> String {
@@ -1551,7 +1681,7 @@ fn tri_row_key(row: &TriRow) -> String {
     }
     let primary = tri_row_display_record(row);
     if let Some(record) = primary.as_ref() {
-        return format!(
+        let key = format!(
             "inv:{}|date:{}|gross:{}|cur:{}",
             record.invoice_number.clone().unwrap_or_default(),
             record.issue_date.map(|d| d.to_string()).unwrap_or_default(),
@@ -1561,9 +1691,18 @@ fn tri_row_key(row: &TriRow) -> String {
                 .unwrap_or_default(),
             record.currency.clone().unwrap_or_default()
         );
+        // Without an invoice number the fields above identify almost nothing,
+        // so the records themselves become part of the key.
+        if record.invoice_number.is_none() {
+            return format!("{key}{}", tri_row_identity_suffix(row));
+        }
+        return key;
     }
     "empty".to_string()
 }
+
+#[cfg(test)]
+mod tri_store_tests;
 
 fn handle_db_command(path: &Path, command: DbCommands) -> Result<()> {
     let conn = open_db(path)?;

@@ -815,6 +815,7 @@ fn saldeo_overrides_show_star_and_replace_fields() {
         issue_date: NaiveDate::from_ymd_opt(2026, 5, 1),
         gross_amount_minor: Some(12300),
         currency: Some("PLN".into()),
+        baseline: None,
     };
     assert!(apply_saldeo_record_override(&mut saldeo, &override_row));
     assert_eq!(saldeo.invoice_number.as_deref(), Some("FV/1/2026"));
@@ -895,6 +896,7 @@ fn saldeo_legacy_overrides_are_imported_into_sqlite() {
         issue_date: NaiveDate::from_ymd_opt(2026, 5, 2),
         gross_amount_minor: Some(12345),
         currency: Some("PLN".into()),
+        baseline: None,
     };
     std::fs::write(
         &legacy_path,
@@ -912,6 +914,7 @@ fn saldeo_legacy_overrides_are_imported_into_sqlite() {
         issue_date: NaiveDate::from_ymd_opt(2026, 5, 3),
         gross_amount_minor: Some(98765),
         currency: Some("EUR".into()),
+        baseline: None,
     };
 
     let _home_guard = HomeGuard(std::env::var_os("HOME"));
