@@ -3213,9 +3213,14 @@ fn score_pair(ksef: &InvoiceRecord, mail: &InvoiceRecord) -> (u8, Vec<String>) {
     let mut score: u16 = 0;
     let mut reasons = Vec::new();
 
-    if let (Some(a), Some(b)) = (&ksef.ksef_reference, &mail.ksef_reference)
-        && a == b
-    {
+    if let (Some(a), Some(b)) = (
+        normalized_ksef_reference(ksef),
+        normalized_ksef_reference(mail),
+    ) {
+        if a != b {
+            // Two different KSeF numbers are two different documents.
+            return (0, vec!["ksef_reference conflict".to_string()]);
+        }
         score += 100;
         reasons.push("ksef_reference exact".to_string());
     }
@@ -3223,13 +3228,13 @@ fn score_pair(ksef: &InvoiceRecord, mail: &InvoiceRecord) -> (u8, Vec<String>) {
     if let (Some(a), Some(b)) = (&ksef.invoice_number, &mail.invoice_number) {
         let comparable_a = comparable_invoice_number(a);
         let comparable_b = comparable_invoice_number(b);
-        if comparable_a == comparable_b {
+        if !comparable_a.is_empty() && comparable_a == comparable_b {
             score += 45;
             reasons.push("invoice_number exact".to_string());
-        } else if invoice_number_strong_contains(&comparable_a, &comparable_b) {
+        } else if invoice_number_strong_contains(a, b) {
             score += 45;
             reasons.push("invoice_number embedded exact".to_string());
-        } else if comparable_a.contains(&comparable_b) || comparable_b.contains(&comparable_a) {
+        } else if invoice_number_token_contains(a, b) {
             score += 25;
             reasons.push("invoice_number partial".to_string());
         }
@@ -3250,7 +3255,8 @@ fn score_pair(ksef: &InvoiceRecord, mail: &InvoiceRecord) -> (u8, Vec<String>) {
         }
     }
 
-    if let (Some(a), Some(b)) = (ksef.gross_amount_minor, mail.gross_amount_minor)
+    if !currencies_conflict(ksef, mail)
+        && let (Some(a), Some(b)) = (ksef.gross_amount_minor, mail.gross_amount_minor)
         && a != 0
         && b != 0
     {
@@ -3276,7 +3282,7 @@ fn score_pair(ksef: &InvoiceRecord, mail: &InvoiceRecord) -> (u8, Vec<String>) {
     }
 
     if let (Some(a), Some(b)) = (&ksef.currency, &mail.currency)
-        && a.eq_ignore_ascii_case(b)
+        && a.trim().eq_ignore_ascii_case(b.trim())
     {
         score += 5;
         reasons.push("currency match".to_string());
@@ -3297,12 +3303,16 @@ fn scoring_tax_ids(record: &InvoiceRecord) -> HashSet<String> {
     .collect()
 }
 
+/// Same invoice regardless of the score threshold: shared KSeF number, or the
+/// same invoice number with a shared counterparty NIP. When either side has no
+/// counterparty NIP, the number alone is not enough — the gross amount (±2 gr)
+/// must agree and currencies must not conflict.
 fn invoice_identity_match(left: &InvoiceRecord, right: &InvoiceRecord) -> bool {
-    if let (Some(left_ksef), Some(right_ksef)) = (&left.ksef_reference, &right.ksef_reference)
-        && !left_ksef.trim().is_empty()
-        && left_ksef == right_ksef
-    {
-        return true;
+    if let (Some(a), Some(b)) = (
+        normalized_ksef_reference(left),
+        normalized_ksef_reference(right),
+    ) {
+        return a == b;
     }
     let Some(left_number) = left
         .invoice_number
@@ -3325,7 +3335,16 @@ fn invoice_identity_match(left: &InvoiceRecord, right: &InvoiceRecord) -> bool {
     }
     let left_ids = scoring_tax_ids(left);
     let right_ids = scoring_tax_ids(right);
-    left_ids.is_empty() || right_ids.is_empty() || !left_ids.is_disjoint(&right_ids)
+    if !left_ids.is_empty() && !right_ids.is_empty() {
+        return !left_ids.is_disjoint(&right_ids);
+    }
+    if currencies_conflict(left, right) {
+        return false;
+    }
+    matches!(
+        (left.gross_amount_minor, right.gross_amount_minor),
+        (Some(a), Some(b)) if a != 0 && b != 0 && (a - b).abs() <= 2
+    )
 }
 
 fn comparable_invoice_number(value: &str) -> String {
@@ -3336,9 +3355,51 @@ fn comparable_invoice_number(value: &str) -> String {
         .collect()
 }
 
+/// Token-bounded containment of a long (>= 8 alphanumerics) invoice number.
 fn invoice_number_strong_contains(a: &str, b: &str) -> bool {
-    let min_len = a.len().min(b.len());
-    min_len >= 8 && (a.contains(b) || b.contains(a))
+    let min_len = comparable_invoice_number(a)
+        .len()
+        .min(comparable_invoice_number(b).len());
+    min_len >= 8 && invoice_number_token_contains(a, b)
+}
+
+/// Invoice number split on its original separators (`FV/12/2026` -> FV, 12, 2026).
+fn invoice_number_tokens(value: &str) -> Vec<String> {
+    value
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_uppercase)
+        .collect()
+}
+
+/// True when one number's tokens are a contiguous run of the other's tokens, so
+/// `FV/12/2026` is inside `FV/12/2026/A`, but `1/2026` is not inside `11/2026`.
+fn invoice_number_token_contains(a: &str, b: &str) -> bool {
+    let a = invoice_number_tokens(a);
+    let b = invoice_number_tokens(b);
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    !short.is_empty() && long.windows(short.len()).any(|run| run == short.as_slice())
+}
+
+fn normalized_ksef_reference(record: &InvoiceRecord) -> Option<String> {
+    record
+        .ksef_reference
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_uppercase)
+}
+
+fn currencies_conflict(left: &InvoiceRecord, right: &InvoiceRecord) -> bool {
+    let normalize = |record: &InvoiceRecord| {
+        record
+            .currency
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_uppercase)
+    };
+    matches!((normalize(left), normalize(right)), (Some(a), Some(b)) if a != b)
 }
 
 #[derive(Debug, Deserialize)]

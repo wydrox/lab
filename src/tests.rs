@@ -762,10 +762,13 @@ fn exact_invoice_number_matches_across_sources() {
     let mut mail = empty_record(SourceKind::Mail);
     mail.invoice_number = Some("PL6552160".into());
     mail.currency = Some("PLN".into());
+    // Without a counterparty NIP the number needs a matching gross amount (±2 gr).
+    mail.gross_amount_minor = Some(12300);
     let mut saldeo = empty_record(SourceKind::Saldeo);
     saldeo.invoice_number = Some("PL6552160".into());
     saldeo.ksef_reference = Some("8992520556-20260301-537139000008-F4".into());
     saldeo.currency = Some("PLN".into());
+    saldeo.gross_amount_minor = Some(12301);
     assert!(invoice_identity_match(&mail, &saldeo));
     let report = tri_reconcile(vec![mail], vec![], vec![saldeo], 70);
     assert_eq!(report.rows.len(), 1);
