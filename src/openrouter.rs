@@ -4,6 +4,43 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 const OPENROUTER_CHAT_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 pub(crate) const DEFAULT_OPENROUTER_MODEL: &str = "google/gemini-3.8-flash";
 
+/// A failure worth retrying on a later sync: timeout, network, HTTP 429/5xx, or
+/// a request that never left the machine.
+#[derive(Debug)]
+pub(crate) struct TransientLlmError(pub(crate) String);
+
+impl std::fmt::Display for TransientLlmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TransientLlmError {}
+
+pub(crate) fn transient_llm_error(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(TransientLlmError(message.into()))
+}
+
+pub(crate) fn http_status_is_transient(status: u16) -> bool {
+    status == 429 || (500..600).contains(&status)
+}
+
+pub(crate) fn llm_error_is_transient(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<TransientLlmError>().is_some()
+            || cause.downcast_ref::<reqwest::Error>().is_some_and(|err| {
+                err.is_timeout()
+                    || err.is_connect()
+                    || err.is_request()
+                    || err.is_body()
+                    || err.is_decode()
+                    || err
+                        .status()
+                        .is_some_and(|status| http_status_is_transient(status.as_u16()))
+            })
+    })
+}
+
 pub(crate) fn openrouter_configured() -> bool {
     secret_is_set(Secret::OpenRouterApiKey)
 }
@@ -154,11 +191,16 @@ pub(crate) fn openrouter_invoice_request(model: &str, filename: &str, pdf_base64
 }
 
 pub(crate) fn openrouter_response_json(response: &Value) -> Result<Value> {
-    if let Some(message) = response
-        .get("error")
-        .and_then(|error| error.get("message"))
-        .and_then(Value::as_str)
+    if let Some(error) = response.get("error")
+        && let Some(message) = error.get("message").and_then(Value::as_str)
     {
+        let code = error.get("code").and_then(|code| {
+            code.as_u64()
+                .or_else(|| code.as_str().and_then(|s| s.parse().ok()))
+        });
+        if code.is_some_and(|code| u16::try_from(code).is_ok_and(http_status_is_transient)) {
+            return Err(transient_llm_error(format!("OpenRouter: {message}")));
+        }
         return Err(anyhow!("OpenRouter: {message}"));
     }
     let choice = response
@@ -209,9 +251,14 @@ pub(crate) fn openrouter_extract_invoice_fields(
         .and_then(|name| name.to_str())
         .unwrap_or("invoice.pdf");
     let pdf_base64 = STANDARD.encode(&bytes);
-    let api_key = secret_value(Secret::OpenRouterApiKey)?.ok_or_else(|| {
-        anyhow!("brak OPENROUTER_API_KEY; ustaw klucz OpenRouter albo użyj lokalnego LLM")
-    })?;
+    // Nothing is sent without a key, so these failures must not block a later try.
+    let api_key = secret_value(Secret::OpenRouterApiKey)
+        .map_err(|err| transient_llm_error(format!("odczyt klucza OpenRouter: {err:#}")))?
+        .ok_or_else(|| {
+            transient_llm_error(
+                "brak OPENROUTER_API_KEY; ustaw klucz OpenRouter albo użyj lokalnego LLM",
+            )
+        })?;
     let model = openrouter_chat_model();
     let body = openrouter_invoice_request(&model, filename, &pdf_base64);
     let client = Client::builder().timeout(openrouter_timeout()).build()?;
@@ -243,7 +290,11 @@ pub(crate) fn openrouter_extract_invoice_fields(
             Ok(resp) => {
                 let status = resp.status();
                 let text = resp.text().unwrap_or_default();
-                return Err(anyhow!("OpenRouter HTTP {status}: {text}"));
+                let message = format!("OpenRouter HTTP {status}: {text}");
+                if http_status_is_transient(status.as_u16()) {
+                    return Err(transient_llm_error(message));
+                }
+                return Err(anyhow!(message));
             }
             Err(err) => {
                 last_err = Some(err);
@@ -253,7 +304,7 @@ pub(crate) fn openrouter_extract_invoice_fields(
     }
     Err(last_err
         .map(anyhow::Error::from)
-        .unwrap_or_else(|| anyhow!("OpenRouter nie odpowiedział po 4 próbach")))
+        .unwrap_or_else(|| transient_llm_error("OpenRouter nie odpowiedział po 4 próbach")))
 }
 
 #[cfg(test)]

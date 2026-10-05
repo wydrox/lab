@@ -185,7 +185,7 @@ fn productmesh_filter_normalizes_input_nip() {
 #[test]
 fn year_specific_defaults_use_selected_year() {
     assert!(default_gmail_query(2025).contains("after:2025/01/01"));
-    assert!(default_gmail_query(2025).contains("before:2026/01/01"));
+    assert!(default_gmail_query(2025).contains("before:2026/02/01"));
     assert!(
         default_mail_out_path(2025)
             .to_string_lossy()
@@ -209,7 +209,7 @@ fn amazon_gmail_query_targets_amazon_it_and_es() {
     assert!(query.contains("(from:amazon.it OR from:amazon.es)"));
     assert!(query.contains("has:attachment filename:pdf"));
     assert!(query.contains("after:2026/01/01"));
-    assert!(query.contains("before:2027/01/01"));
+    assert!(query.contains("before:2027/02/01"));
 }
 
 #[test]

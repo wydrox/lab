@@ -457,6 +457,7 @@ fn run_sync_sources_with_progress(
             );
         }
         let mut candidates = productmesh_invoice_candidates(&mail_records, productmesh_nip);
+        let mut other_year = retain_mail_candidates_for_year(&mut candidates, year);
         if let Some(progress) = &progress {
             set_progress(
                 progress,
@@ -478,11 +479,19 @@ fn run_sync_sources_with_progress(
                 ),
             );
         }
+        // The candidate file keeps LLM results for records the LLM dated into
+        // another year, so the next sync reuses them instead of asking again.
         write_records(
             &candidates,
             OutputFormat::Jsonl,
             Some(&mail_candidates_path),
         )?;
+        other_year += retain_mail_candidates_for_year(&mut candidates, year);
+        if other_year > 0 {
+            eprintln!(
+                "  [{mail_source_label}] pominięto {other_year} faktur z datą wystawienia spoza {year}"
+            );
+        }
         records_count += candidates.len();
         if let Some(progress) = &progress {
             set_progress(
@@ -564,6 +573,14 @@ fn run_sync_sources_with_progress(
         records_count,
         stored,
     })
+}
+
+// Year Y holds invoices issued in Y; mail from early Y+1 is fetched for late
+// invoices, so dated records from other years are dropped. Undated ones stay.
+fn retain_mail_candidates_for_year(candidates: &mut Vec<InvoiceRecord>, year: i32) -> usize {
+    let before = candidates.len();
+    candidates.retain(|record| record.issue_date.is_none_or(|date| date.year() == year));
+    before - candidates.len()
 }
 
 fn sync_reconcile_metadata(year: i32, ksef: bool, saldeo: bool, db_path: &Path) -> Result<()> {
@@ -967,7 +984,7 @@ fn saldeo_repair_plan(
             llm_enriched_count = enrich_repair_mail_with(
                 &mut mail,
                 confirm,
-                |candidates| enrich_candidates_with_gemma(candidates, &cached, None),
+                |candidates| enrich_candidates_with_llm_explicit(candidates, &cached, None),
                 |candidates| {
                     write_records(candidates, OutputFormat::Jsonl, Some(&mail_path))?;
                     let conn = open_db(db_path)?;
@@ -1873,13 +1890,13 @@ fn sync_mail_records_with_parser(
     mut parse: impl FnMut(&Path) -> Result<InvoiceRecord>,
 ) -> Result<(Vec<InvoiceRecord>, usize)> {
     let cache_path = mail_out.join("records.jsonl");
-    if !cache_path.exists() {
-        let records = scan_mail_input_with_parser(mail_out, &mut parse)?;
-        let parsed_count = records.len();
-        write_records(&records, OutputFormat::Jsonl, Some(&cache_path))?;
-        return Ok((records, parsed_count));
-    }
-    let mut records = load_records(SourceKind::Mail, &cache_path)?;
+    let cache_exists = cache_path.exists();
+    let files_on_disk = mail_candidate_files(mail_out)?;
+    let mut records = if cache_exists {
+        load_records(SourceKind::Mail, &cache_path)?
+    } else {
+        Vec::new()
+    };
     let mut parsed_count = 0usize;
     for record in &mut records {
         if record
@@ -1919,18 +1936,40 @@ fn sync_mail_records_with_parser(
         record.warnings.push(MAIL_PARSER_VERSION.to_string());
         parsed_count += 1;
     }
+    // Reconcile the folder with the cache: a run interrupted after saving an
+    // attachment leaves a file that only this scan can bring into records.jsonl.
     let mut seen = records
         .iter()
         .map(|record| record.content_hash.clone())
         .collect::<HashSet<_>>();
+    let known_paths = records
+        .iter()
+        .filter_map(|record| record.source_path.as_deref())
+        .filter_map(|path| fs::canonicalize(path).ok())
+        .collect::<HashSet<_>>();
     let mut paths = saved_files.iter().map(PathBuf::from).collect::<Vec<_>>();
+    paths.extend(files_on_disk);
     paths.sort();
     paths.dedup();
     for path in paths {
         if !path.is_file() || !is_mail_candidate_file(&path) {
             continue;
         }
-        let mut record = parse(&path)?;
+        if fs::canonicalize(&path).is_ok_and(|path| known_paths.contains(&path)) {
+            continue;
+        }
+        // Same bytes under another name (e.g. one PDF in two messages): skip the
+        // parse, which may run OCR, instead of repeating it on every sync.
+        if fs::read(&path).is_ok_and(|bytes| seen.contains(&hex::encode(Sha256::digest(&bytes)))) {
+            continue;
+        }
+        let mut record = match parse(&path) {
+            Ok(record) => record,
+            Err(err) => {
+                eprintln!("  [Gmail] pominięto {}: {err:#}", path.display());
+                continue;
+            }
+        };
         if !mail_parse_needs_retry(&record) {
             record.warnings.push(MAIL_PARSER_VERSION.to_string());
         }
@@ -1939,16 +1978,13 @@ fn sync_mail_records_with_parser(
             parsed_count += 1;
         }
     }
-    if parsed_count > 0 {
+    if parsed_count > 0 || !cache_exists {
         write_records(&records, OutputFormat::Jsonl, Some(&cache_path))?;
     }
     Ok((records, parsed_count))
 }
 
-fn scan_mail_input_with_parser(
-    input: &Path,
-    parse: &mut impl FnMut(&Path) -> Result<InvoiceRecord>,
-) -> Result<Vec<InvoiceRecord>> {
+fn mail_candidate_files(input: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     if input.is_dir() {
         for entry in WalkDir::new(input).into_iter().filter_map(Result::ok) {
@@ -1967,16 +2003,7 @@ fn scan_mail_input_with_parser(
     }
 
     files.sort();
-    files
-        .iter()
-        .map(|path| {
-            let mut record = parse(path)?;
-            if !mail_parse_needs_retry(&record) {
-                record.warnings.push(MAIL_PARSER_VERSION.to_string());
-            }
-            Ok(record)
-        })
-        .collect::<Result<Vec<_>>>()
+    Ok(files)
 }
 
 fn is_mail_candidate_file(path: &Path) -> bool {
@@ -3746,26 +3773,25 @@ fn gmail_fetch(
             .error_for_status()?
             .json()?;
 
-        let headers = gmail_headers(&msg);
-        fs::write(&metadata_path, serde_json::to_vec_pretty(&msg)?)?;
+        let stored = gmail_store_message(out_dir, id, &msg, &allowed_exts, |attachment_id| {
+            let attachment: Value = client
+                .get(format!(
+                    "https://gmail.googleapis.com/gmail/v1/users/{}/messages/{}/attachments/{}",
+                    user, id, attachment_id
+                ))
+                .bearer_auth(token)
+                .send()?
+                .error_for_status()?
+                .json()?;
+            Ok(attachment
+                .get("data")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()))
+        })?;
+        attachments_saved += stored.len();
+        saved_files.extend(stored);
         saved_files.push(metadata_path.display().to_string());
         metadata_saved += 1;
-
-        let before_parts = saved_files.len();
-        let mut part_index = 0usize;
-        collect_gmail_parts(
-            &client,
-            token,
-            user,
-            id,
-            &msg["payload"],
-            out_dir,
-            &allowed_exts,
-            &headers,
-            &mut part_index,
-            &mut saved_files,
-        )?;
-        attachments_saved += saved_files.len().saturating_sub(before_parts);
         if let Some(progress) = &progress {
             set_progress(
                 progress,
@@ -3790,28 +3816,94 @@ fn gmail_fetch(
     })
 }
 
+// The metadata file is written last, so it marks a complete message. Caches written
+// before that rule could hold metadata with only some attachments, so every
+// attachment the metadata describes must also be on disk.
 fn gmail_message_cached(out_dir: &Path, message_id: &str, allowed_exts: &HashSet<String>) -> bool {
-    let sanitized_id = sanitize_filename(message_id);
-    let metadata_path = out_dir.join(format!("{sanitized_id}_message.json"));
-    if !metadata_path.is_file() {
-        return false;
-    }
-    let Ok(entries) = fs::read_dir(out_dir) else {
+    let metadata_path = out_dir.join(format!("{}_message.json", sanitize_filename(message_id)));
+    let Ok(bytes) = fs::read(&metadata_path) else {
         return false;
     };
-    entries.filter_map(Result::ok).any(|entry| {
-        let path = entry.path();
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        file_name.starts_with(&format!("{sanitized_id}_")) && allowed_exts.contains(&ext)
-    })
+    let Ok(msg) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    gmail_attachment_plan(message_id, &msg["payload"], allowed_exts)
+        .iter()
+        .all(|part| out_dir.join(&part.file_name).is_file())
+}
+
+struct GmailAttachmentPart<'a> {
+    file_name: String,
+    ext: String,
+    body: &'a Value,
+}
+
+// Lists the parts gmail_fetch saves, with their on-disk names, in traversal order.
+fn gmail_attachment_plan<'a>(
+    message_id: &str,
+    payload: &'a Value,
+    allowed_exts: &HashSet<String>,
+) -> Vec<GmailAttachmentPart<'a>> {
+    let mut plan = Vec::new();
+    let mut part_index = 0usize;
+    collect_gmail_parts(
+        message_id,
+        payload,
+        allowed_exts,
+        &mut part_index,
+        &mut plan,
+    );
+    plan
+}
+
+// Writes each missing attachment atomically, then the message metadata, so an
+// interrupted run never leaves metadata that claims the message is complete.
+fn gmail_store_message(
+    out_dir: &Path,
+    message_id: &str,
+    msg: &Value,
+    allowed_exts: &HashSet<String>,
+    mut fetch_attachment: impl FnMut(&str) -> Result<Option<String>>,
+) -> Result<Vec<String>> {
+    let headers = gmail_headers(msg);
+    let mut saved_files = Vec::new();
+    for part in gmail_attachment_plan(message_id, &msg["payload"], allowed_exts) {
+        let path = out_dir.join(&part.file_name);
+        if path.exists() {
+            continue;
+        }
+        let data =
+            if let Some(attachment_id) = part.body.get("attachmentId").and_then(|v| v.as_str()) {
+                fetch_attachment(attachment_id)?
+            } else {
+                part.body
+                    .get("data")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            };
+        let Some(data) = data else {
+            continue;
+        };
+        let decoded = decode_gmail_base64(&data)?;
+        let bytes = if part.ext == "txt" && !headers.is_empty() {
+            let mut with_headers = String::new();
+            for key in ["message-id", "subject", "from", "date"] {
+                if let Some(value) = headers.get(key) {
+                    with_headers.push_str(&format!("{}: {}\n", canonical_header(key), value));
+                }
+            }
+            with_headers.push('\n');
+            with_headers.push_str(&String::from_utf8_lossy(&decoded));
+            with_headers.into_bytes()
+        } else {
+            decoded
+        };
+        write_private_file(&path, &bytes)?;
+        saved_files.push(path.display().to_string());
+    }
+    let metadata_path = out_dir.join(format!("{}_message.json", sanitize_filename(message_id)));
+    write_private_file(&metadata_path, &serde_json::to_vec_pretty(msg)?)?;
+    Ok(saved_files)
 }
 
 fn gmail_headers(msg: &Value) -> HashMap<String, String> {
@@ -3833,33 +3925,16 @@ fn gmail_headers(msg: &Value) -> HashMap<String, String> {
     headers
 }
 
-#[allow(clippy::too_many_arguments)]
-fn collect_gmail_parts(
-    client: &Client,
-    token: &str,
-    user: &str,
+fn collect_gmail_parts<'a>(
     message_id: &str,
-    part: &Value,
-    out_dir: &Path,
+    part: &'a Value,
     allowed_exts: &HashSet<String>,
-    headers: &HashMap<String, String>,
     part_index: &mut usize,
-    saved_files: &mut Vec<String>,
-) -> Result<()> {
+    plan: &mut Vec<GmailAttachmentPart<'a>>,
+) {
     if let Some(parts) = part.get("parts").and_then(|v| v.as_array()) {
         for child in parts {
-            collect_gmail_parts(
-                client,
-                token,
-                user,
-                message_id,
-                child,
-                out_dir,
-                allowed_exts,
-                headers,
-                part_index,
-                saved_files,
-            )?;
+            collect_gmail_parts(message_id, child, allowed_exts, part_index, plan);
         }
     }
 
@@ -3867,12 +3942,12 @@ fn collect_gmail_parts(
     let mime_type = part.get("mimeType").and_then(|v| v.as_str()).unwrap_or("");
     let body = &part["body"];
 
-    let mut save_name = if !filename.is_empty() {
+    let save_name = if !filename.is_empty() {
         filename.to_string()
     } else if mime_type == "text/plain" {
         format!("{}_body_{}.txt", message_id, *part_index)
     } else {
-        return Ok(());
+        return;
     };
     let ext = Path::new(&save_name)
         .extension()
@@ -3880,61 +3955,27 @@ fn collect_gmail_parts(
         .unwrap_or("")
         .to_ascii_lowercase();
     if !allowed_exts.contains(&ext) {
-        return Ok(());
+        return;
     }
 
+    // Numbering counts every allowed part, as earlier versions did, so cached
+    // file names stay stable.
     *part_index += 1;
-    save_name = format!(
-        "{}_{}_{}",
-        sanitize_filename(message_id),
-        *part_index,
-        sanitize_filename(&save_name)
-    );
-    let path = out_dir.join(save_name);
-    if path.exists() {
-        return Ok(());
+    if body.get("attachmentId").and_then(|v| v.as_str()).is_none()
+        && body.get("data").and_then(|v| v.as_str()).is_none()
+    {
+        return;
     }
-
-    let data = if let Some(attachment_id) = body.get("attachmentId").and_then(|v| v.as_str()) {
-        let attachment: Value = client
-            .get(format!(
-                "https://gmail.googleapis.com/gmail/v1/users/{}/messages/{}/attachments/{}",
-                user, message_id, attachment_id
-            ))
-            .bearer_auth(token)
-            .send()?
-            .error_for_status()?
-            .json()?;
-        attachment
-            .get("data")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    } else {
-        body.get("data")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    };
-
-    let Some(data) = data else {
-        return Ok(());
-    };
-    let decoded = decode_gmail_base64(&data)?;
-
-    if ext == "txt" && !headers.is_empty() {
-        let mut with_headers = String::new();
-        for key in ["message-id", "subject", "from", "date"] {
-            if let Some(value) = headers.get(key) {
-                with_headers.push_str(&format!("{}: {}\n", canonical_header(key), value));
-            }
-        }
-        with_headers.push('\n');
-        with_headers.push_str(&String::from_utf8_lossy(&decoded));
-        fs::write(&path, with_headers.as_bytes())?;
-    } else {
-        fs::write(&path, decoded)?;
-    }
-    saved_files.push(path.display().to_string());
-    Ok(())
+    plan.push(GmailAttachmentPart {
+        file_name: format!(
+            "{}_{}_{}",
+            sanitize_filename(message_id),
+            *part_index,
+            sanitize_filename(&save_name)
+        ),
+        ext,
+        body,
+    });
 }
 
 fn canonical_header(key: &str) -> &str {
@@ -3968,11 +4009,15 @@ fn sanitize_filename(value: &str) -> String {
     s.trim_matches('_').chars().take(180).collect()
 }
 
+// Year Y means invoices issued in Y. Invoices from late December are often
+// mailed in January, so the window runs to Feb 1 of Y+1; the sync then drops
+// candidates whose issue date falls in another year.
+fn gmail_year_window(year: i32) -> String {
+    format!("after:{year}/01/01 before:{}/02/01", year + 1)
+}
+
 fn default_gmail_query(year: i32) -> String {
-    format!(
-        "after:{year}/01/01 before:{}/01/01 has:attachment filename:pdf",
-        year + 1
-    )
+    format!("{} has:attachment filename:pdf", gmail_year_window(year))
 }
 
 fn default_mail_out_path(year: i32) -> PathBuf {
@@ -3989,8 +4034,8 @@ fn default_mail_candidates_path(year: i32) -> PathBuf {
 
 fn amazon_gmail_query(year: i32) -> String {
     format!(
-        "after:{year}/01/01 before:{}/01/01 (from:amazon.it OR from:amazon.es) has:attachment filename:pdf",
-        year + 1
+        "{} (from:amazon.it OR from:amazon.es) has:attachment filename:pdf",
+        gmail_year_window(year)
     )
 }
 
@@ -4135,21 +4180,58 @@ fn apply_cached_mail_candidates(
         return Ok(HashSet::new());
     }
     let cached = load_records(SourceKind::Mail, path)?;
+    // A verified LLM answer comes from the PDF itself, so it stays valid when the
+    // local parse is marked for retry (e.g. OCR not installed) or unversioned.
     let by_hash = cached
         .into_iter()
         .filter(|record| {
-            record
-                .warnings
-                .iter()
-                .any(|warning| warning == MAIL_PARSER_VERSION)
+            record_has_llm_result(record)
+                || record
+                    .warnings
+                    .iter()
+                    .any(|warning| warning == MAIL_PARSER_VERSION)
         })
         .map(|record| (record.content_hash.clone(), record))
         .collect::<HashMap<_, _>>();
     let mut cached_hashes = HashSet::new();
     for candidate in candidates {
         if let Some(cached) = by_hash.get(&candidate.content_hash) {
-            if mail_parse_needs_retry(cached) || !mail_cache_covers_fresh(cached, candidate) {
+            let llm_result = record_has_llm_result(cached);
+            if !llm_result && mail_parse_needs_retry(cached) {
                 continue;
+            }
+            // The LLM may have replaced inconsistent amounts or a number guessed
+            // from the file name; the fresh parse still has those values.
+            let replace_amounts = llm_result
+                && record_amounts_inconsistent(candidate)
+                && !record_amounts_inconsistent(cached)
+                && cached.gross_amount_minor.is_some();
+            let replace_number = llm_result
+                && record_number_guessed_from_filename(candidate)
+                && !record_number_guessed_from_filename(cached)
+                && cached.invoice_number.is_some();
+            let mut fresh = candidate.clone();
+            if replace_amounts {
+                fresh.net_amount_minor = None;
+                fresh.vat_amount_minor = None;
+                fresh.gross_amount_minor = None;
+            }
+            if replace_number {
+                fresh.invoice_number = None;
+            }
+            if !mail_cache_covers_fresh(cached, &fresh) {
+                continue;
+            }
+            if replace_amounts {
+                candidate.net_amount_minor = cached.net_amount_minor;
+                candidate.vat_amount_minor = cached.vat_amount_minor;
+                candidate.gross_amount_minor = cached.gross_amount_minor;
+            }
+            if replace_number {
+                candidate.invoice_number = cached.invoice_number.clone();
+                candidate
+                    .warnings
+                    .retain(|warning| !is_filename_number_warning(warning));
             }
             merge_mail_fields(candidate, cached);
             for warning in &cached.warnings {
@@ -4157,7 +4239,12 @@ fn apply_cached_mail_candidates(
                     candidate.warnings.push(warning.clone());
                 }
             }
-            if !record_missing_core_fields(cached) && !mail_parse_needs_retry(candidate) {
+            let complete = if llm_result {
+                !record_missing_core_fields(candidate)
+            } else {
+                !record_missing_core_fields(cached) && !mail_parse_needs_retry(candidate)
+            };
+            if complete {
                 cached_hashes.insert(candidate.content_hash.clone());
             }
         }
@@ -4165,12 +4252,220 @@ fn apply_cached_mail_candidates(
     Ok(cached_hashes)
 }
 
+const LLM_APPLIED_SUFFIX: &str = ": zastosowano zweryfikowane uzupełnienie";
+
+fn record_has_llm_result(record: &InvoiceRecord) -> bool {
+    record
+        .warnings
+        .iter()
+        .any(|warning| warning.starts_with("LLM ") && warning.ends_with(LLM_APPLIED_SUFFIX))
+}
+
+// The parser marks invoice numbers guessed from the file name with this warning
+// (FILENAME_NUMBER_WARNING in the parser region).
+fn is_filename_number_warning(warning: &str) -> bool {
+    warning == "numer faktury odczytany z nazwy pliku"
+}
+
+fn record_number_guessed_from_filename(record: &InvoiceRecord) -> bool {
+    record
+        .warnings
+        .iter()
+        .any(|warning| is_filename_number_warning(warning))
+}
+
+const LLM_ATTEMPTS_FILE: &str = "llm_attempts.jsonl";
+// Part of the attempt key: bump when the prompt, response schema or validation
+// rules change, so earlier answers no longer block a new attempt.
+const LLM_EXTRACTION_VERSION: &str = "lab-invoice-llm:v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LlmAttemptOutcome {
+    Applied,
+    Unchanged,
+    Rejected,
+    Transient,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct LlmAttempt {
+    content_hash: String,
+    model: String,
+    version: String,
+    outcome: LlmAttemptOutcome,
+    attempted_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+type LlmAttemptKey = (String, String, String);
+
+// Record of PDFs already sent to a model, stored next to the mail cache so the
+// automatic sync does not pay for the same file twice.
+struct LlmAttemptLedger {
+    path: PathBuf,
+    attempts: std::collections::BTreeMap<LlmAttemptKey, LlmAttempt>,
+}
+
+impl LlmAttemptLedger {
+    fn load(path: PathBuf) -> Result<Self> {
+        let mut attempts = std::collections::BTreeMap::new();
+        match fs::read_to_string(&path) {
+            Ok(text) => {
+                for line in text.lines().filter(|line| !line.trim().is_empty()) {
+                    // A damaged line only loses that entry; the rest still counts.
+                    if let Ok(attempt) = serde_json::from_str::<LlmAttempt>(line) {
+                        attempts.insert(llm_attempt_key(&attempt), attempt);
+                    }
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err).with_context(|| format!("odczyt {}", path.display())),
+        }
+        Ok(Self { path, attempts })
+    }
+
+    fn get(&self, content_hash: &str, model: &str) -> Option<&LlmAttempt> {
+        self.attempts.get(&(
+            content_hash.to_string(),
+            model.to_string(),
+            LLM_EXTRACTION_VERSION.to_string(),
+        ))
+    }
+
+    fn record(&mut self, attempt: LlmAttempt) -> Result<()> {
+        self.attempts.insert(llm_attempt_key(&attempt), attempt);
+        let mut out = Vec::new();
+        for attempt in self.attempts.values() {
+            serde_json::to_writer(&mut out, attempt)?;
+            out.push(b'\n');
+        }
+        write_private_file(&self.path, &out)
+    }
+}
+
+fn llm_attempt_key(attempt: &LlmAttempt) -> LlmAttemptKey {
+    (
+        attempt.content_hash.clone(),
+        attempt.model.clone(),
+        attempt.version.clone(),
+    )
+}
+
+#[derive(Default)]
+struct LlmAttemptLedgers {
+    by_path: HashMap<PathBuf, LlmAttemptLedger>,
+}
+
+impl LlmAttemptLedgers {
+    fn for_pdf(&mut self, pdf: &Path) -> Result<&mut LlmAttemptLedger> {
+        let dir = pdf
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let path = dir.join(LLM_ATTEMPTS_FILE);
+        if !self.by_path.contains_key(&path) {
+            let ledger = LlmAttemptLedger::load(path.clone())?;
+            self.by_path.insert(path.clone(), ledger);
+        }
+        Ok(self.by_path.get_mut(&path).expect("ledger loaded above"))
+    }
+}
+
+fn llm_attempt_hash(record: &InvoiceRecord, pdf: &Path) -> Option<String> {
+    if !record.content_hash.is_empty() {
+        return Some(record.content_hash.clone());
+    }
+    fs::read(pdf)
+        .ok()
+        .map(|bytes| hex::encode(Sha256::digest(&bytes)))
+}
+
+fn llm_attempt_outcome(result: &Result<bool>) -> LlmAttemptOutcome {
+    match result {
+        Ok(true) => LlmAttemptOutcome::Applied,
+        Ok(false) => LlmAttemptOutcome::Unchanged,
+        Err(err) if llm_error_is_transient(err) => LlmAttemptOutcome::Transient,
+        Err(_) => LlmAttemptOutcome::Rejected,
+    }
+}
+
+/// Who asked for LLM enrichment; decides which filters apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LlmRequest {
+    /// Sync or bulk run: paid-candidate filter and the attempt ledger apply.
+    Automatic,
+    /// `repair --llm`: paid-candidate filter applies, the ledger does not.
+    Explicit,
+    /// Rows selected in the TUI: neither filter applies.
+    Forced,
+}
+
+fn llm_queue(
+    records: &[InvoiceRecord],
+    skip_hashes: &HashSet<String>,
+    paid: bool,
+    request: LlmRequest,
+    model: &str,
+    ledgers: &mut LlmAttemptLedgers,
+) -> Result<Vec<usize>> {
+    let mut queue = Vec::new();
+    let mut already_sent = 0usize;
+    for (idx, record) in records.iter().enumerate() {
+        if !record_queued_for_llm(record, skip_hashes, paid, request == LlmRequest::Forced) {
+            continue;
+        }
+        let Some(path) = record.source_path.as_deref().map(Path::new) else {
+            continue;
+        };
+        if request == LlmRequest::Automatic
+            && let Some(hash) = llm_attempt_hash(record, path)
+            && ledgers
+                .for_pdf(path)?
+                .get(&hash, model)
+                .is_some_and(|attempt| attempt.outcome != LlmAttemptOutcome::Transient)
+        {
+            already_sent += 1;
+            continue;
+        }
+        queue.push(idx);
+    }
+    if already_sent > 0 {
+        eprintln!(
+            "  [Gmail/LLM] pominięto {already_sent} PDF już wysłanych do {model}; wybierz wiersze w TUI albo użyj repair --llm, żeby wysłać ponownie"
+        );
+    }
+    Ok(queue)
+}
+
 fn enrich_candidates_with_gemma(
     records: &mut [InvoiceRecord],
     skip_hashes: &HashSet<String>,
     progress: Option<Arc<Mutex<String>>>,
 ) -> Result<()> {
-    enrich_candidates_with_gemma_with_hook(records, skip_hashes, progress, false, |_, _| Ok(()))
+    enrich_candidates_with_request(
+        records,
+        skip_hashes,
+        progress,
+        LlmRequest::Automatic,
+        |_, _| Ok(()),
+    )
+}
+
+// `repair --llm`: the user asked for it, so earlier attempts do not block a resend.
+fn enrich_candidates_with_llm_explicit(
+    records: &mut [InvoiceRecord],
+    skip_hashes: &HashSet<String>,
+    progress: Option<Arc<Mutex<String>>>,
+) -> Result<()> {
+    enrich_candidates_with_request(
+        records,
+        skip_hashes,
+        progress,
+        LlmRequest::Explicit,
+        |_, _| Ok(()),
+    )
 }
 
 fn enrich_candidates_with_gemma_with_hook<F>(
@@ -4178,16 +4473,45 @@ fn enrich_candidates_with_gemma_with_hook<F>(
     skip_hashes: &HashSet<String>,
     progress: Option<Arc<Mutex<String>>>,
     force: bool,
+    after_record: F,
+) -> Result<()>
+where
+    F: FnMut(&[InvoiceRecord], usize) -> Result<()>,
+{
+    let request = if force {
+        LlmRequest::Forced
+    } else {
+        LlmRequest::Automatic
+    };
+    enrich_candidates_with_request(records, skip_hashes, progress, request, after_record)
+}
+
+fn enrich_candidates_with_request<F>(
+    records: &mut [InvoiceRecord],
+    skip_hashes: &HashSet<String>,
+    progress: Option<Arc<Mutex<String>>>,
+    request: LlmRequest,
     mut after_record: F,
 ) -> Result<()>
 where
     F: FnMut(&[InvoiceRecord], usize) -> Result<()>,
 {
     let use_openrouter = openrouter_configured();
-    let todo = records
-        .iter()
-        .filter(|record| record_queued_for_llm(record, skip_hashes, use_openrouter, force))
-        .count();
+    let force = request == LlmRequest::Forced;
+    let model = if use_openrouter {
+        openrouter_chat_model()
+    } else {
+        llm_model()
+    };
+    let mut ledgers = LlmAttemptLedgers::default();
+    let queue = llm_queue(
+        records,
+        skip_hashes,
+        use_openrouter,
+        request,
+        &model,
+        &mut ledgers,
+    )?;
     if use_openrouter && !force {
         let skipped = records
             .iter()
@@ -4202,14 +4526,9 @@ where
             );
         }
     }
-    if todo == 0 {
+    if queue.is_empty() {
         return Ok(());
     }
-    let model = if use_openrouter {
-        openrouter_chat_model()
-    } else {
-        llm_model()
-    };
     let extract: fn(&mut InvoiceRecord, &Path) -> Result<bool> = if use_openrouter {
         openrouter_extract_invoice_fields
     } else {
@@ -4217,7 +4536,8 @@ where
     };
     eprintln!(
         "  [Gmail/LLM] wzbogacanie {} kandydatów przez {}...",
-        todo, model
+        queue.len(),
+        model
     );
     if !use_openrouter && let Err(err) = ensure_ppmlx_server() {
         eprintln!("  [Gmail/LLM] pominięto wzbogacanie: {err}");
@@ -4234,34 +4554,58 @@ where
         }
         return Ok(());
     }
-    let mut processed = 0usize;
-    for idx in 0..records.len() {
-        if !record_queued_for_llm(&records[idx], skip_hashes, use_openrouter, force) {
-            continue;
-        }
+    run_llm_queue(
+        records,
+        &queue,
+        progress,
+        use_openrouter,
+        &model,
+        &mut ledgers,
+        extract,
+        after_record,
+    )?;
+    eprintln!("  [Gmail/LLM] gotowe");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_llm_queue<F>(
+    records: &mut [InvoiceRecord],
+    queue: &[usize],
+    progress: Option<Arc<Mutex<String>>>,
+    use_openrouter: bool,
+    model: &str,
+    ledgers: &mut LlmAttemptLedgers,
+    mut extract: impl FnMut(&mut InvoiceRecord, &Path) -> Result<bool>,
+    mut after_record: F,
+) -> Result<()>
+where
+    F: FnMut(&[InvoiceRecord], usize) -> Result<()>,
+{
+    let todo = queue.len();
+    for (processed, &idx) in queue.iter().enumerate() {
         let Some(source_path) = records[idx].source_path.clone() else {
             continue;
         };
         let path = Path::new(&source_path);
-        if path.extension().and_then(|e| e.to_str()) != Some("pdf") {
-            continue;
-        }
-        processed += 1;
         let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("PDF");
         let status = if use_openrouter {
-            openrouter_progress_line(processed, todo, fname)
+            openrouter_progress_line(processed + 1, todo, fname)
         } else {
-            format!("LLM: {}/{} {}", processed, todo, fname)
+            format!("LLM: {}/{} {}", processed + 1, todo, fname)
         };
         eprintln!("  [Gmail/LLM] {}", status);
         if let Some(ref p) = progress {
             set_progress(p, status);
         }
-        match extract(&mut records[idx], path) {
+        let hash = llm_attempt_hash(&records[idx], path);
+        let result = extract(&mut records[idx], path);
+        let outcome = llm_attempt_outcome(&result);
+        match &result {
             Ok(true) => {
-                records[idx].warnings.push(format!(
-                    "LLM {model}: zastosowano zweryfikowane uzupełnienie"
-                ));
+                records[idx]
+                    .warnings
+                    .push(format!("LLM {model}{LLM_APPLIED_SUFFIX}"));
             }
             Ok(false) => {}
             Err(err) => {
@@ -4272,9 +4616,29 @@ where
                 eprintln!("  [Gmail/LLM] odrzucono uzupełnienie: {err}");
             }
         }
+        if let Some(hash) = hash {
+            let attempt = LlmAttempt {
+                content_hash: hash,
+                model: model.to_string(),
+                version: LLM_EXTRACTION_VERSION.to_string(),
+                outcome,
+                attempted_at: Utc::now(),
+                detail: result
+                    .as_ref()
+                    .err()
+                    .map(|err| truncate(&format!("{err:#}"), 300)),
+            };
+            // A lost entry only costs one repeated request; do not drop the
+            // answer already received for this record.
+            if let Err(err) = ledgers
+                .for_pdf(path)
+                .and_then(|ledger| ledger.record(attempt))
+            {
+                eprintln!("  [Gmail/LLM] nie zapisano rejestru prób LLM: {err:#}");
+            }
+        }
         after_record(records, idx)?;
     }
-    eprintln!("  [Gmail/LLM] gotowe");
     Ok(())
 }
 
@@ -4403,11 +4767,12 @@ fn ppmlx_extract_json(prompt: &str) -> Result<Value> {
                 continue;
             }
             Ok(resp) => {
-                return Err(anyhow!(
-                    "ppmlx HTTP {}: {}",
-                    resp.status(),
-                    resp.text().unwrap_or_default()
-                ));
+                let status = resp.status();
+                let message = format!("ppmlx HTTP {}: {}", status, resp.text().unwrap_or_default());
+                if http_status_is_transient(status.as_u16()) {
+                    return Err(transient_llm_error(message));
+                }
+                return Err(anyhow!(message));
             }
             Err(err) => {
                 last_err = Some(err);
@@ -4417,7 +4782,7 @@ fn ppmlx_extract_json(prompt: &str) -> Result<Value> {
         }
     }
     Err(last_err.map(anyhow::Error::from).unwrap_or_else(|| {
-        anyhow!("ppmlx nie odpowiedział po 5 próbach (503 Service Unavailable)")
+        transient_llm_error("ppmlx nie odpowiedział po 5 próbach (503 Service Unavailable)")
     }))
 }
 
@@ -4593,10 +4958,47 @@ fn json_object_candidates(content: &str) -> Vec<&str> {
     candidates
 }
 
+// Fills empty fields only, with two exceptions: inconsistent amounts are replaced
+// by a complete, consistent triple, and a number guessed from the file name is
+// replaced by the one read from the document. Both leave a warning.
 fn apply_extracted_invoice_json(record: &mut InvoiceRecord, value: &Value) {
+    let llm_number =
+        json_first_string(value, &["invoice_number", "number"]).map(|v| clean_invoice_number(&v));
+    if record_number_guessed_from_filename(record)
+        && let Some(number) = llm_number.clone().filter(|number| !number.is_empty())
+    {
+        if record.invoice_number.as_deref() != Some(number.as_str()) {
+            record.warnings.push(format!(
+                "LLM: zastąpiono numer faktury odczytany z nazwy pliku ({})",
+                record.invoice_number.as_deref().unwrap_or("-")
+            ));
+            record.invoice_number = Some(number);
+        }
+        record
+            .warnings
+            .retain(|warning| !is_filename_number_warning(warning));
+    }
     if record.invoice_number.is_none() {
-        record.invoice_number = json_first_string(value, &["invoice_number", "number"])
-            .map(|v| clean_invoice_number(&v));
+        record.invoice_number = llm_number;
+    }
+    if record_amounts_inconsistent(record)
+        && let (Some(net), Some(vat), Some(gross)) = (
+            json_first_money_minor(value, &["net_amount", "amount_net"]),
+            json_first_money_minor(value, &["vat_amount", "amount_vat"]),
+            json_first_money_minor(value, &["gross_amount", "amount", "total"]),
+        )
+        && net.checked_add(vat) == Some(gross)
+    {
+        let old = |amount: Option<i64>| amount.map_or_else(|| "-".to_string(), format_minor_money);
+        record.warnings.push(format!(
+            "LLM: zastąpiono niespójne kwoty (netto {}, VAT {}, brutto {}) spójnym zestawem z dokumentu",
+            old(record.net_amount_minor),
+            old(record.vat_amount_minor),
+            old(record.gross_amount_minor)
+        ));
+        record.net_amount_minor = Some(net);
+        record.vat_amount_minor = Some(vat);
+        record.gross_amount_minor = Some(gross);
     }
     if record.issue_date.is_none() {
         record.issue_date =

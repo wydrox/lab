@@ -457,3 +457,247 @@ fn fresh_retry_warning_is_not_hidden_by_complete_cache() {
     );
     assert_eq!(serde_json::to_value(candidates).unwrap(), before);
 }
+
+fn gmail_message(id: &str, attachments: &[&str]) -> Value {
+    let parts = attachments
+        .iter()
+        .enumerate()
+        .map(|(idx, name)| {
+            serde_json::json!({
+                "filename": name,
+                "mimeType": "application/pdf",
+                "body": {"attachmentId": format!("att-{idx}")}
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "id": id,
+        "payload": {
+            "mimeType": "multipart/mixed",
+            "headers": [{"name": "Subject", "value": "Faktury"}],
+            "parts": parts
+        }
+    })
+}
+
+fn pdf_exts() -> HashSet<String> {
+    HashSet::from(["pdf".to_string()])
+}
+
+fn encoded(bytes: &[u8]) -> String {
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+#[test]
+fn interrupted_fetch_is_not_cached_and_next_sync_parses_orphaned_file() {
+    let dir = TempDir::new();
+    // An earlier sync already wrote records.jsonl.
+    save(&dir.join("records.jsonl"), &[]);
+    let msg = gmail_message("msg1", &["a.pdf", "b.pdf"]);
+    let metadata = dir.join("msg1_message.json");
+    let err = gmail_store_message(&dir.0, "msg1", &msg, &pdf_exts(), |id| match id {
+        "att-0" => Ok(Some(encoded(b"first invoice"))),
+        _ => Err(anyhow!("HTTP 503")),
+    })
+    .unwrap_err();
+    assert!(err.to_string().contains("503"));
+    assert!(dir.join("msg1_1_a.pdf").is_file());
+    assert!(!dir.join("msg1_2_b.pdf").exists());
+    assert!(
+        !metadata.exists(),
+        "metadata must not mark a partial message"
+    );
+    assert!(!gmail_message_cached(&dir.0, "msg1", &pdf_exts()));
+
+    // The next sync gets no saved files for the orphan but still parses it.
+    let (records, count) = sync_mail_records_with_parser(&dir.0, &[], fixture_parse).unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(
+        records[0].source_path.as_deref(),
+        Some(dir.join("msg1_1_a.pdf").display().to_string().as_str())
+    );
+
+    // Refetch downloads only the missing attachment, then writes the metadata.
+    let mut fetched = Vec::new();
+    let saved = gmail_store_message(&dir.0, "msg1", &msg, &pdf_exts(), |id| {
+        fetched.push(id.to_string());
+        Ok(Some(encoded(b"second invoice")))
+    })
+    .unwrap();
+    assert_eq!(fetched, vec!["att-1"]);
+    assert_eq!(saved, vec![dir.join("msg1_2_b.pdf").display().to_string()]);
+    assert!(gmail_message_cached(&dir.0, "msg1", &pdf_exts()));
+    let (records, count) = sync_mail_records_with_parser(&dir.0, &[], fixture_parse).unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(records.len(), 2);
+    assert_eq!(
+        sync_mail_records_with_parser(&dir.0, &[], |_| panic!("all files have records"))
+            .unwrap()
+            .1,
+        0
+    );
+}
+
+#[test]
+fn orphan_parse_error_does_not_abort_sync() {
+    let dir = TempDir::new();
+    save(&dir.join("records.jsonl"), &[]);
+    fs::write(dir.join("bad.pdf"), b"bad").unwrap();
+    fs::write(dir.join("good.pdf"), b"good").unwrap();
+    let (records, count) = sync_mail_records_with_parser(&dir.0, &[], |path| {
+        if path.ends_with("bad.pdf") {
+            Err(anyhow!("read failed"))
+        } else {
+            fixture_parse(path)
+        }
+    })
+    .unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(records.len(), 1);
+    // Same bytes under another name are not parsed again.
+    fs::write(dir.join("copy.pdf"), b"good").unwrap();
+    let (_, count) = sync_mail_records_with_parser(&dir.0, &[], |path| {
+        assert!(path.ends_with("bad.pdf"), "{}", path.display());
+        Err(anyhow!("still failing"))
+    })
+    .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn gmail_metadata_is_written_last_and_files_are_private() {
+    let dir = TempDir::new();
+    let msg = gmail_message("msg2", &["x.pdf", "y.pdf", "notes.docx"]);
+    let metadata = dir.join("msg2_message.json");
+    let saved = gmail_store_message(&dir.0, "msg2", &msg, &pdf_exts(), |_| {
+        assert!(!metadata.exists(), "metadata written before attachments");
+        Ok(Some(encoded(b"pdf")))
+    })
+    .unwrap();
+    assert_eq!(saved.len(), 2);
+    assert!(metadata.is_file());
+    let names = fs::read_dir(&dir.0)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        names,
+        HashSet::from([
+            "msg2_1_x.pdf".to_string(),
+            "msg2_2_y.pdf".to_string(),
+            "msg2_message.json".to_string()
+        ]),
+        "no temporary files left behind"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(dir.join("msg2_1_x.pdf"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+}
+
+#[test]
+fn legacy_metadata_with_missing_attachment_is_refetched() {
+    let dir = TempDir::new();
+    let msg = gmail_message("msg3", &["a.pdf", "b.pdf"]);
+    // Old layout: metadata first, then the run died after one attachment.
+    fs::write(
+        dir.join("msg3_message.json"),
+        serde_json::to_vec(&msg).unwrap(),
+    )
+    .unwrap();
+    fs::write(dir.join("msg3_1_a.pdf"), b"first").unwrap();
+    assert!(!gmail_message_cached(&dir.0, "msg3", &pdf_exts()));
+    fs::write(dir.join("msg3_2_b.pdf"), b"second").unwrap();
+    assert!(gmail_message_cached(&dir.0, "msg3", &pdf_exts()));
+    fs::write(dir.join("msg3_message.json"), b"{truncated").unwrap();
+    assert!(!gmail_message_cached(&dir.0, "msg3", &pdf_exts()));
+}
+
+#[test]
+fn year_query_covers_january_of_next_year() {
+    for query in [default_gmail_query(2025), amazon_gmail_query(2025)] {
+        assert!(query.contains("after:2025/01/01"), "{query}");
+        assert!(query.contains("before:2026/02/01"), "{query}");
+        assert!(!query.contains("before:2026/01/01"), "{query}");
+        assert!(query.contains("has:attachment filename:pdf"), "{query}");
+    }
+}
+
+#[test]
+fn other_year_candidates_are_dropped_and_undated_kept() {
+    let dated = |hash: &str, date: Option<NaiveDate>| {
+        let mut record = complete_record(hash);
+        record.issue_date = date;
+        record
+    };
+    let mut candidates = vec![
+        dated("dec-prev", NaiveDate::from_ymd_opt(2024, 12, 30)),
+        dated("this-year", NaiveDate::from_ymd_opt(2025, 12, 30)),
+        dated("next-year", NaiveDate::from_ymd_opt(2026, 1, 3)),
+        dated("undated", None),
+    ];
+    assert_eq!(retain_mail_candidates_for_year(&mut candidates, 2025), 2);
+    let kept = candidates
+        .iter()
+        .map(|record| record.content_hash.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(kept, vec!["this-year", "undated"]);
+}
+
+#[test]
+fn llm_result_is_reused_when_ocr_is_unavailable() {
+    let dir = TempDir::new();
+    let path = dir.join("candidates.jsonl");
+    let ocr_warning = "OCR niedostępny; pozostawiono tekst Poppler: brak modelu";
+    // The parse needed a retry, so the record never got the parser version marker.
+    let mut cached = complete_record("hash");
+    cached.warnings = vec![
+        ocr_warning.into(),
+        "LLM google/gemini-3.8-flash: zastosowano zweryfikowane uzupełnienie".into(),
+    ];
+    save(&path, &[cached]);
+    let mut fresh = empty_record(SourceKind::Mail);
+    fresh.content_hash = "hash".into();
+    fresh.warnings.push(ocr_warning.into());
+    let mut candidates = vec![fresh];
+    let skip = apply_cached_mail_candidates(&path, &mut candidates).unwrap();
+    assert!(skip.contains("hash"));
+    assert_eq!(candidates[0].invoice_number.as_deref(), Some("TEST/2026/1"));
+    assert!(!record_missing_core_fields(&candidates[0]));
+}
+
+#[test]
+fn llm_corrections_in_cache_replace_inconsistent_amounts_and_filename_number() {
+    let dir = TempDir::new();
+    let path = dir.join("candidates.jsonl");
+    let mut cached = versioned(complete_record("hash"));
+    cached.invoice_number = Some("FV/7/2026".into());
+    cached.net_amount_minor = Some(10000);
+    cached.vat_amount_minor = Some(2300);
+    cached
+        .warnings
+        .push("LLM model: zastosowano zweryfikowane uzupełnienie".into());
+    save(&path, &[cached]);
+    let mut fresh = versioned(complete_record("hash"));
+    fresh.invoice_number = Some("scan_0001".into());
+    fresh
+        .warnings
+        .push("numer faktury odczytany z nazwy pliku".into());
+    fresh.net_amount_minor = Some(956700);
+    fresh.vat_amount_minor = Some(2300);
+    assert!(record_amounts_inconsistent(&fresh));
+    let mut candidates = vec![fresh];
+    let skip = apply_cached_mail_candidates(&path, &mut candidates).unwrap();
+    assert!(skip.contains("hash"));
+    let record = &candidates[0];
+    assert_eq!(record.invoice_number.as_deref(), Some("FV/7/2026"));
+    assert_eq!(record.net_amount_minor, Some(10000));
+    assert_eq!(record.gross_amount_minor, Some(12300));
+    assert!(!record_amounts_inconsistent(record));
+    assert!(!record_number_guessed_from_filename(record));
+}
