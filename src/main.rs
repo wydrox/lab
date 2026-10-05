@@ -2039,6 +2039,9 @@ fn parse_file(source: SourceKind, path: &Path) -> Result<InvoiceRecord> {
     record.warnings.extend(warnings);
     if record.invoice_number.is_none() && !record_is_password_protected(&record) {
         record.invoice_number = invoice_number_from_filename(path);
+        if record.invoice_number.is_some() {
+            record.warnings.push(FILENAME_NUMBER_WARNING.to_string());
+        }
     }
     Ok(record)
 }
@@ -2112,6 +2115,7 @@ fn record_missing_hard_fields(record: &InvoiceRecord) -> bool {
             .invoice_number
             .as_deref()
             .is_none_or(|number| !is_valid_invoice_number_candidate(number))
+        || record_number_from_filename(record)
         || record.issue_date.is_none()
         || record.gross_amount_minor.is_none()
 }
@@ -2142,7 +2146,7 @@ fn record_queued_for_llm(
     if paid && !force {
         record_needs_paid_llm(record)
     } else {
-        record_missing_core_fields(record)
+        record_missing_core_fields(record) || record_number_from_filename(record)
     }
 }
 
@@ -2157,14 +2161,17 @@ fn json_first_string(value: &Value, keys: &[&str]) -> Option<String> {
 }
 
 fn json_first_money_minor(value: &Value, keys: &[&str]) -> Option<i64> {
-    keys.iter().find_map(|key| {
-        let raw = value.get(*key)?;
-        match raw {
-            Value::Number(n) => parse_money_minor(&n.to_string()),
-            Value::String(s) => parse_money_minor(s),
-            _ => None,
-        }
-    })
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(json_money_minor))
+}
+
+// Liczba JSON ma zawsze kropkę dziesiętną; tekst może mieć zapis lokalny.
+fn json_money_minor(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(n) => parse_decimal_minor(&n.to_string()),
+        Value::String(s) => parse_money_minor(s),
+        _ => None,
+    }
 }
 
 fn empty_record(source: SourceKind) -> InvoiceRecord {
@@ -2222,13 +2229,15 @@ fn parse_xml_invoice(source: SourceKind, text: &str) -> InvoiceRecord {
             "totalGross",
         ],
     )
-    .and_then(|v| parse_money_minor(&v));
-    record.net_amount_minor =
-        first_xml_text(text, &["P_13_1", "NetAmount", "netAmount", "totalNet"])
-            .and_then(|v| parse_money_minor(&v));
-    record.vat_amount_minor =
-        first_xml_text(text, &["P_14_1", "VatAmount", "vatAmount", "totalVat"])
-            .and_then(|v| parse_money_minor(&v));
+    .and_then(|v| xml_money_minor(&v));
+    record.net_amount_minor = xml_rate_amounts_minor(text, "P_13").or_else(|| {
+        first_xml_text(text, &["NetAmount", "netAmount", "totalNet"])
+            .and_then(|v| xml_money_minor(&v))
+    });
+    record.vat_amount_minor = xml_rate_amounts_minor(text, "P_14").or_else(|| {
+        first_xml_text(text, &["VatAmount", "vatAmount", "totalVat"])
+            .and_then(|v| xml_money_minor(&v))
+    });
     record.currency = first_xml_text(text, &["KodWaluty", "Currency", "currency"])
         .and_then(|v| normalize_currency(&v));
     record.ksef_reference = first_xml_text(
@@ -2263,15 +2272,50 @@ fn parse_xml_invoice(source: SourceKind, text: &str) -> InvoiceRecord {
     record
 }
 
+// Element kwoty w XML: kropka dziesiętna; zapis lokalny tylko jako zapas.
+fn xml_money_minor(value: &str) -> Option<i64> {
+    parse_decimal_minor(value).or_else(|| parse_money_minor(value))
+}
+
+// Suma pól FA dla wszystkich stawek (P_13_1, P_13_2, P_13_6_1, ...). Warianty
+// `W` (np. P_14_1W) to ten sam VAT przeliczony na PLN, więc ich nie dodajemy.
+fn xml_rate_amounts_minor(text: &str, prefix: &str) -> Option<i64> {
+    let re = Regex::new(&format!(
+        r"<(?:[A-Za-z0-9_\-]+:)?({}_[0-9]+(?:_[0-9]+)*)(?:\s[^>]*)?>",
+        regex::escape(prefix)
+    ))
+    .unwrap();
+    let mut names: Vec<&str> = Vec::new();
+    for caps in re.captures_iter(text) {
+        let name = caps.get(1).map_or("", |m| m.as_str());
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    let mut total: Option<i64> = None;
+    for name in names {
+        // first_xml_text zwraca pierwsze trafienie z listy, więc pytamy o każde pole osobno.
+        if let Some(amount) = first_xml_text(text, &[name]).and_then(|v| xml_money_minor(&v)) {
+            total = Some(total.unwrap_or(0).checked_add(amount)?);
+        }
+    }
+    total
+}
+
 fn parse_json_invoice(source: SourceKind, text: &str) -> Result<InvoiceRecord> {
     let value: Value = serde_json::from_str(text)?;
     let mut flat = HashMap::new();
     flatten_json("", &value, &mut flat);
+    let raw = |keys: &[&str]| keys.iter().find_map(|k| flat.get(&normalize_key(k)));
     let get = |keys: &[&str]| -> Option<String> {
-        keys.iter()
-            .find_map(|k| flat.get(&normalize_key(k)).cloned())
+        raw(keys)
+            .map(|v| match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
             .filter(|v| !v.trim().is_empty())
     };
+    let money = |keys: &[&str]| raw(keys).and_then(json_money_minor);
 
     let mut record = empty_record(source);
     record.invoice_number = get(&[
@@ -2311,18 +2355,15 @@ fn parse_json_invoice(source: SourceKind, text: &str) -> Result<InvoiceRecord> {
         "nabywca.nazwa",
     ])
     .and_then(|v| clean_name(&v));
-    record.gross_amount_minor = get(&[
+    record.gross_amount_minor = money(&[
         "gross_amount",
         "grossAmount",
         "totalGross",
         "kwotaBrutto",
         "p_15",
-    ])
-    .and_then(|v| parse_money_minor(&v));
-    record.net_amount_minor =
-        get(&["net_amount", "netAmount", "totalNet", "p_13_1"]).and_then(|v| parse_money_minor(&v));
-    record.vat_amount_minor =
-        get(&["vat_amount", "vatAmount", "totalVat", "p_14_1"]).and_then(|v| parse_money_minor(&v));
+    ]);
+    record.net_amount_minor = money(&["net_amount", "netAmount", "totalNet", "p_13_1"]);
+    record.vat_amount_minor = money(&["vat_amount", "vatAmount", "totalVat", "p_14_1"]);
     record.currency = get(&["currency", "kodWaluty"]).and_then(|v| normalize_currency(&v));
     record.ksef_reference = get(&["ksef_reference", "nrKSeF", "ksefNumber", "referenceNumber"]);
     record.email_message_id = get(&["email_message_id", "messageId", "id"]);
@@ -2341,7 +2382,7 @@ fn parse_json_invoice(source: SourceKind, text: &str) -> Result<InvoiceRecord> {
     Ok(record)
 }
 
-fn flatten_json(prefix: &str, value: &Value, out: &mut HashMap<String, String>) {
+fn flatten_json(prefix: &str, value: &Value, out: &mut HashMap<String, Value>) {
     match value {
         Value::Object(map) => {
             for (key, value) in map {
@@ -2359,11 +2400,9 @@ fn flatten_json(prefix: &str, value: &Value, out: &mut HashMap<String, String>) 
             }
         }
         Value::Null => {}
-        Value::String(s) => {
-            out.insert(normalize_key(prefix), s.clone());
-        }
+        // Typ zostaje: liczba JSON i napis z kwotą parsują się inaczej.
         other => {
-            out.insert(normalize_key(prefix), other.to_string());
+            out.insert(normalize_key(prefix), other.clone());
         }
     }
 }
@@ -2552,8 +2591,22 @@ fn is_valid_invoice_number_candidate(value: &str) -> bool {
     )
 }
 
+pub(crate) const FILENAME_NUMBER_WARNING: &str = "numer faktury odczytany z nazwy pliku";
+
+fn record_number_from_filename(record: &InvoiceRecord) -> bool {
+    record
+        .warnings
+        .iter()
+        .any(|warning| warning == FILENAME_NUMBER_WARNING)
+}
+
 fn invoice_number_from_filename(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
+    // Załączniki z Gmaila mają nazwę `{id wiadomości}_{n}_{oryginał}`; id to nie numer faktury.
+    let stem = Regex::new(r"^[0-9A-Fa-f]{12,}_[0-9]+_")
+        .unwrap()
+        .find(stem)
+        .map_or(stem, |prefix| &stem[prefix.end()..]);
     for pattern in [
         r"(?i)Invoice-([A-Z0-9\-]+)",
         r"(?i)Faktura[_\-]([A-Z0-9/\-]+)",
@@ -2915,53 +2968,101 @@ fn is_probable_name_line(line: &str) -> bool {
 #[cfg(test)]
 mod parser_names_tests;
 
+// Format maszynowy (liczba JSON, kwota w XML): kropka zawsze dziesiętna,
+// dowolna liczba miejsc po przecinku, zaokrąglenie do groszy (połówki od zera).
+fn parse_decimal_minor(value: &str) -> Option<i64> {
+    let value = value.trim();
+    let (negative, unsigned) = match value.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, value.strip_prefix('+').unwrap_or(value)),
+    };
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i32>().ok()?),
+        None => (unsigned, 0),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if (int_part.is_empty() && frac_part.is_empty())
+        || !int_part
+            .bytes()
+            .chain(frac_part.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let digits = format!("{int_part}{frac_part}");
+    // Liczba cyfr przed przecinkiem po przeliczeniu na grosze.
+    let point = int_part.len() as i64 + i64::from(exponent) + 2;
+    if point < 0 {
+        return Some(0);
+    }
+    let point = point.min(64) as usize;
+    let mut kept: String = digits.chars().take(point).collect();
+    kept.push_str(&"0".repeat(point.saturating_sub(digits.len())));
+    let round_up = digits.as_bytes().get(point).is_some_and(|d| *d >= b'5');
+    let kept = kept.trim_start_matches('0');
+    if kept.len() > 20 {
+        return None;
+    }
+    let mut minor: i128 = if kept.is_empty() {
+        0
+    } else {
+        kept.parse().ok()?
+    };
+    if round_up {
+        minor += 1;
+    }
+    i64::try_from(if negative { -minor } else { minor }).ok()
+}
+
+// Kwota z tekstu: `1.234,56`, `1,234.56`, `1 234,56`, `1234,5`, `0.5`.
+// Pojedynczy separator z dokładnie trzema cyframi (`1.234`, `1,234`) to separator tysięcy.
 fn parse_money_minor(value: &str) -> Option<i64> {
-    let mut s: String = value
+    let s: String = value
         .chars()
         .filter(|c| c.is_ascii_digit() || *c == ',' || *c == '.' || *c == '-')
         .collect();
-    if s.is_empty() || s == "-" {
+    let (negative, body) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.as_str()),
+    };
+    if body.contains('-') || !body.bytes().any(|b| b.is_ascii_digit()) {
         return None;
     }
-    let last_comma = s.rfind(',');
-    let last_dot = s.rfind('.');
-    let decimal_pos = match (last_comma, last_dot) {
-        (Some(c), Some(d)) => Some(c.max(d)),
-        (Some(c), None) => Some(c),
-        (None, Some(d)) => {
-            if s.len().saturating_sub(d + 1) == 2 {
-                Some(d)
-            } else {
-                None
+    let decimal = match (body.rfind(','), body.rfind('.')) {
+        (Some(comma), Some(dot)) => {
+            let decimal = if comma > dot { ',' } else { '.' };
+            if body.matches(decimal).count() != 1 {
+                return None;
             }
+            Some(decimal)
         }
+        (Some(_), None) => single_kind_decimal_separator(body, ',')?,
+        (None, Some(_)) => single_kind_decimal_separator(body, '.')?,
         (None, None) => None,
     };
+    let normalized = match decimal.and_then(|sep| body.rsplit_once(sep)) {
+        Some((int_part, frac_part)) => {
+            let int_part: String = int_part.chars().filter(char::is_ascii_digit).collect();
+            format!("{int_part}.{frac_part}")
+        }
+        None => body.chars().filter(char::is_ascii_digit).collect(),
+    };
+    let sign = if negative { "-" } else { "" };
+    parse_decimal_minor(&format!("{sign}{normalized}"))
+}
 
-    if let Some(pos) = decimal_pos {
-        let int_part: String = s[..pos]
-            .chars()
-            .filter(|c| c.is_ascii_digit() || *c == '-')
-            .collect();
-        let frac_part: String = s[pos + 1..]
-            .chars()
-            .filter(|c| c.is_ascii_digit())
-            .take(2)
-            .collect();
-        let sign = if int_part.starts_with('-') { -1 } else { 1 };
-        let units: i64 = int_part.replace('-', "").parse().ok()?;
-        let cents: i64 = match frac_part.len() {
-            0 => 0,
-            1 => frac_part.parse::<i64>().ok()? * 10,
-            _ => frac_part.parse::<i64>().ok()?,
-        };
-        units
-            .checked_mul(sign)?
-            .checked_mul(100)?
-            .checked_add(sign * cents)
-    } else {
-        s.retain(|c| c.is_ascii_digit() || c == '-');
-        s.parse::<i64>().ok().and_then(|v| v.checked_mul(100))
+// Tylko jeden rodzaj separatora: Some(Some(sep)) dziesiętny, Some(None) same
+// grupy tysięcy, None gdy zapis nie jest poprawną kwotą (np. `1.2.3`).
+fn single_kind_decimal_separator(body: &str, sep: char) -> Option<Option<char>> {
+    let groups: Vec<&str> = body.split(sep).collect();
+    let thousands = groups[0].len() <= 3
+        && !groups[0].is_empty()
+        && !groups[0].starts_with('0')
+        && groups[1..].iter().all(|group| group.len() == 3);
+    match groups.len() {
+        2 if !thousands => Some(Some(sep)),
+        _ if thousands => Some(None),
+        _ => None,
     }
 }
 
@@ -4019,7 +4120,7 @@ fn productmesh_invoice_candidates(
     let productmesh_nip =
         normalize_tax_id(productmesh_nip).unwrap_or_else(|| productmesh_nip.to_string());
     let excluded = Regex::new(r"(?i)(receipt|statement|regulamin|warunki|informacje|upowa|oferta|umowa|order|label|bilet|dr_skan|wypowiedzenie|grafklient|cennik|polityka|pasek|wishlist|terms|portfolio|kosztorys|formularz|prawo_jazdy|zalacznik)").unwrap();
-    let mut by_invoice: HashMap<String, InvoiceRecord> = HashMap::new();
+    let mut by_invoice: HashMap<String, Vec<InvoiceRecord>> = HashMap::new();
     let mut fallback_seen = HashSet::new();
     let mut fallback_out = Vec::new();
     for record in records {
@@ -4049,12 +4150,15 @@ fn productmesh_invoice_candidates(
         if let Some(invoice_number) = &record.invoice_number {
             let key = comparable_invoice_number(invoice_number);
             if !key.is_empty() {
-                match by_invoice.get(&key) {
+                let group = by_invoice.entry(key).or_default();
+                match group
+                    .iter_mut()
+                    .find(|existing| same_mail_invoice(existing, record, &productmesh_nip))
+                {
                     Some(existing)
                         if record_quality_score(existing) >= record_quality_score(record) => {}
-                    _ => {
-                        by_invoice.insert(key, record.clone());
-                    }
+                    Some(existing) => *existing = record.clone(),
+                    None => group.push(record.clone()),
                 }
                 continue;
             }
@@ -4073,15 +4177,36 @@ fn productmesh_invoice_candidates(
             fallback_out.push(record.clone());
         }
     }
-    let mut out = by_invoice.into_values().collect::<Vec<_>>();
+    let mut out = by_invoice.into_values().flatten().collect::<Vec<_>>();
     out.extend(fallback_out);
     out.sort_by(|a, b| a.source_path.cmp(&b.source_path));
     out
 }
 
+// Ten sam numer u dwóch kontrahentów to dwie faktury. Scalamy tylko ten sam plik,
+// wspólny NIP kontrahenta albo (gdy któregoś NIP brak) tę samą kwotę brutto.
+fn same_mail_invoice(left: &InvoiceRecord, right: &InvoiceRecord, own_nip: &str) -> bool {
+    if !left.content_hash.is_empty() && left.content_hash == right.content_hash {
+        return true;
+    }
+    let counterparty_ids = |record: &InvoiceRecord| {
+        let mut ids = scoring_tax_ids(record);
+        ids.remove(own_nip);
+        ids
+    };
+    let (left_ids, right_ids) = (counterparty_ids(left), counterparty_ids(right));
+    if !left_ids.is_empty() && !right_ids.is_empty() {
+        return !left_ids.is_disjoint(&right_ids);
+    }
+    left.gross_amount_minor.is_some() && left.gross_amount_minor == right.gross_amount_minor
+}
+
+#[cfg(test)]
+mod parser_records_tests;
+
 fn record_quality_score(record: &InvoiceRecord) -> usize {
     [
-        record.invoice_number.is_some(),
+        record.invoice_number.is_some() && !record_number_from_filename(record),
         record.issue_date.is_some(),
         record.gross_amount_minor.is_some(),
         record.currency.is_some(),
