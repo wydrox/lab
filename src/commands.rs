@@ -303,6 +303,9 @@ pub(crate) fn run_upload_flow(
         plan.warnings.push(format!(
             "refresh Saldeo po uploadzie nie powiódł się: {err:#}"
         ));
+        if run_error.is_none() {
+            run_error = Some(err.context("refresh Saldeo po uploadzie nie powiódł się"));
+        }
     }
     if approve && run_error.is_none() {
         match steps.approve(config) {
@@ -322,7 +325,7 @@ pub(crate) fn run_upload_flow(
         }
     } else if approve {
         plan.warnings
-            .push("zatwierdzanie KSeF pominięte, bo upload został przerwany".to_string());
+            .push("zatwierdzanie KSeF pominięte z powodu błędu przebiegu uploadu".to_string());
     }
     let failed = plan.summary.failed_count;
     if run_error.is_none() && failed > 0 {

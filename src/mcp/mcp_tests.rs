@@ -475,6 +475,7 @@ fn reconcile_tool_applies_issue_year_rule_to_default_mail_only() {
 struct FakeUploadSteps {
     calls: Vec<&'static str>,
     refresh_fails: bool,
+    post_upload_refresh_fails: bool,
     upload_fails: bool,
     failed_items: usize,
     approve_cap_exceeded: bool,
@@ -483,7 +484,8 @@ struct FakeUploadSteps {
 impl UploadFlowSteps for FakeUploadSteps {
     fn refresh_saldeo(&mut self, _config: &UploadFlowConfig<'_>) -> Result<()> {
         self.calls.push("refresh");
-        if self.refresh_fails {
+        if self.refresh_fails || (self.post_upload_refresh_fails && self.calls.contains(&"upload"))
+        {
             return Err(anyhow!("Saldeo timeout"));
         }
         Ok(())
@@ -1097,4 +1099,28 @@ fn mcp_defaults_to_current_year() {
         assert_eq!(year, current_year, "{tool}");
     }
     assert_eq!(json_year(&serde_json::json!({"year":2025})), Ok(2025));
+}
+
+#[test]
+fn upload_flow_post_upload_refresh_failure_is_error_and_skips_approval() {
+    for approve in [false, true] {
+        let mut steps = FakeUploadSteps {
+            post_upload_refresh_fails: true,
+            ..Default::default()
+        };
+        let (plan, error) = run_fake_upload(&mut steps, true, approve);
+        let error = error.expect("a failed post-upload refresh must be an MCP error");
+        assert!(error.contains("refresh Saldeo"), "{error}");
+        assert!(error.contains("Saldeo timeout"), "{error}");
+        assert_eq!(steps.calls, ["refresh", "plan", "upload", "refresh"]);
+        assert_eq!(plan["summary"]["uploaded_count"], 2);
+        assert!(plan.get("ksef_approve").is_none());
+        assert!(
+            plan["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| { w.as_str().unwrap().contains("refresh Saldeo") })
+        );
+    }
 }
