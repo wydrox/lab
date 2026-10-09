@@ -33,8 +33,9 @@ fn maps_ksef_online_metadata_to_invoice_record() {
 fn ksef_year_ranges_are_quarterly() {
     let ranges = ksef_year_quarter_ranges(2026);
     assert_eq!(ranges.len(), 4);
-    assert_eq!(ranges[0].0, "2026-01-01T00:00:00+00:00");
-    assert_eq!(ranges[3].1, "2027-01-01T00:00:00+00:00");
+    // Widened by a day on both sides; records outside 2026 are dropped later.
+    assert_eq!(ranges[0].0, "2025-12-31T00:00:00+00:00");
+    assert_eq!(ranges[3].1, "2027-01-02T00:00:00+00:00");
 }
 
 #[test]
@@ -184,8 +185,8 @@ fn productmesh_filter_normalizes_input_nip() {
 
 #[test]
 fn year_specific_defaults_use_selected_year() {
-    assert!(default_gmail_query(2025).contains("after:2025/01/01"));
-    assert!(default_gmail_query(2025).contains("before:2026/01/01"));
+    assert!(default_gmail_query(2025).contains("after:2024/12/01"));
+    assert!(default_gmail_query(2025).contains("before:2026/02/01"));
     assert!(
         default_mail_out_path(2025)
             .to_string_lossy()
@@ -208,8 +209,8 @@ fn amazon_gmail_query_targets_amazon_it_and_es() {
     let query = amazon_gmail_query(2026);
     assert!(query.contains("(from:amazon.it OR from:amazon.es)"));
     assert!(query.contains("has:attachment filename:pdf"));
-    assert!(query.contains("after:2026/01/01"));
-    assert!(query.contains("before:2027/01/01"));
+    assert!(query.contains("after:2025/12/01"));
+    assert!(query.contains("before:2027/02/01"));
 }
 
 #[test]
@@ -762,10 +763,13 @@ fn exact_invoice_number_matches_across_sources() {
     let mut mail = empty_record(SourceKind::Mail);
     mail.invoice_number = Some("PL6552160".into());
     mail.currency = Some("PLN".into());
+    // Without a counterparty NIP the number needs a matching gross amount (±2 gr).
+    mail.gross_amount_minor = Some(12300);
     let mut saldeo = empty_record(SourceKind::Saldeo);
     saldeo.invoice_number = Some("PL6552160".into());
     saldeo.ksef_reference = Some("8992520556-20260301-537139000008-F4".into());
     saldeo.currency = Some("PLN".into());
+    saldeo.gross_amount_minor = Some(12301);
     assert!(invoice_identity_match(&mail, &saldeo));
     let report = tri_reconcile(vec![mail], vec![], vec![saldeo], 70);
     assert_eq!(report.rows.len(), 1);
@@ -815,6 +819,7 @@ fn saldeo_overrides_show_star_and_replace_fields() {
         issue_date: NaiveDate::from_ymd_opt(2026, 5, 1),
         gross_amount_minor: Some(12300),
         currency: Some("PLN".into()),
+        baseline: None,
     };
     assert!(apply_saldeo_record_override(&mut saldeo, &override_row));
     assert_eq!(saldeo.invoice_number.as_deref(), Some("FV/1/2026"));
@@ -895,6 +900,7 @@ fn saldeo_legacy_overrides_are_imported_into_sqlite() {
         issue_date: NaiveDate::from_ymd_opt(2026, 5, 2),
         gross_amount_minor: Some(12345),
         currency: Some("PLN".into()),
+        baseline: None,
     };
     std::fs::write(
         &legacy_path,
@@ -912,8 +918,11 @@ fn saldeo_legacy_overrides_are_imported_into_sqlite() {
         issue_date: NaiveDate::from_ymd_opt(2026, 5, 3),
         gross_amount_minor: Some(98765),
         currency: Some("EUR".into()),
+        baseline: None,
     };
 
+    // Blokada przed HomeGuard: przy wyjściu HOME wraca, zanim blokada zostanie zwolniona.
+    let _env_lock = crate::credentials::testing::env_lock();
     let _home_guard = HomeGuard(std::env::var_os("HOME"));
     unsafe { std::env::set_var("HOME", &home) };
 
@@ -1036,4 +1045,28 @@ fn approved_filter_ignores_rows_without_ksef_and_saldeo() {
     let missing_ksef = invoice_table_row_from_reconcile_row(&row, Some(&statuses)).unwrap();
     assert_eq!(invoice_table_ksef_status(&missing_ksef), "—");
     assert!(invoice_table_row_passes_filter(&missing_ksef, true));
+}
+
+#[test]
+fn own_nip_check_is_visible_and_not_inferred_from_filename_or_fields() {
+    let present = parse_text_invoice(SourceKind::Mail, "VAT Number: PL 524 292 00 20");
+    assert_eq!(own_nip::record_check(&present), own_nip::OwnNipCheck::Found);
+    assert!(user_facing_record_warnings(&present).is_empty());
+    let mut missing = parse_text_invoice(SourceKind::Mail, "Invoice without buyer NIP");
+    missing.buyer_tax_id = Some(DEFAULT_PRODUCTMESH_NIP.into());
+    assert_eq!(
+        own_nip::record_check(&missing),
+        own_nip::OwnNipCheck::NotFound
+    );
+    assert!(
+        user_facing_record_warnings(&missing)
+            .iter()
+            .any(|w| w.contains(DEFAULT_PRODUCTMESH_NIP))
+    );
+    let encoded = serde_json::to_string(&present).unwrap();
+    let restored: InvoiceRecord = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(
+        own_nip::record_check(&restored),
+        own_nip::OwnNipCheck::Found
+    );
 }

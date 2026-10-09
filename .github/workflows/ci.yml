@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    # macOS only: the code links Security.framework (Keychain).
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # scripts/test_saldeo_login.py runs `node -e`.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Python script tests
+        run: |
+          python3 -m pip install --upgrade pytest
+          python3 -m pytest scripts -q

@@ -82,7 +82,10 @@ mod macos {
         }
     }
 
-    fn relax_item_access(item: *mut c_void) {
+    /// Ustawia ACL elementu (`SecAccessCreate` z `trustedlist = NULL`: dostęp bez pytania
+    /// ma bieżąca aplikacja). Tylko po utworzeniu albo aktualizacji elementu — nigdy przy
+    /// odczycie, bo zapis ACL przy odczycie przestawiał wpis na każdy kolejny build binarki.
+    fn set_item_access(item: *mut c_void) {
         if item.is_null() || cfg!(test) {
             return;
         }
@@ -102,7 +105,8 @@ mod macos {
         let account = account.as_bytes();
         let mut length = 0u32;
         let mut data = ptr::null_mut::<u8>();
-        let mut item = ptr::null_mut::<c_void>();
+        // Odczyt nie potrzebuje referencji elementu (itemRef = NULL), więc nic nie zwalniamy
+        // poza buforem hasła i nic w elemencie nie zmieniamy.
         let status = unsafe {
             SecKeychainFindGenericPassword(
                 ptr::null_mut(),
@@ -112,7 +116,7 @@ mod macos {
                 account.as_ptr(),
                 &mut length,
                 &mut data,
-                &mut item,
+                ptr::null_mut(),
             )
         };
         if status == ERR_ITEM_NOT_FOUND {
@@ -121,16 +125,15 @@ mod macos {
         if status != 0 {
             return Err(anyhow!("Keychain: odczyt status {status}"));
         }
-        let bytes = unsafe { std::slice::from_raw_parts(data, length as usize) }.to_vec();
-        unsafe {
-            let _ = SecKeychainItemFreeContent(ptr::null_mut(), data.cast());
+        // SAFETY: przy statusie 0 `data` wskazuje `length` bajtów należących do Security
+        // albo jest NULL (puste hasło); `copy_password_bytes` nie tworzy slice z NULL.
+        let bytes = unsafe { super::copy_password_bytes(data, length) };
+        if !data.is_null() {
+            unsafe {
+                let _ = SecKeychainItemFreeContent(ptr::null_mut(), data.cast());
+            }
         }
-        relax_item_access(item);
-        if !item.is_null() {
-            unsafe { CFRelease(item) };
-        }
-        let raw = String::from_utf8(bytes).context("Keychain: sekret nie jest UTF-8")?;
-        Ok(Some(super::decode_keychain_secret(&raw).unwrap_or(raw)))
+        super::decode_keychain_payload(bytes).map(Some)
     }
 
     pub(super) fn set(service: &str, account: &str, secret: &str) -> Result<bool> {
@@ -138,6 +141,7 @@ mod macos {
         let service_b = service.as_bytes();
         let account_b = account.as_bytes();
         let password = payload.as_bytes();
+        let mut created = ptr::null_mut::<c_void>();
         let status = unsafe {
             SecKeychainAddGenericPassword(
                 ptr::null_mut(),
@@ -147,11 +151,15 @@ mod macos {
                 account_b.as_ptr(),
                 u32_len(password, "sekret")?,
                 password.as_ptr(),
-                ptr::null_mut(),
+                &mut created,
             )
         };
         if status == 0 {
-            relax_named_item(service, account);
+            // Nowy element: ACL ustawiamy na zwróconej referencji, bez drugiego wyszukiwania.
+            set_item_access(created);
+            if !created.is_null() {
+                unsafe { CFRelease(created) };
+            }
             return Ok(true);
         }
         if status != ERR_DUPLICATE_ITEM {
@@ -181,40 +189,14 @@ mod macos {
                 password.as_ptr(),
             )
         };
-        relax_item_access(item);
+        if modify == 0 {
+            set_item_access(item);
+        }
         unsafe { CFRelease(item) };
         if modify != 0 {
             return Err(anyhow!("Keychain: aktualizacja status {modify}"));
         }
         Ok(true)
-    }
-
-    fn relax_named_item(service: &str, account: &str) {
-        let service_b = service.as_bytes();
-        let account_b = account.as_bytes();
-        let mut item = ptr::null_mut::<c_void>();
-        let Ok(service_len) = u32_len(service_b, "usługa") else {
-            return;
-        };
-        let Ok(account_len) = u32_len(account_b, "konto") else {
-            return;
-        };
-        let find = unsafe {
-            SecKeychainFindGenericPassword(
-                ptr::null_mut(),
-                service_len,
-                service_b.as_ptr(),
-                account_len,
-                account_b.as_ptr(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-                &mut item,
-            )
-        };
-        if find == 0 && !item.is_null() {
-            relax_item_access(item);
-            unsafe { CFRelease(item) };
-        }
     }
 
     #[cfg(test)]
@@ -253,19 +235,32 @@ fn encode_keychain_secret(secret: &str) -> String {
     format!("base64:{}", STANDARD.encode(secret))
 }
 
+/// Wartość z prefiksem `base64:` (zapis LAB); inaczej `None` i wartość zostaje dosłowna.
+/// Żadne wydanie nie zapisywało hex, więc np. hasło `12345678` nie jest dekodowane.
 fn decode_keychain_secret(raw: &str) -> Option<String> {
-    if let Some(encoded) = raw.strip_prefix("base64:") {
-        return STANDARD
-            .decode(encoded)
-            .ok()
-            .and_then(|bytes| String::from_utf8(bytes).ok());
+    let encoded = raw.strip_prefix("base64:")?;
+    STANDARD
+        .decode(encoded)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
+fn decode_keychain_payload(bytes: Vec<u8>) -> Result<String> {
+    let raw = String::from_utf8(bytes).context("Keychain: sekret nie jest UTF-8")?;
+    Ok(decode_keychain_secret(&raw).unwrap_or(raw))
+}
+
+/// Kopia bufora hasła z Security.framework. Puste hasło może przyjść jako NULL albo
+/// długość 0; wtedy nie powstaje slice (`from_raw_parts` z NULL to UB nawet dla 0).
+///
+/// # Safety
+/// Gdy `data` nie jest NULL, musi wskazywać co najmniej `len` czytelnych bajtów.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+unsafe fn copy_password_bytes(data: *const u8, len: u32) -> Vec<u8> {
+    if data.is_null() || len == 0 {
+        return Vec::new();
     }
-    if raw.len().is_multiple_of(2) && raw.chars().all(|c| c.is_ascii_hexdigit()) {
-        return hex::decode(raw)
-            .ok()
-            .and_then(|bytes| String::from_utf8(bytes).ok());
-    }
-    None
+    unsafe { std::slice::from_raw_parts(data, len as usize) }.to_vec()
 }
 
 fn secret_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
@@ -319,17 +314,50 @@ mod tests {
             decode_keychain_secret(&payload).as_deref(),
             Some("token-gmail")
         );
+        // Bez zgadywania hex: wartość bez prefiksu zostaje dosłowna.
+        assert_eq!(decode_keychain_secret("12345678"), None);
         assert_eq!(
-            decode_keychain_secret(&hex::encode("hex-secret")).as_deref(),
-            Some("hex-secret")
+            decode_keychain_payload(b"12345678".to_vec()).unwrap(),
+            "12345678"
         );
+        assert_eq!(
+            decode_keychain_payload(hex::encode("hex-secret").into_bytes()).unwrap(),
+            hex::encode("hex-secret")
+        );
+        assert_eq!(
+            decode_keychain_payload(payload.into_bytes()).unwrap(),
+            "token-gmail"
+        );
+        assert!(decode_keychain_payload(vec![0xff, 0xfe]).is_err());
         assert!(include_str!("keychain.rs").contains("SecKeychainAddGenericPassword"));
         assert!(!include_str!("keychain.rs").contains("Command::new(\"security\")"));
         assert!(!include_str!("main.rs").contains("add-generic-password"));
     }
 
+    #[test]
+    fn empty_or_null_password_buffer_is_empty() {
+        assert!(unsafe { copy_password_bytes(std::ptr::null(), 0) }.is_empty());
+        assert!(unsafe { copy_password_bytes(std::ptr::null(), 8) }.is_empty());
+        let data = *b"abc";
+        assert!(unsafe { copy_password_bytes(data.as_ptr(), 0) }.is_empty());
+        assert_eq!(unsafe { copy_password_bytes(data.as_ptr(), 3) }, b"abc");
+        assert_eq!(decode_keychain_payload(Vec::new()).unwrap(), "");
+    }
+
+    #[test]
+    fn reads_never_set_item_access() {
+        let source = include_str!("keychain.rs");
+        let get = source.find("pub(super) fn get(").unwrap();
+        let end = get + source[get..].find("\n    }\n").unwrap();
+        let body = &source[get..end];
+        assert!(!body.contains("set_item_access"), "{body}");
+        assert!(!body.contains(&format!("{}(", "SecKeychainItemSetAccess")));
+        assert!(!source.contains(&format!("{}_item_access", "relax")));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "tworzy i usuwa wpis w prawdziwym login Keychain; uruchom: cargo test -- --ignored roundtrip_uses_security_framework"]
     fn roundtrip_uses_security_framework() {
         let account = format!("lab-test-{}", std::process::id());
         macos::delete(KEYCHAIN_SERVICE, &account).unwrap();

@@ -4,6 +4,43 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 const OPENROUTER_CHAT_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 pub(crate) const DEFAULT_OPENROUTER_MODEL: &str = "google/gemini-3.8-flash";
 
+/// A failure worth retrying on a later sync: timeout, network, HTTP 429/5xx, or
+/// a request that never left the machine.
+#[derive(Debug)]
+pub(crate) struct TransientLlmError(pub(crate) String);
+
+impl std::fmt::Display for TransientLlmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TransientLlmError {}
+
+pub(crate) fn transient_llm_error(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(TransientLlmError(message.into()))
+}
+
+pub(crate) fn http_status_is_transient(status: u16) -> bool {
+    status == 429 || (500..600).contains(&status)
+}
+
+pub(crate) fn llm_error_is_transient(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<TransientLlmError>().is_some()
+            || cause.downcast_ref::<reqwest::Error>().is_some_and(|err| {
+                err.is_timeout()
+                    || err.is_connect()
+                    || err.is_request()
+                    || err.is_body()
+                    || err.is_decode()
+                    || err
+                        .status()
+                        .is_some_and(|status| http_status_is_transient(status.as_u16()))
+            })
+    })
+}
+
 pub(crate) fn openrouter_configured() -> bool {
     secret_is_set(Secret::OpenRouterApiKey)
 }
@@ -30,11 +67,10 @@ pub(crate) fn openrouter_chat_model() -> String {
 }
 
 pub(crate) fn openrouter_progress_line(processed: usize, todo: usize, filename: &str) -> String {
-    let percent = if todo == 0 {
-        100
-    } else {
-        processed.saturating_mul(100) / todo
-    };
+    let percent = processed
+        .saturating_mul(100)
+        .checked_div(todo)
+        .unwrap_or(100);
     format!("OpenRouter {processed}/{todo} ({percent}%) {filename}")
 }
 
@@ -154,11 +190,16 @@ pub(crate) fn openrouter_invoice_request(model: &str, filename: &str, pdf_base64
 }
 
 pub(crate) fn openrouter_response_json(response: &Value) -> Result<Value> {
-    if let Some(message) = response
-        .get("error")
-        .and_then(|error| error.get("message"))
-        .and_then(Value::as_str)
+    if let Some(error) = response.get("error")
+        && let Some(message) = error.get("message").and_then(Value::as_str)
     {
+        let code = error.get("code").and_then(|code| {
+            code.as_u64()
+                .or_else(|| code.as_str().and_then(|s| s.parse().ok()))
+        });
+        if code.is_some_and(|code| u16::try_from(code).is_ok_and(http_status_is_transient)) {
+            return Err(transient_llm_error(format!("OpenRouter: {message}")));
+        }
         return Err(anyhow!("OpenRouter: {message}"));
     }
     let choice = response
@@ -209,15 +250,19 @@ pub(crate) fn openrouter_extract_invoice_fields(
         .and_then(|name| name.to_str())
         .unwrap_or("invoice.pdf");
     let pdf_base64 = STANDARD.encode(&bytes);
-    let api_key = secret_value(Secret::OpenRouterApiKey)?.ok_or_else(|| {
-        anyhow!("brak OPENROUTER_API_KEY; ustaw klucz OpenRouter albo użyj lokalnego LLM")
-    })?;
+    // Nothing is sent without a key, so these failures must not block a later try.
+    let api_key = secret_value(Secret::OpenRouterApiKey)
+        .map_err(|err| transient_llm_error(format!("odczyt klucza OpenRouter: {err:#}")))?
+        .ok_or_else(|| {
+            transient_llm_error(
+                "brak OPENROUTER_API_KEY; ustaw klucz OpenRouter albo użyj lokalnego LLM",
+            )
+        })?;
     let model = openrouter_chat_model();
     let body = openrouter_invoice_request(&model, filename, &pdf_base64);
     let client = Client::builder().timeout(openrouter_timeout()).build()?;
-    let mut last_err = None;
-    for attempt in 0..4 {
-        match client
+    let response = openrouter_send_with_retry(
+        || match client
             .post(OPENROUTER_CHAT_URL)
             .header("Authorization", format!("Bearer {api_key}"))
             .header("Content-Type", "application/json")
@@ -226,34 +271,94 @@ pub(crate) fn openrouter_extract_invoice_fields(
             .json(&body)
             .send()
         {
-            Ok(resp) if resp.status().is_success() => {
-                let response: Value = resp.json()?;
-                let value = openrouter_response_json(&response)?;
-                return invoice_validation::apply_normalized_invoice_json(record, &value);
-            }
-            Ok(resp) if matches!(resp.status().as_u16(), 429 | 502 | 503) => {
-                let delay = Duration::from_secs(2u64.pow(attempt));
-                eprintln!(
-                    "  [Gmail/OpenRouter] HTTP {}, czekam {}s...",
-                    resp.status().as_u16(),
-                    delay.as_secs()
-                );
-                std::thread::sleep(delay);
-            }
+            Ok(resp) if resp.status().is_success() => resp
+                .json::<Value>()
+                .map_err(|err| (OpenRouterFailure::Other, anyhow::Error::from(err))),
             Ok(resp) => {
                 let status = resp.status();
                 let text = resp.text().unwrap_or_default();
-                return Err(anyhow!("OpenRouter HTTP {status}: {text}"));
+                let message = format!("OpenRouter HTTP {status}: {text}");
+                let err = if http_status_is_transient(status.as_u16()) {
+                    transient_llm_error(message)
+                } else {
+                    anyhow!(message)
+                };
+                Err((OpenRouterFailure::Status(status.as_u16()), err))
             }
-            Err(err) => {
-                last_err = Some(err);
-                std::thread::sleep(Duration::from_secs(2u64.pow(attempt)));
-            }
-        }
+            Err(err) => Err((openrouter_failure_kind(&err), anyhow::Error::from(err))),
+        },
+        std::thread::sleep,
+    )?;
+    let value = openrouter_response_json(&response)?;
+    invoice_validation::apply_normalized_invoice_json(record, &value)
+}
+
+const OPENROUTER_MAX_ATTEMPTS: u32 = 4;
+
+/// Why a request to OpenRouter failed, as far as retrying is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenRouterFailure {
+    /// No connection was made, so nothing reached OpenRouter.
+    Connect,
+    /// No answer in time; the PDF may have been processed and billed.
+    Timeout,
+    /// Any other client-side failure after the request may have been sent.
+    Other,
+    Status(u16),
+}
+
+// A connect error (including a connect timeout) happens before any byte of the
+// request is sent; every other timeout may come after OpenRouter got the PDF.
+pub(crate) fn openrouter_failure_kind(err: &reqwest::Error) -> OpenRouterFailure {
+    if err.is_connect() {
+        OpenRouterFailure::Connect
+    } else if err.is_timeout() {
+        OpenRouterFailure::Timeout
+    } else {
+        OpenRouterFailure::Other
     }
-    Err(last_err
-        .map(anyhow::Error::from)
-        .unwrap_or_else(|| anyhow!("OpenRouter nie odpowiedział po 4 próbach")))
+}
+
+/// Retry only when the request provably was not processed: no connection, rate
+/// limit, or a gateway that did not reach the model. A timeout is not retried here;
+/// the attempts ledger marks it transient so a later sync may try again.
+pub(crate) fn openrouter_failure_is_retryable(failure: OpenRouterFailure) -> bool {
+    matches!(
+        failure,
+        OpenRouterFailure::Connect | OpenRouterFailure::Status(429 | 502 | 503 | 504)
+    )
+}
+
+pub(crate) fn openrouter_send_with_retry<T>(
+    mut send: impl FnMut() -> std::result::Result<T, (OpenRouterFailure, anyhow::Error)>,
+    mut wait: impl FnMut(Duration),
+) -> Result<T> {
+    let mut attempt = 0;
+    loop {
+        let (failure, err) = match send() {
+            Ok(value) => return Ok(value),
+            Err(failed) => failed,
+        };
+        attempt += 1;
+        if !openrouter_failure_is_retryable(failure) || attempt >= OPENROUTER_MAX_ATTEMPTS {
+            return Err(match failure {
+                OpenRouterFailure::Timeout => err.context(
+                    "OpenRouter nie odpowiedział w limicie czasu; nie ponawiam od razu, bo PDF mógł zostać przetworzony i rozliczony",
+                ),
+                _ => err,
+            });
+        }
+        let delay = Duration::from_secs(2u64.pow(attempt - 1));
+        eprintln!(
+            "  [Gmail/OpenRouter] {}, ponawiam za {}s...",
+            match failure {
+                OpenRouterFailure::Status(status) => format!("HTTP {status}"),
+                _ => "brak połączenia".to_string(),
+            },
+            delay.as_secs()
+        );
+        wait(delay);
+    }
 }
 
 #[cfg(test)]
@@ -334,5 +439,66 @@ mod tests {
         let err = openrouter_response_json(&api_err).unwrap_err().to_string();
         assert!(err.contains("insufficient credits"));
         assert!(!err.contains("sk-"));
+    }
+
+    #[test]
+    fn only_unprocessed_requests_are_retried() {
+        use OpenRouterFailure::*;
+        for failure in [Connect, Status(429), Status(502), Status(503), Status(504)] {
+            assert!(openrouter_failure_is_retryable(failure), "{failure:?}");
+        }
+        for failure in [Timeout, Other, Status(500), Status(400), Status(402)] {
+            assert!(!openrouter_failure_is_retryable(failure), "{failure:?}");
+        }
+    }
+
+    fn run_with(failures: &[OpenRouterFailure]) -> (Result<&'static str>, usize, Vec<Duration>) {
+        let mut calls = 0;
+        let mut waits = Vec::new();
+        let result = openrouter_send_with_retry(
+            || {
+                calls += 1;
+                match failures.get(calls - 1) {
+                    Some(&failure) => Err((failure, transient_llm_error(format!("{failure:?}")))),
+                    None => Ok("ok"),
+                }
+            },
+            |delay| waits.push(delay),
+        );
+        (result, calls, waits)
+    }
+
+    #[test]
+    fn timeout_is_not_retried_but_stays_transient() {
+        let (result, calls, waits) = run_with(&[OpenRouterFailure::Timeout]);
+        let err = result.unwrap_err();
+        assert_eq!(calls, 1);
+        assert!(waits.is_empty());
+        assert!(format!("{err:#}").contains("nie ponawiam"), "{err:#}");
+        assert!(llm_error_is_transient(&err));
+    }
+
+    #[test]
+    fn rate_limit_and_unavailable_are_retried() {
+        let (result, calls, waits) = run_with(&[
+            OpenRouterFailure::Status(503),
+            OpenRouterFailure::Status(429),
+            OpenRouterFailure::Connect,
+        ]);
+        assert_eq!(result.unwrap(), "ok");
+        assert_eq!(calls, 4);
+        assert_eq!(
+            waits,
+            [1, 2, 4].map(Duration::from_secs),
+            "exponential back-off"
+        );
+        // Bounded: four attempts, then the last error.
+        let (result, calls, _) = run_with(&[OpenRouterFailure::Status(503); 6]);
+        assert!(llm_error_is_transient(&result.unwrap_err()));
+        assert_eq!(calls, 4);
+        // A non-retryable status ends at once.
+        let (result, calls, _) = run_with(&[OpenRouterFailure::Status(400)]);
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
     }
 }

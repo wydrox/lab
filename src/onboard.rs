@@ -28,6 +28,8 @@ pub(crate) struct OnboardStatus {
     ksef_token_source: SecretSource,
     ksef_password_source: SecretSource,
     ksef_access_source: SecretSource,
+    /// Odrzucone kopie narzędzi i katalogi narzędzi zapisywalne dla grupy.
+    tool_warnings: Vec<String>,
 }
 
 pub(crate) fn onboard(
@@ -201,13 +203,10 @@ pub(crate) fn collect_onboard_status(db_path: &Path) -> Result<OnboardStatus> {
     let saldeo_valid = saldeo_exists && saldeo_session_valid(&saldeo_state);
 
     let pdftotext_ok = local_tool("pdftotext").is_ok();
-    let python_ok = Command::new("python3")
-        .arg("-c")
-        .arg("import shutil, subprocess, sys; pp=shutil.which('ppmlx'); sys.exit(1 if not pp else 0)")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    // Tylko informacja o obecności ppmlx; żaden proces (np. Python z cwd) nie jest uruchamiany.
+    let python_ok = crate::hardening::tool_present_for_status("ppmlx");
     let openssl_ok = local_tool("openssl").is_ok();
+    let tool_warnings = crate::hardening::tool_dir_warnings();
 
     let db_exists = db_path.exists();
     if !db_exists {
@@ -262,38 +261,50 @@ pub(crate) fn collect_onboard_status(db_path: &Path) -> Result<OnboardStatus> {
         ksef_token_source,
         ksef_password_source,
         ksef_access_source,
+        tool_warnings,
     })
 }
 
 /// Raport o sekretach: czy są ustawione i skąd pochodzą; bez wartości.
 pub(crate) fn secrets_status_json(status: &OnboardStatus) -> Value {
     serde_json::json!({
-        "gmail_token": secret_status_entry(status.gmail_token_source),
-        "saldeo_storage_state": secret_status_entry(status.saldeo_state_source),
-        "saldeo_username": secret_status_entry(secret_source(Secret::SaldeoUsername)),
-        "saldeo_password": secret_status_entry(secret_source(Secret::SaldeoPassword)),
-        "ksef_token": secret_status_entry(status.ksef_token_source),
-        "ksef_cert_password": secret_status_entry(status.ksef_password_source),
-        "ksef_access_token": secret_status_entry(status.ksef_access_source),
-        "openrouter_api_key": secret_status_entry(secret_source(Secret::OpenRouterApiKey)),
+        "gmail_token": secret_status_entry(&status.gmail_token_source),
+        "saldeo_storage_state": secret_status_entry(&status.saldeo_state_source),
+        "saldeo_username": secret_status_entry(&secret_source(Secret::SaldeoUsername)),
+        "saldeo_password": secret_status_entry(&secret_source(Secret::SaldeoPassword)),
+        "ksef_token": secret_status_entry(&status.ksef_token_source),
+        "ksef_cert_password": secret_status_entry(&status.ksef_password_source),
+        "ksef_access_token": secret_status_entry(&status.ksef_access_source),
+        "openrouter_api_key": secret_status_entry(&secret_source(Secret::OpenRouterApiKey)),
     })
 }
 
-fn secret_status_entry(source: SecretSource) -> Value {
-    serde_json::json!({ "set": source.is_set(), "source": source.as_str() })
+fn secret_status_entry(source: &SecretSource) -> Value {
+    let mut entry = serde_json::json!({ "set": source.is_set(), "source": source.as_str() });
+    if let Some(problem) = source.problem() {
+        entry["problem"] = Value::String(problem);
+    }
+    entry
 }
 
 /// Skąd LAB wziął sekret; do wydruku statusu, nigdy z wartością.
-pub(crate) fn secret_source_suffix(source: SecretSource) -> String {
+pub(crate) fn secret_source_suffix(source: &SecretSource) -> String {
     match source {
         SecretSource::Env => " (zmienna sesji)".to_string(),
         SecretSource::Keychain => " (Keychain)".to_string(),
         SecretSource::File => " (plik 600)".to_string(),
         SecretSource::Missing => String::new(),
+        SecretSource::Insecure(path) => format!(" (insecure permissions: {})", path.display()),
     }
 }
 
 pub(crate) fn print_onboard_status(status: &OnboardStatus, db_path: &Path) {
+    let root = lab_root_info();
+    eprintln!(
+        "  Katalog LAB:     {} ({})",
+        root.path.display(),
+        root.source.as_str()
+    );
     eprintln!(
         "  Baza danych:     {} ({})",
         if status.db_exists {
@@ -322,7 +333,7 @@ pub(crate) fn print_onboard_status(status: &OnboardStatus, db_path: &Path) {
     eprintln!(
         "  OpenRouter:      {}{}",
         display_secret_value(secret_is_set(Secret::OpenRouterApiKey)),
-        secret_source_suffix(secret_source(Secret::OpenRouterApiKey))
+        secret_source_suffix(&secret_source(Secret::OpenRouterApiKey))
     );
     eprintln!(
         "  openssl:         {}",
@@ -341,7 +352,7 @@ pub(crate) fn print_onboard_status(status: &OnboardStatus, db_path: &Path) {
         } else {
             "✗"
         },
-        secret_source_suffix(status.gmail_token_source)
+        secret_source_suffix(&status.gmail_token_source)
     );
     eprintln!(
         "  Saldeo:          {}{}",
@@ -352,15 +363,18 @@ pub(crate) fn print_onboard_status(status: &OnboardStatus, db_path: &Path) {
         } else {
             "✗"
         },
-        secret_source_suffix(status.saldeo_state_source)
+        secret_source_suffix(&status.saldeo_state_source)
     );
-    let saldeo_login =
-        secret_is_set(Secret::SaldeoUsername) && secret_is_set(Secret::SaldeoPassword);
+    let saldeo_username = secret_source(Secret::SaldeoUsername);
+    let saldeo_password = secret_source(Secret::SaldeoPassword);
+    let saldeo_login = saldeo_username.is_set() && saldeo_password.is_set();
     eprintln!(
         "  Saldeo login:    {}{}",
         if saldeo_login { "✓" } else { "✗" },
-        if saldeo_login {
-            secret_source_suffix(secret_source(Secret::SaldeoUsername))
+        if saldeo_login || saldeo_username.problem().is_some() {
+            secret_source_suffix(&saldeo_username)
+        } else if saldeo_password.problem().is_some() {
+            secret_source_suffix(&saldeo_password)
         } else {
             String::new()
         }
@@ -388,12 +402,12 @@ pub(crate) fn print_onboard_status(status: &OnboardStatus, db_path: &Path) {
         } else {
             "✗"
         },
-        secret_source_suffix(status.ksef_password_source)
+        secret_source_suffix(&status.ksef_password_source)
     );
     eprintln!(
         "  KSeF token:      {}{}",
         if status.ksef_token_ok { "✓" } else { "✗" },
-        secret_source_suffix(status.ksef_token_source)
+        secret_source_suffix(&status.ksef_token_source)
     );
     eprintln!(
         "  KSeF dane:       {}",
@@ -403,7 +417,14 @@ pub(crate) fn print_onboard_status(status: &OnboardStatus, db_path: &Path) {
             format!("✗ ({})", status.ksef_dir.display())
         }
     );
+    print_tool_warnings(&status.tool_warnings);
     eprintln!();
+}
+
+fn print_tool_warnings(warnings: &[String]) {
+    for warning in warnings {
+        eprintln!("  ⚠ {warning}");
+    }
 }
 
 pub(crate) fn onboard_next_steps(status: &OnboardStatus, gmail_ok: bool) -> Vec<&'static str> {
@@ -451,6 +472,7 @@ pub(crate) fn write_onboard_check_json(status: &OnboardStatus) -> Result<()> {
         "saldeo": { "session_valid": status.saldeo_valid },
         "ksef": { "api_ok": status.ksef_api_ok, "data_exists": status.ksef_data_exists },
         "database": { "exists": status.db_exists },
+        "warnings": status.tool_warnings,
         "secrets": secrets_status_json(status),
         "next_steps": steps
     });
@@ -494,7 +516,8 @@ pub(crate) fn onboard_configure_gmail(
     }
 
     *gmail_client_secret = Some(secret.clone());
-    let mut vars = read_lab_env_file().unwrap_or_default();
+    // Nieczytelny plik env to błąd, nie pusta mapa: zapis nie może skasować innych kluczy.
+    let mut vars = read_lab_env_file()?;
     vars.insert(
         "GOOGLE_CLIENT_SECRET_PATH".to_string(),
         secret.display().to_string(),
@@ -528,17 +551,11 @@ pub(crate) fn onboard_configure_saldeo() -> Result<()> {
             .allow_empty(true)
             .interact_text()?;
         if !username.trim().is_empty() {
-            save_secret(Secret::SaldeoUsername, username.trim())?;
             let password = Password::new()
                 .with_prompt("SALDEO_PASSWORD")
                 .allow_empty_password(true)
                 .interact()?;
-            if password.is_empty() {
-                eprintln!("⏭ Hasło puste; login zapisany, hasło bez zmian.\n");
-            } else {
-                save_secret(Secret::SaldeoPassword, &password)?;
-                eprintln!("✓ Zapisano SALDEO_USERNAME i SALDEO_PASSWORD w Keychain\n");
-            }
+            eprintln!("{}\n", save_saldeo_login(&username, &password)?);
         }
     }
     let target = preferred_saldeo_storage_state_path();
@@ -559,23 +576,53 @@ pub(crate) fn onboard_configure_saldeo() -> Result<()> {
         return Ok(());
     }
     if source != target {
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-        }
-        fs::copy(&source, &target)
+        // Kopia od razu jako plik 600 (bez okna z prawami umask).
+        let bytes = fs::read(&source).with_context(|| format!("odczyt {}", source.display()))?;
+        write_private_file(&target, &bytes)
             .with_context(|| format!("kopiowanie {} → {}", source.display(), target.display()))?;
     }
-    save_saldeo_storage_state_secret(&target)?;
-    eprintln!(
-        "✓ Saldeo storage state zapisany: {}\n✓ Saldeo storage state zapisany w macOS Keychain (jeśli dostępny)\n",
-        target.display()
-    );
+    match save_saldeo_storage_state_secret(&target)? {
+        Some(saved) => eprintln!("✓ Saldeo storage state zapisany {}\n", saved.describe()),
+        None => eprintln!("✗ Saldeo storage state jest pusty: {}\n", target.display()),
+    }
     Ok(())
+}
+
+/// Zapis loginu Saldeo z onboardingu. Login bez hasła trafia na dysk tylko wtedy, gdy
+/// hasło jest już zapisane; inaczej nic nie jest zapisywane. Zwraca komunikat bez wartości.
+pub(crate) fn save_saldeo_login(username: &str, password: &str) -> Result<String> {
+    let username = strip_one_line_ending(username).trim();
+    let password = strip_one_line_ending(password);
+    if username.is_empty() {
+        return Ok("⏭ SALDEO_USERNAME pusty; bez zmian.".to_string());
+    }
+    if password.is_empty() {
+        if !secret_is_set(Secret::SaldeoPassword) {
+            return Ok(
+                "⏭ Hasło puste i brak zapisanego SALDEO_PASSWORD; SALDEO_USERNAME nie został zapisany (LAB zaloguje ręcznie w Helium)."
+                    .to_string(),
+            );
+        }
+        let saved = save_secret(Secret::SaldeoUsername, username)?;
+        return Ok(format!(
+            "⏭ Hasło puste; SALDEO_USERNAME zapisany {}, hasło bez zmian.",
+            saved.describe()
+        ));
+    }
+    // Najpierw sprawdzamy oba, potem zapis: błąd hasła nie zostawia samego loginu.
+    ensure_single_line_value("SALDEO_USERNAME", username)?;
+    ensure_single_line_value("SALDEO_PASSWORD", password)?;
+    save_secret(Secret::SaldeoPassword, password)?;
+    let saved = save_secret(Secret::SaldeoUsername, username)?;
+    Ok(format!(
+        "✓ Zapisano SALDEO_USERNAME i SALDEO_PASSWORD {}",
+        saved.describe()
+    ))
 }
 
 pub(crate) fn onboard_edit_env_path(name: &str) -> Result<()> {
     if let Some(value) = prompt_env_path(name, lab_config_var(name))? {
-        let mut vars = read_lab_env_file().unwrap_or_default();
+        let mut vars = read_lab_env_file()?;
         vars.insert(name.to_string(), value);
         write_lab_env_file(&vars)?;
         eprintln!("✓ Zapisano {name} w {}\n", lab_env_file_path().display());
@@ -602,24 +649,47 @@ pub(crate) fn onboard_edit_env_secret(name: &str) -> Result<()> {
         eprintln!("⏭ Bez zmian.\n");
         return Ok(());
     }
-    match save_secret(secret, value.trim())? {
-        SecretSource::File if Secret::from_env_key(name).is_some() => eprintln!(
-            "✓ Zapisano {name} w {} (poza git)\n",
-            crate::lab_dotenv_path().display()
-        ),
-        SecretSource::File => eprintln!("✓ Zapisano {name} w pliku 0600\n"),
-        _ => eprintln!("✓ Zapisano {name} w macOS Keychain (lab-cli)\n"),
-    }
+    let saved = save_secret(secret, value.trim())?;
+    eprintln!("✓ Zapisano {name} {}\n", saved.describe());
     Ok(())
 }
 
 pub(crate) fn ensure_saldeo_session_or_auth(progress: Option<Arc<Mutex<String>>>) -> Result<()> {
-    let storage_state = default_saldeo_storage_state_path();
+    ensure_saldeo_session_with(
+        progress,
+        lab_noninteractive(),
+        || saldeo_session_valid(&default_saldeo_storage_state_path()),
+        saldeo_auth_noninteractive,
+    )
+}
+
+/// Komunikat dla przebiegu bez użytkownika; `scripts/lab-automation.sh` szuka frazy
+/// „Saldeo session expired”, więc nie zmieniaj jej.
+pub(crate) const SALDEO_SESSION_EXPIRED_UNATTENDED: &str = "Saldeo session expired: przy LAB_NONINTERACTIVE=1 LAB nie otwiera Helium i nie instaluje Playwright. Odśwież sesję interaktywnie: lab onboard (Saldeo auth)";
+
+/// Przy `LAB_NONINTERACTIVE=1` błąd zamiast logowania w przeglądarce i `npm install`.
+fn refuse_unattended_saldeo_login() -> Result<()> {
+    if lab_noninteractive() {
+        return Err(anyhow!(SALDEO_SESSION_EXPIRED_UNATTENDED));
+    }
+    Ok(())
+}
+
+/// Logika `ensure_saldeo_session_or_auth` z wstrzykniętym sprawdzeniem sesji i logowaniem.
+pub(crate) fn ensure_saldeo_session_with(
+    progress: Option<Arc<Mutex<String>>>,
+    noninteractive: bool,
+    session_valid: impl Fn() -> bool,
+    run_auth: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     if let Some(progress) = &progress {
         set_progress(progress, "Saldeo: sprawdzam zapisane cookies...");
     }
-    if saldeo_session_valid(&storage_state) {
+    if session_valid() {
         return Ok(());
+    }
+    if noninteractive {
+        return Err(anyhow!(SALDEO_SESSION_EXPIRED_UNATTENDED));
     }
 
     if let Some(progress) = &progress {
@@ -630,13 +700,12 @@ pub(crate) fn ensure_saldeo_session_or_auth(progress: Option<Arc<Mutex<String>>>
         };
         set_progress(progress, message);
     }
-    saldeo_auth_noninteractive()?;
+    run_auth()?;
 
-    let storage_state = default_saldeo_storage_state_path();
     if let Some(progress) = &progress {
         set_progress(progress, "Saldeo: sprawdzam nowe cookies...");
     }
-    if saldeo_session_valid(&storage_state) {
+    if session_valid() {
         Ok(())
     } else {
         Err(anyhow!(
@@ -698,9 +767,11 @@ impl Drop for SaldeoAuthTempFile {
 }
 
 pub(crate) fn saldeo_auth_noninteractive() -> Result<()> {
+    // Przed czymkolwiek innym: bez katalogów, bez npm, bez przeglądarki.
+    refuse_unattended_saldeo_login()?;
     let target = preferred_saldeo_storage_state_path();
     if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+        crate::hardening::create_dir_for_private_files(parent)?;
     }
     let url =
         std::env::var("SALDEO_URL").unwrap_or_else(|_| "https://saldeo.brainshare.pl/".to_string());
@@ -712,36 +783,20 @@ pub(crate) fn saldeo_auth_noninteractive() -> Result<()> {
     let login = saldeo_login_pair()?;
     // Installation can fail or take a long time; do not leave credentials on disk yet.
     let node_path = ensure_playwright_node_path()?;
-    let login_file = if let Some((username, password)) = &login {
-        Some(SaldeoAuthTempFile::write(
-            SaldeoAuthTempFile::path_for("login", "json"),
-            &serde_json::to_vec(&serde_json::json!({
-                "username": username,
-                "password": password
-            }))?,
-        )?)
-    } else {
-        None
-    };
+    let login_file = write_saldeo_login_file(login.as_ref())?;
     let script_file = SaldeoAuthTempFile::write(
         SaldeoAuthTempFile::path_for("login-script", "js"),
         include_str!("../scripts/saldeo-login.js").as_bytes(),
     )?;
-    let timeout_ms = saldeo_auth_timeout_ms();
-    let mut command = Command::new("node");
-    command
-        .arg(&script_file.path)
-        .env("NODE_PATH", &node_path)
-        .env("LAB_SALDEO_STORAGE_STATE", &target)
-        .env("SALDEO_URL", &url)
-        .env("HELIUM_EXECUTABLE", &helium)
-        .env("SALDEO_AUTH_TIMEOUT_MS", timeout_ms.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
-    if let Some(file) = &login_file {
-        command.env("LAB_SALDEO_LOGIN_FILE", &file.path);
-    }
+    let mut command = saldeo_login_node_command(&SaldeoLoginNodeArgs {
+        script: &script_file.path,
+        node_path: &node_path,
+        target: &target,
+        url: &url,
+        helium: &helium,
+        timeout_ms: saldeo_auth_timeout_ms(),
+        login_file: login_file.as_ref().map(|file| file.path.as_path()),
+    });
     let status = command_status_with_timeout(&mut command, saldeo_auth_process_timeout())
         .context("uruchomienie node + Playwright + Helium")?;
     drop(login_file);
@@ -757,6 +812,38 @@ pub(crate) fn saldeo_auth_noninteractive() -> Result<()> {
     }
     save_saldeo_storage_state_secret(&target)?;
     Ok(())
+}
+
+pub(crate) struct SaldeoLoginNodeArgs<'a> {
+    pub(crate) script: &'a Path,
+    pub(crate) node_path: &'a Path,
+    pub(crate) target: &'a Path,
+    pub(crate) url: &'a str,
+    pub(crate) helium: &'a str,
+    pub(crate) timeout_ms: u64,
+    pub(crate) login_file: Option<&'a Path>,
+}
+
+/// `node saldeo-login.js`: hasło tylko w pliku 0600 (`LAB_SALDEO_LOGIN_FILE`),
+/// sekrety LAB usunięte ze środowiska.
+pub(crate) fn saldeo_login_node_command(args: &SaldeoLoginNodeArgs<'_>) -> Command {
+    let mut command = Command::new("node");
+    crate::hardening::remove_secret_env(&mut command);
+    command
+        .arg(args.script)
+        .env("NODE_PATH", args.node_path)
+        .env("LAB_SALDEO_STORAGE_STATE", args.target)
+        .env("SALDEO_URL", args.url)
+        .env("HELIUM_EXECUTABLE", args.helium)
+        .env("SALDEO_AUTH_TIMEOUT_MS", args.timeout_ms.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    match args.login_file {
+        Some(path) => command.env("LAB_SALDEO_LOGIN_FILE", path),
+        None => command.env_remove("LAB_SALDEO_LOGIN_FILE"),
+    };
+    command
 }
 
 pub(crate) fn saldeo_auth_timeout_ms() -> u64 {
@@ -795,12 +882,22 @@ fn command_status_with_timeout(
 
 pub(crate) fn run_saldeo_auth_script() -> Result<()> {
     eprintln!("── Saldeo auth ──");
+    refuse_unattended_saldeo_login()?;
     let target = preferred_saldeo_storage_state_path();
-    if !Confirm::new()
-        .with_prompt(format!(
-            "Uruchomić Playwright i zapisać auth do {}?",
+    let script = find_saldeo_auth_script()?;
+    let prompt = match &script {
+        Some(script) => format!(
+            "Uruchomić skrypt {} i zapisać auth do {}?",
+            script.display(),
             target.display()
-        ))
+        ),
+        None => format!(
+            "Brak zaufanego scripts/saldeo-auth.sh. Uruchomić wbudowany Playwright + Helium i zapisać auth do {}?",
+            target.display()
+        ),
+    };
+    if !Confirm::new()
+        .with_prompt(prompt)
         .default(true)
         .interact()?
     {
@@ -808,14 +905,17 @@ pub(crate) fn run_saldeo_auth_script() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(script) = find_saldeo_auth_script() {
-        let status = Command::new(&script)
-            .arg(&target)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .with_context(|| format!("uruchomienie {}", script.display()))?;
+    if let Some(script) = script {
+        // Hasło idzie plikiem 0600 (LAB_SALDEO_LOGIN_FILE), nie przez środowisko skryptu.
+        let login_file = write_saldeo_login_file(saldeo_login_pair()?.as_ref())?;
+        let status = saldeo_auth_script_command(
+            &script,
+            &target,
+            login_file.as_ref().map(|file| file.path.as_path()),
+        )
+        .status()
+        .with_context(|| format!("uruchomienie {}", script.display()))?;
+        drop(login_file);
         if !status.success() {
             return Err(anyhow!("skrypt Saldeo auth zakończył się błędem: {status}"));
         }
@@ -823,10 +923,44 @@ pub(crate) fn run_saldeo_auth_script() -> Result<()> {
         return Ok(());
     }
 
-    eprintln!("Nie znalazłem scripts/saldeo-auth.sh — uruchamiam Playwright + Helium.");
     saldeo_auth_noninteractive()?;
     eprintln!("✓ Zapisano Saldeo auth: {}\n", target.display());
     Ok(())
+}
+
+/// Plik 0600 z loginem Saldeo dla `saldeo-login.js`; usuwany w Drop.
+fn write_saldeo_login_file(login: Option<&(String, String)>) -> Result<Option<SaldeoAuthTempFile>> {
+    let Some((username, password)) = login else {
+        return Ok(None);
+    };
+    SaldeoAuthTempFile::write(
+        SaldeoAuthTempFile::path_for("login", "json"),
+        &serde_json::to_vec(&serde_json::json!({
+            "username": username,
+            "password": password
+        }))?,
+    )
+    .map(Some)
+}
+
+/// Skrypt `saldeo-auth.sh` bez sekretów LAB w środowisku; login tylko przez plik 0600.
+pub(crate) fn saldeo_auth_script_command(
+    script: &Path,
+    target: &Path,
+    login_file: Option<&Path>,
+) -> Command {
+    let mut command = Command::new(script);
+    crate::hardening::remove_secret_env(&mut command);
+    command
+        .arg(target)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    match login_file {
+        Some(path) => command.env("LAB_SALDEO_LOGIN_FILE", path),
+        None => command.env_remove("LAB_SALDEO_LOGIN_FILE"),
+    };
+    command
 }
 
 fn lab_playwright_prefix() -> PathBuf {
@@ -841,26 +975,48 @@ fn lab_playwright_prefix() -> PathBuf {
         .join("playwright")
 }
 
+/// Wersja Playwright instalowana dla logowania Saldeo (ta sama w `scripts/saldeo-auth.sh`).
+pub(crate) const PLAYWRIGHT_VERSION: &str = "1.63.0";
+
+/// `LAB_PLAYWRIGHT_VERSION` albo [`PLAYWRIGHT_VERSION`]; dozwolone litery, cyfry, `.` i `-`
+/// (wersja albo dist-tag), żeby wartość nie stała się innym specyfikatorem npm.
+pub(crate) fn playwright_version_from(value: Option<&str>) -> Result<String> {
+    // Jak `${LAB_PLAYWRIGHT_VERSION:-…}` w skrypcie: pusta wartość = domyślna.
+    let Some(value) = value.filter(|v| !v.is_empty()) else {
+        return Ok(PLAYWRIGHT_VERSION.to_string());
+    };
+    let valid = value.len() <= 64
+        && value
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+    if !valid {
+        return Err(anyhow!(
+            "LAB_PLAYWRIGHT_VERSION: oczekuję wersji albo dist-tagu (litery, cyfry, '.', '-'), dostałem {value:?}"
+        ));
+    }
+    Ok(value.to_string())
+}
+
 fn ensure_playwright_node_path() -> Result<PathBuf> {
+    refuse_unattended_saldeo_login()?;
     let prefix = lab_playwright_prefix();
     let node_modules = prefix.join("node_modules");
     let module = node_modules.join("playwright");
+    // Zainstalowana wersja zostaje, nawet jeśli inna niż przypięta: bez wymuszonej reinstalacji.
     if module.is_dir() {
         return Ok(node_modules);
     }
-    fs::create_dir_all(&prefix).with_context(|| format!("mkdir {}", prefix.display()))?;
+    let version = playwright_version_from(std::env::var("LAB_PLAYWRIGHT_VERSION").ok().as_deref())?;
+    crate::hardening::create_dir_for_private_files(&prefix)?;
     eprintln!(
-        "  [Saldeo] instaluję Playwright w {} (bez przeglądarki Playwright)...",
+        "  [Saldeo] instaluję Playwright {version} w {} (bez przeglądarki Playwright)...",
         prefix.display()
     );
-    let status = Command::new("npm")
-        .arg("install")
-        .arg("--prefix")
-        .arg(&prefix)
-        .arg("--no-fund")
-        .arg("--no-audit")
-        .arg("playwright")
-        .env("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", "1")
+    let status = npm_install_playwright_command(&prefix, &version)
         .status()
         .context("npm install playwright")?;
     if !status.success() {
@@ -874,24 +1030,86 @@ fn ensure_playwright_node_path() -> Result<PathBuf> {
     Ok(node_modules)
 }
 
-pub(crate) fn find_saldeo_auth_script() -> Option<PathBuf> {
-    let mut roots = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        roots.extend(cwd.ancestors().map(Path::to_path_buf));
+/// `npm install playwright@<version>` bez skryptów pakietów i bez sekretów LAB w środowisku.
+pub(crate) fn npm_install_playwright_command(prefix: &Path, version: &str) -> Command {
+    // stdout bywa strumieniem JSON-RPC serwera MCP: wyjście npm idzie na stderr,
+    // a npm nie czyta stdin.
+    let mut command = Command::new("npm");
+    crate::hardening::remove_secret_env(&mut command);
+    command
+        .arg("install")
+        .arg("--prefix")
+        .arg(prefix)
+        .arg("--no-fund")
+        .arg("--no-audit")
+        .arg("--ignore-scripts")
+        .arg(format!("playwright@{version}"))
+        .env("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(std::io::stderr()))
+        .stderr(Stdio::inherit());
+    command
+}
+
+/// Skrypt `saldeo-auth.sh` tylko z zaufanych miejsc: `SALDEO_AUTH_SCRIPT` (ścieżka
+/// bezwzględna), drzewo katalogów uruchomionego pliku (po rozwinięciu dowiązań) albo
+/// bieżący katalog, gdy jest pakietem `lab-cli`. Nigdy przodkowie bieżącego katalogu.
+pub(crate) fn find_saldeo_auth_script() -> Result<Option<PathBuf>> {
+    let explicit = std::env::var_os("SALDEO_AUTH_SCRIPT").filter(|value| !value.is_empty());
+    let exe = std::env::current_exe().ok();
+    let cwd = std::env::current_dir().ok();
+    find_saldeo_auth_script_in(
+        explicit.as_deref().map(Path::new),
+        exe.as_deref(),
+        cwd.as_deref(),
+        crate::hardening::current_uid(),
+    )
+}
+
+/// Jawna ścieżka, która nie przechodzi kontroli, to błąd; znaleziona automatycznie jest
+/// pomijana z komunikatem na stderr.
+pub(crate) fn find_saldeo_auth_script_in(
+    explicit: Option<&Path>,
+    exe: Option<&Path>,
+    cwd: Option<&Path>,
+    uid: u32,
+) -> Result<Option<PathBuf>> {
+    if let Some(path) = explicit {
+        if !path.is_absolute() {
+            return Err(anyhow!(
+                "SALDEO_AUTH_SCRIPT wymaga ścieżki bezwzględnej: {}",
+                path.display()
+            ));
+        }
+        return crate::hardening::trusted_user_script(path, uid)
+            .map(Some)
+            .context("SALDEO_AUTH_SCRIPT");
     }
-    if let Ok(exe) = std::env::current_exe()
+    let mut roots = Vec::new();
+    if let Some(exe) = exe.and_then(|exe| fs::canonicalize(exe).ok())
         && let Some(parent) = exe.parent()
     {
         roots.extend(parent.ancestors().map(Path::to_path_buf));
     }
-
+    if let Some(cwd) = cwd
+        && crate::credentials::cwd_is_lab_package(cwd)
+    {
+        roots.push(cwd.to_path_buf());
+    }
     for root in roots {
         let script = root.join("scripts").join("saldeo-auth.sh");
-        if script.is_file() {
-            return Some(script);
+        if !script.is_file() {
+            continue;
+        }
+        match crate::hardening::trusted_user_script(&script, uid) {
+            Ok(real) => return Ok(Some(real)),
+            Err(err) => warn_once(
+                format!("saldeo-auth-script:{}", script.display()),
+                &format!("pomijam {}: {err:#}", script.display()),
+            ),
         }
     }
-    None
+    Ok(None)
 }
 
 pub(crate) fn prompt_env_path(name: &str, current: Option<String>) -> Result<Option<String>> {
@@ -940,7 +1158,7 @@ pub(crate) fn onboard_configure_ksef_data(current_year: i32) -> Result<()> {
         fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
         eprintln!("✓ Utworzono: {}", dir.display());
     }
-    let mut vars = read_lab_env_file().unwrap_or_default();
+    let mut vars = read_lab_env_file()?;
     vars.insert("KSEF_DATA_DIR".to_string(), dir.display().to_string());
     write_lab_env_file(&vars)?;
     eprintln!(
@@ -963,7 +1181,18 @@ pub(crate) fn lab_config_var(name: &str) -> Option<String> {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .or_else(|| crate::dotenv_secret(name))
-        .or_else(|| read_lab_env_file().ok()?.remove(name))
+        .or_else(|| lab_env_file_value(name))
+}
+
+/// Zwykły odczyt z `~/.config/lab/env`; problem z plikiem = brak wartości i komunikat na stderr.
+fn lab_env_file_value(name: &str) -> Option<String> {
+    match read_lab_env_file() {
+        Ok(mut vars) => vars.remove(name),
+        Err(err) => {
+            crate::warn_unreadable_secret_file(&lab_env_file_path(), &err);
+            None
+        }
+    }
 }
 
 pub(crate) fn preferred_saldeo_storage_state_path() -> PathBuf {
@@ -988,34 +1217,16 @@ pub(crate) fn lab_env_file_path() -> PathBuf {
         .join("env")
 }
 
+/// Brak pliku = pusta mapa. Prawa szersze niż 600, błąd odczytu albo tekst spoza UTF-8
+/// to błąd ze ścieżką; wywołujący odczyt-modyfikację-zapis nie może wtedy nic zapisać.
 pub(crate) fn read_lab_env_file() -> Result<HashMap<String, String>> {
-    let path = lab_env_file_path();
-    if !path.exists() {
-        return Ok(HashMap::new());
-    }
-    let text = fs::read_to_string(&path).with_context(|| format!("odczyt {}", path.display()))?;
-    let mut vars = HashMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let line = line.strip_prefix("export ").unwrap_or(line);
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        vars.insert(key.trim().to_string(), unquote_env_value(value.trim()));
-    }
-    Ok(vars)
+    crate::read_private_env_file(&lab_env_file_path(), "plik env LAB")
 }
 
 pub(crate) fn write_lab_env_file(vars: &HashMap<String, String>) -> Result<()> {
     let mut vars = vars.clone();
     strip_secret_env_keys(&mut vars)?;
     let path = lab_env_file_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-    }
     let mut keys = vars.keys().cloned().collect::<Vec<_>>();
     keys.sort();
     let mut out = String::from(
@@ -1023,12 +1234,15 @@ pub(crate) fn write_lab_env_file(vars: &HashMap<String, String>) -> Result<()> {
     );
     for key in keys {
         if let Some(value) = vars.get(&key) {
+            ensure_single_line_value(&key, value)?;
             out.push_str(&format!("{}={}\n", key, quote_env_value(value)));
         }
     }
     write_private_file(&path, out.as_bytes())
 }
 
+/// Wartość w pojedynczych cudzysłowach; `'` jako `'\''`. Odwrotność: `unquote_env_value`
+/// (przez `parse_env_text`) dla każdej wartości bez znaku nowej linii i NUL.
 pub(crate) fn quote_env_value(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -1043,18 +1257,20 @@ pub(crate) fn unquote_env_value(value: &str) -> String {
     }
 }
 
-pub(crate) fn save_saldeo_storage_state_secret(storage_state: &Path) -> Result<()> {
+/// `None`, gdy pliku nie ma albo jest pusty; inaczej miejsce zapisu.
+pub(crate) fn save_saldeo_storage_state_secret(
+    storage_state: &Path,
+) -> Result<Option<SavedSecret>> {
     if !storage_state.is_file() {
-        return Ok(());
+        return Ok(None);
     }
     // Playwright zapisuje plik z prawami umask; zacieśniamy je przed odczytem.
     crate::hardening::chmod_private(storage_state)?;
     let text = read_secret_file(storage_state, "sesja Saldeo")?;
     if text.trim().is_empty() {
-        return Ok(());
+        return Ok(None);
     }
-    save_secret(Secret::SaldeoStorageState, &text)?;
-    Ok(())
+    save_secret(Secret::SaldeoStorageState, &text).map(Some)
 }
 
 pub(crate) fn read_saldeo_storage_state(storage_state: &Path) -> Result<String> {
@@ -1068,27 +1284,8 @@ pub(crate) fn saldeo_session_valid(storage_state: &Path) -> bool {
     let Ok(text) = read_saldeo_storage_state(storage_state) else {
         return false;
     };
-    let Ok(storage): Result<Value, _> = serde_json::from_str(&text) else {
-        return false;
-    };
-    let Some(cookies) = storage.get("cookies").and_then(|v| v.as_array()) else {
-        return false;
-    };
-    let cookie_header = cookies
-        .iter()
-        .filter_map(|cookie| {
-            let name = cookie.get("name")?.as_str()?;
-            let value = cookie.get("value")?.as_str()?;
-            Some(format!("{name}={value}"))
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    let xsrf = cookies
-        .iter()
-        .find(|cookie| cookie.get("name").and_then(|v| v.as_str()) == Some("X-SALDEO-XSRF-C-TOKEN"))
-        .and_then(|cookie| cookie.get("value"))
-        .and_then(|v| v.as_str());
-    let Some(xsrf) = xsrf else {
+    // Ciasteczka i XSRF wybrane dla URL-a kontroli wg reguł domena/ścieżka/secure.
+    let Ok(session) = saldeo_session_from_storage_text(&text) else {
         return false;
     };
     let Ok(client) = Client::builder().build() else {
@@ -1107,17 +1304,47 @@ pub(crate) fn saldeo_session_valid(storage_state: &Path) -> bool {
             "ksefMiniWorkflowStatus": null, "ksefBoId": null,
             "dimensionReportDocumentIds": [], "dimensions": null }
     });
-    match client
-        .post("https://saldeo.brainshare.pl/rest/client/document/list/search")
-        .header("Cookie", &cookie_header)
-        .header("X-SALDEO-XSRF-H-TOKEN", xsrf)
-        .header("saldeoApp", "angularApp")
-        .header("timeout", "60000")
-        .json(&body)
-        .send()
-    {
-        Ok(resp) => resp.status().is_success(),
+    // Przejściowe błędy (timeout, połączenie, 502/503/504) są ponawiane, żeby jedna czkawka
+    // serwera nie wyglądała jak wygasła sesja; 401/403 kończą od razu.
+    let response = saldeo_read_with_retry("kontrola sesji", std::thread::sleep, || {
+        let request = session
+            .authorize(
+                client.post(SALDEO_DOCUMENT_SEARCH_URL),
+                SALDEO_DOCUMENT_SEARCH_URL,
+            )
+            .header("saldeoApp", "angularApp")
+            .header("timeout", "60000")
+            .json(&body);
+        let response = request.send().map_err(SaldeoReadError::from_reqwest)?;
+        let status = response.status().as_u16();
+        if matches!(status, 502..=504) {
+            return Err(SaldeoReadError::new(
+                SaldeoReadFailure::Status(status),
+                anyhow!("HTTP {status}"),
+            ));
+        }
+        let text = response.text().map_err(SaldeoReadError::from_reqwest)?;
+        Ok((status, text))
+    });
+    match response {
+        Ok((status, text)) => saldeo_session_response_valid(status, &text),
         Err(_) => false,
+    }
+}
+
+/// Notatka `doctor` o tym, gdzie faktycznie leżą sekrety; bez wartości.
+pub(crate) fn secrets_storage_note() -> String {
+    let dotenv = crate::lab_dotenv_path();
+    if keychain_enabled() {
+        format!(
+            "Sekrety tekstowe LAB zapisuje w {} (plik 600) i kopiuje do macOS Keychain (usługa lab-cli, LAB_USE_KEYCHAIN=1); wartości z Keychain nie są kopiowane do tego pliku. Kolejność odczytu: zmienna sesji → ten plik → plik 600 → Keychain. Plik ~/.config/lab/env nie przechowuje sekretów.",
+            dotenv.display()
+        )
+    } else {
+        format!(
+            "Sekrety tekstowe są w {} (plik 600); Keychain jest wyłączony (LAB_USE_KEYCHAIN=1 go włącza). Zmienna sesji ma pierwszeństwo; plik ~/.config/lab/env nie przechowuje sekretów.",
+            dotenv.display()
+        )
     }
 }
 
@@ -1136,6 +1363,8 @@ pub(crate) fn doctor(db_path: &Path, token_env: &str) -> Result<()> {
         && status.ksef_data_exists;
     let year = status.year;
     let mail_candidates = default_mail_candidates_path(year);
+    let amazon_mail_candidates = default_amazon_mail_candidates_path(year);
+    let lab_root = lab_root_info();
     let ksef_records = configured_ksef_out_path(year);
     let saldeo_records = default_saldeo_records_path(year);
     let ksef_context_type =
@@ -1157,6 +1386,7 @@ pub(crate) fn doctor(db_path: &Path, token_env: &str) -> Result<()> {
             "ppmlx_present": status.python_ok,
             "openssl_present": status.openssl_ok
         },
+        "warnings": status.tool_warnings,
         "gmail": {
             "token_env": token_env,
             "token_env_present": gmail_env_present,
@@ -1199,6 +1429,9 @@ pub(crate) fn doctor(db_path: &Path, token_env: &str) -> Result<()> {
         "reconcile_defaults": {
             "mail_candidates": mail_candidates.display().to_string(),
             "mail_candidates_present": mail_candidates.exists(),
+            "amazon_mail_candidates": amazon_mail_candidates.display().to_string(),
+            "amazon_mail_candidates_present": amazon_mail_candidates.exists(),
+            "mail_candidates_records": load_default_mail_candidates(year).ok().map(|records| records.len()),
             "ksef": ksef_records.display().to_string(),
             "ksef_present": ksef_records.exists(),
             "saldeo": saldeo_records.display().to_string(),
@@ -1206,7 +1439,9 @@ pub(crate) fn doctor(db_path: &Path, token_env: &str) -> Result<()> {
         },
         "database": {
             "path": db_path.display().to_string(),
-            "exists": status.db_exists
+            "exists": status.db_exists,
+            "lab_root": lab_root.path.display().to_string(),
+            "lab_root_source": lab_root.source.as_str()
         },
         "secrets": secrets_status_json(&status),
         "notes": [
@@ -1214,12 +1449,62 @@ pub(crate) fn doctor(db_path: &Path, token_env: &str) -> Result<()> {
             "PDF-y są parsowane przez pdftotext, potem PyMuPDF/pdfplumber/pypdf jako fallback.",
             "lab reconcile bez własnych --ksef/--saldeo pobiera online metadane KSeF i Saldeo przed porównaniem.",
             "KSeF online używa KSEF_TOKEN, KSEF_CONTEXT_NIP/KSEF_NIP i KSEF_BASE_URL/KSEF_ENV; metadane są cache'owane lokalnie w KSEF_DATA_DIR albo data/ksef-<rok>.",
-            "Sekrety trzyma macOS Keychain (usługa lab-cli); zmienna środowiskowa sesji ma pierwszeństwo, plik ~/.config/lab/env już ich nie przechowuje.",
+            secrets_storage_note(),
             "Jeśli OPENROUTER_API_KEY jest ustawiony, LAB odczytuje brakujące PDF-y przez google/gemini-3.8-flash ze structured output. Lokalny Gemma zostaje jako zapas."
         ],
         "next_steps": onboard_next_steps(&status, gmail_usable)
     });
+    print_tool_warnings(&status.tool_warnings);
     write_json(&status_json, None)
+}
+
+#[cfg(test)]
+mod playwright_version_tests {
+    use super::*;
+
+    #[test]
+    fn default_is_pinned_and_override_is_validated() {
+        assert_eq!(playwright_version_from(None).unwrap(), "1.63.0");
+        assert_eq!(playwright_version_from(Some("")).unwrap(), "1.63.0");
+        for ok in ["1.64.0", "1.64.0-beta-1", "next", "latest"] {
+            assert_eq!(playwright_version_from(Some(ok)).unwrap(), ok);
+        }
+        for bad in [
+            "^1.63.0",
+            "~1.63",
+            ">=1.0",
+            "1.63.0 || 2",
+            " 1.63.0",
+            "git+https://example.invalid/x.git",
+            "file:../x",
+            "-1.0",
+            "1.0;rm",
+            "1.63.0\n",
+        ] {
+            let err = playwright_version_from(Some(bad)).unwrap_err().to_string();
+            assert!(err.contains("LAB_PLAYWRIGHT_VERSION"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn script_and_binary_pin_the_same_version() {
+        let script = include_str!("../scripts/saldeo-auth.sh");
+        assert!(
+            script.contains(&format!(
+                "PLAYWRIGHT_VERSION=\"${{LAB_PLAYWRIGHT_VERSION:-{PLAYWRIGHT_VERSION}}}\""
+            )),
+            "scripts/saldeo-auth.sh musi przypinać Playwright {PLAYWRIGHT_VERSION}"
+        );
+        assert!(script.contains("\"playwright@$PLAYWRIGHT_VERSION\""));
+        assert!(script.contains("--ignore-scripts"));
+        let command = npm_install_playwright_command(Path::new("/tmp/lab-prefix-dummy"), "next");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args.last().map(String::as_str), Some("playwright@next"));
+        assert!(args.iter().any(|arg| arg == "--ignore-scripts"));
+    }
 }
 
 #[cfg(test)]

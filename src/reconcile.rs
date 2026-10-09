@@ -1,9 +1,51 @@
 use crate::*;
 
+#[cfg(test)]
+mod matching_tests;
+
 pub(crate) fn read_tri_report(path: &Path) -> Result<TriReconcileReport> {
     let text = fs::read_to_string(path).with_context(|| format!("odczyt {}", path.display()))?;
     serde_json::from_str(&text)
         .with_context(|| format!("niepoprawny tri report {}", path.display()))
+}
+
+/// A record belongs to the year's table when it is dated in `year` or has no date at all:
+/// the per-year source folders already scope undated records, and dropping them would hide
+/// an unparsed PDF (no LLM re-read, no upload) or a Saldeo document's match.
+pub(crate) fn invoice_record_in_year_table(record: &InvoiceRecord, year: i32) -> bool {
+    record
+        .issue_date
+        .or(record.sale_date)
+        .is_none_or(|date| date.year() == year)
+}
+
+/// Issue-year rule for a year's records (TUI table and the default Gmail source of
+/// `reconcile`, MCP `reconcile` and the upload plan); see `invoice_record_in_year_table`.
+pub(crate) fn filter_invoice_records_for_year_table(
+    records: Vec<InvoiceRecord>,
+    year: i32,
+) -> Vec<InvoiceRecord> {
+    records
+        .into_iter()
+        .filter(|record| invoice_record_in_year_table(record, year))
+        .collect()
+}
+
+pub(crate) fn invoice_record_matches_year(record: &InvoiceRecord, year: i32) -> bool {
+    record
+        .issue_date
+        .or(record.sale_date)
+        .is_some_and(|date| date.year() == year)
+}
+
+pub(crate) fn filter_invoice_records_for_year(
+    records: Vec<InvoiceRecord>,
+    year: i32,
+) -> Vec<InvoiceRecord> {
+    records
+        .into_iter()
+        .filter(|record| invoice_record_matches_year(record, year))
+        .collect()
 }
 
 pub(crate) fn tri_reconcile(
@@ -15,85 +57,20 @@ pub(crate) fn tri_reconcile(
     let mail_records = dedupe_reconcile_records(mail_records);
     let ksef_records = dedupe_reconcile_records(ksef_records);
     let saldeo_records = dedupe_reconcile_records(saldeo_records);
-    let mut rows = Vec::new();
-    let mut used_ksef = HashSet::new();
-    let mut used_saldeo = HashSet::new();
-
-    for mail in &mail_records {
-        let best_ksef = best_match(mail, &ksef_records, &used_ksef, review_score);
-        let best_saldeo = best_match(mail, &saldeo_records, &used_saldeo, review_score);
-        if let Some((idx, _)) = best_ksef {
-            used_ksef.insert(idx);
-        }
-        if let Some((idx, _)) = best_saldeo {
-            used_saldeo.insert(idx);
-        }
-        let ksef = best_ksef.map(|(idx, _)| ksef_records[idx].clone());
-        let saldeo = best_saldeo.map(|(idx, _)| saldeo_records[idx].clone());
-        let ksef_score_to_saldeo = match (&ksef, &saldeo) {
-            (Some(k), Some(s)) => Some(score_pair(k, s).0),
-            _ => None,
-        };
-        rows.push(TriRow {
-            status: tri_status(true, ksef.is_some(), saldeo.is_some()).to_string(),
-            mail_score_to_ksef: best_ksef.map(|(_, score)| score),
-            mail_score_to_saldeo: best_saldeo.map(|(_, score)| score),
-            ksef_score_to_saldeo,
-            mail: Some(mail.clone()),
-            ksef,
-            saldeo,
-        });
-    }
-
-    let mut used_ksef_extra = HashSet::new();
-    for (ksef_idx, ksef) in ksef_records.iter().enumerate() {
-        if used_ksef.contains(&ksef_idx) {
-            continue;
-        }
-        if let Some((saldeo_idx, score)) =
-            best_match(ksef, &saldeo_records, &used_saldeo, review_score)
-        {
-            used_ksef.insert(ksef_idx);
-            used_ksef_extra.insert(ksef_idx);
-            used_saldeo.insert(saldeo_idx);
-            rows.push(TriRow {
-                status: tri_status(false, true, true).to_string(),
-                mail_score_to_ksef: None,
-                mail_score_to_saldeo: None,
-                ksef_score_to_saldeo: Some(score),
-                mail: None,
-                ksef: Some(ksef.clone()),
-                saldeo: Some(saldeo_records[saldeo_idx].clone()),
-            });
-        }
-    }
-
-    for (idx, ksef) in ksef_records.iter().enumerate() {
-        if !used_ksef.contains(&idx) && !used_ksef_extra.contains(&idx) {
-            rows.push(TriRow {
-                status: tri_status(false, true, false).to_string(),
-                mail_score_to_ksef: None,
-                mail_score_to_saldeo: None,
-                ksef_score_to_saldeo: None,
-                mail: None,
-                ksef: Some(ksef.clone()),
-                saldeo: None,
-            });
-        }
-    }
-    for (idx, saldeo) in saldeo_records.iter().enumerate() {
-        if !used_saldeo.contains(&idx) {
-            rows.push(TriRow {
-                status: tri_status(false, false, true).to_string(),
-                mail_score_to_ksef: None,
-                mail_score_to_saldeo: None,
-                ksef_score_to_saldeo: None,
-                mail: None,
-                ksef: None,
-                saldeo: Some(saldeo.clone()),
-            });
-        }
-    }
+    let groups = assign_tri_groups(
+        [&mail_records, &ksef_records, &saldeo_records],
+        review_score,
+    );
+    let rows = groups
+        .into_iter()
+        .map(|[mail, ksef, saldeo]| {
+            build_tri_row(
+                mail.map(|idx| mail_records[idx].clone()),
+                ksef.map(|idx| ksef_records[idx].clone()),
+                saldeo.map(|idx| saldeo_records[idx].clone()),
+            )
+        })
+        .collect::<Vec<_>>();
 
     let rows = merge_duplicate_tri_rows(rows);
     let summary = TriSummary {
@@ -134,7 +111,7 @@ pub(crate) fn dedupe_reconcile_records(records: Vec<InvoiceRecord>) -> Vec<Invoi
             continue;
         };
         if let Some(existing_idx) = by_key.get(&key).copied() {
-            if record_completeness_score(&record) > record_completeness_score(&out[existing_idx]) {
+            if record_is_better(&record, &out[existing_idx]) {
                 out[existing_idx] = record;
             }
         } else {
@@ -190,6 +167,17 @@ pub(crate) fn reconcile_dedupe_key(record: &InvoiceRecord) -> Option<String> {
     ))
 }
 
+/// More complete record wins; ties resolve by content so input order does not matter.
+fn record_is_better(candidate: &InvoiceRecord, current: &InvoiceRecord) -> bool {
+    match record_completeness_score(candidate).cmp(&record_completeness_score(current)) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => {
+            canonical_record_key(candidate) < canonical_record_key(current)
+        }
+    }
+}
+
 pub(crate) fn record_completeness_score(record: &InvoiceRecord) -> usize {
     let mut score = 0usize;
     score += record.ksef_reference.is_some() as usize * 16;
@@ -209,29 +197,210 @@ pub(crate) fn record_completeness_score(record: &InvoiceRecord) -> usize {
     score
 }
 
-pub(crate) fn best_match(
-    needle: &InvoiceRecord,
-    haystack: &[InvoiceRecord],
-    used: &HashSet<usize>,
-    min_score: u8,
-) -> Option<(usize, u8)> {
-    let identity = haystack
-        .iter()
-        .enumerate()
-        .filter(|(idx, _)| !used.contains(idx))
-        .filter(|(_, candidate)| invoice_identity_match(needle, candidate))
-        .map(|(idx, candidate)| (idx, score_pair(needle, candidate).0.max(100)))
-        .max_by_key(|(_, score)| *score);
-    if identity.is_some() {
-        return identity;
+const TRI_MAIL: usize = 0;
+const TRI_KSEF: usize = 1;
+const TRI_SALDEO: usize = 2;
+
+/// Record index per source slot (mail, KSeF, Saldeo) of one reconcile row.
+type TriMembers = [Option<usize>; 3];
+
+/// (source slot, record index)
+type TriMember = (usize, usize);
+
+struct TriLinkCandidate {
+    score: u8,
+    left: TriMember,
+    right: TriMember,
+}
+
+/// Groups records into rows by global passes, so the outcome does not depend on
+/// input order and a weak match cannot take a record that has an exact one:
+/// (a) shared KSeF number, (b) invoice identity, (c) fuzzy score >= `review_score`.
+/// Within a pass candidates are taken best score first. A row holds at most one
+/// record per source and never two different KSeF numbers.
+fn assign_tri_groups(sources: [&[InvoiceRecord]; 3], review_score: u8) -> Vec<TriMembers> {
+    let ranks = sources.map(canonical_record_ranks);
+    let mut by_reference = Vec::new();
+    let mut by_identity = Vec::new();
+    let mut fuzzy = Vec::new();
+    for (left_slot, right_slot) in [
+        (TRI_MAIL, TRI_KSEF),
+        (TRI_MAIL, TRI_SALDEO),
+        (TRI_KSEF, TRI_SALDEO),
+    ] {
+        for (left_idx, left) in sources[left_slot].iter().enumerate() {
+            let left_reference = normalized_ksef_reference(left);
+            for (right_idx, right) in sources[right_slot].iter().enumerate() {
+                let right_reference = normalized_ksef_reference(right);
+                if let (Some(a), Some(b)) = (&left_reference, &right_reference)
+                    && a != b
+                {
+                    continue;
+                }
+                let candidate = TriLinkCandidate {
+                    score: score_pair(left, right).0,
+                    left: (left_slot, left_idx),
+                    right: (right_slot, right_idx),
+                };
+                if left_reference.is_some() && left_reference == right_reference {
+                    by_reference.push(candidate);
+                } else if invoice_identity_match(left, right) {
+                    by_identity.push(candidate);
+                } else if candidate.score >= review_score {
+                    fuzzy.push(candidate);
+                }
+            }
+        }
     }
-    haystack
-        .iter()
-        .enumerate()
-        .filter(|(idx, _)| !used.contains(idx))
-        .map(|(idx, candidate)| (idx, score_pair(needle, candidate).0))
-        .filter(|(_, score)| *score >= min_score)
-        .max_by_key(|(_, score)| *score)
+
+    let mut groups = TriGroups::new(sources);
+    for mut pass in [by_reference, by_identity, fuzzy] {
+        pass.sort_by(|a, b| {
+            b.score.cmp(&a.score).then_with(|| {
+                let key = |c: &TriLinkCandidate| {
+                    (
+                        c.left.0,
+                        ranks[c.left.0][c.left.1],
+                        c.right.0,
+                        ranks[c.right.0][c.right.1],
+                    )
+                };
+                key(a).cmp(&key(b))
+            })
+        });
+        for candidate in pass {
+            groups.try_link(candidate.left, candidate.right);
+        }
+    }
+    groups.into_rows()
+}
+
+/// Position of each record in a content-based order; used as the tie-break so
+/// equal scores resolve the same way whatever order the sources came in.
+fn canonical_record_ranks(records: &[InvoiceRecord]) -> Vec<usize> {
+    let keys = records.iter().map(canonical_record_key).collect::<Vec<_>>();
+    let mut order = (0..records.len()).collect::<Vec<_>>();
+    order.sort_by(|a, b| keys[*a].cmp(&keys[*b]).then(a.cmp(b)));
+    let mut ranks = vec![0; records.len()];
+    for (rank, idx) in order.into_iter().enumerate() {
+        ranks[idx] = rank;
+    }
+    ranks
+}
+
+fn canonical_record_key(record: &InvoiceRecord) -> String {
+    serde_json::to_string(record).unwrap_or_default()
+}
+
+struct TriGroups<'a> {
+    sources: [&'a [InvoiceRecord]; 3],
+    group_of: [Vec<usize>; 3],
+    groups: Vec<TriMembers>,
+}
+
+impl<'a> TriGroups<'a> {
+    fn new(sources: [&'a [InvoiceRecord]; 3]) -> Self {
+        let mut group_of = [Vec::new(), Vec::new(), Vec::new()];
+        let mut groups = Vec::new();
+        for (slot, records) in sources.iter().enumerate() {
+            for idx in 0..records.len() {
+                group_of[slot].push(groups.len());
+                let mut members = [None; 3];
+                members[slot] = Some(idx);
+                groups.push(members);
+            }
+        }
+        Self {
+            sources,
+            group_of,
+            groups,
+        }
+    }
+
+    /// Merges the groups of `left` and `right` unless that would put two records
+    /// of one source, or two different KSeF numbers, into one row.
+    fn try_link(&mut self, left: TriMember, right: TriMember) -> bool {
+        let left_group = self.group_of[left.0][left.1];
+        let right_group = self.group_of[right.0][right.1];
+        if left_group == right_group {
+            return false;
+        }
+        let mut merged = self.groups[left_group];
+        for (slot, idx) in self.groups[right_group].into_iter().enumerate() {
+            if let Some(idx) = idx {
+                if merged[slot].is_some() {
+                    return false;
+                }
+                merged[slot] = Some(idx);
+            }
+        }
+        let mut reference = None;
+        for (slot, idx) in merged.into_iter().enumerate() {
+            let Some(idx) = idx else { continue };
+            let Some(value) = normalized_ksef_reference(&self.sources[slot][idx]) else {
+                continue;
+            };
+            match &reference {
+                Some(existing) if *existing != value => return false,
+                Some(_) => {}
+                None => reference = Some(value),
+            }
+        }
+        for (slot, idx) in self.groups[right_group].into_iter().enumerate() {
+            if let Some(idx) = idx {
+                self.group_of[slot][idx] = left_group;
+            }
+        }
+        self.groups[left_group] = merged;
+        self.groups[right_group] = [None; 3];
+        true
+    }
+
+    /// Rows with mail first (mail order), then KSeF+Saldeo, KSeF-only and
+    /// Saldeo-only, each in source order.
+    fn into_rows(self) -> Vec<TriMembers> {
+        let mut rows = self
+            .groups
+            .into_iter()
+            .filter(|members| members.iter().any(Option::is_some))
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|members| match *members {
+            [Some(mail), _, _] => (0, mail),
+            [None, Some(ksef), Some(_)] => (1, ksef),
+            [None, Some(ksef), None] => (2, ksef),
+            [None, None, Some(saldeo)] => (3, saldeo),
+            [None, None, None] => (4, 0),
+        });
+        rows
+    }
+}
+
+fn build_tri_row(
+    mail: Option<InvoiceRecord>,
+    ksef: Option<InvoiceRecord>,
+    saldeo: Option<InvoiceRecord>,
+) -> TriRow {
+    let mail_score_to_ksef = match (&mail, &ksef) {
+        (Some(mail), Some(ksef)) => Some(score_pair(mail, ksef).0),
+        _ => None,
+    };
+    let mail_score_to_saldeo = match (&mail, &saldeo) {
+        (Some(mail), Some(saldeo)) => Some(score_pair(mail, saldeo).0),
+        _ => None,
+    };
+    let ksef_score_to_saldeo = match (&ksef, &saldeo) {
+        (Some(ksef), Some(saldeo)) => Some(score_pair(ksef, saldeo).0),
+        _ => None,
+    };
+    TriRow {
+        status: tri_status(mail.is_some(), ksef.is_some(), saldeo.is_some()).to_string(),
+        mail_score_to_ksef,
+        mail_score_to_saldeo,
+        ksef_score_to_saldeo,
+        mail,
+        ksef,
+        saldeo,
+    }
 }
 
 fn invoice_number_is_mergeable(number: &str) -> bool {
@@ -282,41 +451,29 @@ fn pick_better_record(
 ) -> Option<InvoiceRecord> {
     match (left, right) {
         (None, record) | (record, None) => record,
-        (Some(left), Some(right)) => Some(
-            if record_completeness_score(&right) > record_completeness_score(&left) {
-                right
-            } else {
-                left
-            },
-        ),
+        (Some(left), Some(right)) => Some(if record_is_better(&right, &left) {
+            right
+        } else {
+            left
+        }),
     }
 }
 
 fn merge_tri_row_pair(left: TriRow, right: TriRow) -> TriRow {
-    let mail = pick_better_record(left.mail, right.mail);
-    let ksef = pick_better_record(left.ksef, right.ksef);
-    let saldeo = pick_better_record(left.saldeo, right.saldeo);
-    let mail_score_to_ksef = match (&mail, &ksef) {
-        (Some(mail), Some(ksef)) => Some(score_pair(mail, ksef).0),
-        _ => None,
-    };
-    let mail_score_to_saldeo = match (&mail, &saldeo) {
-        (Some(mail), Some(saldeo)) => Some(score_pair(mail, saldeo).0),
-        _ => None,
-    };
-    let ksef_score_to_saldeo = match (&ksef, &saldeo) {
-        (Some(ksef), Some(saldeo)) => Some(score_pair(ksef, saldeo).0),
-        _ => None,
-    };
-    TriRow {
-        status: tri_status(mail.is_some(), ksef.is_some(), saldeo.is_some()).to_string(),
-        mail_score_to_ksef,
-        mail_score_to_saldeo,
-        ksef_score_to_saldeo,
-        mail,
-        ksef,
-        saldeo,
-    }
+    build_tri_row(
+        pick_better_record(left.mail, right.mail),
+        pick_better_record(left.ksef, right.ksef),
+        pick_better_record(left.saldeo, right.saldeo),
+    )
+}
+
+/// Rows that share a source hold duplicates of one invoice within that source.
+/// Rows with disjoint sources were already offered to `assign_tri_groups`, which
+/// decides cross-source matches; merging them here would bypass its rules.
+fn tri_rows_share_source(left: &TriRow, right: &TriRow) -> bool {
+    (left.mail.is_some() && right.mail.is_some())
+        || (left.ksef.is_some() && right.ksef.is_some())
+        || (left.saldeo.is_some() && right.saldeo.is_some())
 }
 
 fn merge_duplicate_tri_rows(rows: Vec<TriRow>) -> Vec<TriRow> {
@@ -328,6 +485,7 @@ fn merge_duplicate_tri_rows(rows: Vec<TriRow>) -> Vec<TriRow> {
             continue;
         };
         if let Some(existing_idx) = by_key.get(&key).copied()
+            && tri_rows_share_source(&out[existing_idx], &row)
             && tri_row_amounts_compatible(&out[existing_idx], &row)
         {
             let existing = out[existing_idx].clone();

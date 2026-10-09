@@ -20,7 +20,12 @@ def poppler_reports_password(text):
     return "incorrect password" in text or "password required" in text or "needs a password" in text
 
 
+POPPLER_OVERRIDES = {}
+
+
 def poppler_bin(name):
+    if POPPLER_OVERRIDES.get(name):
+        return Path(POPPLER_OVERRIDES[name])
     for directory in POPPLER_DIRS:
         path = Path(directory) / name
         if path.is_file() and os.access(path, os.X_OK):
@@ -67,8 +72,11 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--cache-dir", required=True)
     parser.add_argument("--max-pages", type=int, default=10)
+    parser.add_argument("--pdfinfo")
+    parser.add_argument("--pdftoppm")
     parser.add_argument("--max-tokens", type=int, default=4096)
     args = parser.parse_args()
+    POPPLER_OVERRIDES.update(pdfinfo=args.pdfinfo, pdftoppm=args.pdftoppm)
     os.umask(0o077)
     pdf = Path(args.pdf).resolve(strict=True)
     if not pdf.is_file():

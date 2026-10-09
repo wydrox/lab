@@ -126,17 +126,21 @@ fn run_ocr(path: &Path) -> Result<String> {
         .ok()
         .filter(|pages| (1..=100).contains(pages))
         .ok_or_else(|| anyhow!("LAB_OCR_MAX_PAGES: dozwolone 1-100"))?;
+    // `python -c` puts the working directory first on sys.path, so the helper runs
+    // inside the private 0700 cache directory and gets absolute paths only.
+    let cache = fs::canonicalize(&cache).with_context(|| format!("ścieżka {}", cache.display()))?;
+    let pdf = fs::canonicalize(path).with_context(|| format!("ścieżka {}", path.display()))?;
+    let model = fs::canonicalize(&model).with_context(|| format!("ścieżka {}", model.display()))?;
     let mut command = Command::new(python);
     apply_isolated_env(&mut command);
+    ocr_command_args(&mut command, &pdf, &model, &cache);
+    // The helper uses the Poppler binaries that passed the trust check here.
+    command
+        .arg("--pdfinfo")
+        .arg(local_tool("pdfinfo")?)
+        .arg("--pdftoppm")
+        .arg(local_tool("pdftoppm")?);
     let mut child = command
-        .arg("-c")
-        .arg(include_str!("../scripts/ocr_pdf.py"))
-        .arg("--pdf")
-        .arg(path)
-        .arg("--model")
-        .arg(model)
-        .arg("--cache-dir")
-        .arg(cache)
         .arg("--max-pages")
         .arg(max_pages.to_string())
         .stdout(Stdio::piped())
@@ -199,9 +203,46 @@ fn run_ocr(path: &Path) -> Result<String> {
     Ok(text.to_string())
 }
 
+fn ocr_command_args(command: &mut Command, pdf: &Path, model: &Path, cache: &Path) {
+    command
+        .current_dir(cache)
+        .arg("-c")
+        .arg(include_str!("../scripts/ocr_pdf.py"))
+        .arg("--pdf")
+        .arg(pdf)
+        .arg("--model")
+        .arg(model)
+        .arg("--cache-dir")
+        .arg(cache);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ocr_helper_runs_in_private_cache_dir_with_absolute_paths() {
+        let mut command = Command::new("python3");
+        let cache = Path::new("/private/cache/lab/ocr");
+        ocr_command_args(
+            &mut command,
+            Path::new("/data/invoice.pdf"),
+            Path::new("/models/glm"),
+            cache,
+        );
+        assert_eq!(command.get_current_dir(), Some(cache));
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args[0], "-c");
+        for flag in ["--pdf", "--model", "--cache-dir"] {
+            let idx = args.iter().position(|arg| arg == flag).unwrap();
+            assert!(Path::new(&args[idx + 1]).is_absolute(), "{flag}");
+        }
+        assert!(!args.iter().any(|arg| arg == "-I" || arg == "-P"));
+    }
+
     #[test]
     fn off_does_not_call_ocr() {
         let (text, _) =

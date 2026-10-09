@@ -1,15 +1,49 @@
+use chrono::Datelike;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use crate::{DEFAULT_PRODUCTMESH_NIP, SourceKind};
+
+/// Domyślny minimalny score dopasowania — wspólny dla CLI i MCP.
+pub(crate) const DEFAULT_REVIEW_SCORE: u8 = 70;
+/// Dolna granica akceptowanego `--review-score` / `review_score`.
+pub(crate) const MIN_REVIEW_SCORE: u8 = 50;
+/// Górna granica akceptowanego `--review-score` / `review_score`.
+pub(crate) const MAX_REVIEW_SCORE: u8 = 100;
+/// Domyślny limit dokumentów KSeF zatwierdzanych w jednym przebiegu (`0` = bez limitu).
+pub(crate) const DEFAULT_MAX_APPROVE: usize = 50;
+/// Env var, który wymusza `--require-mail` / `require_mail` (np. `1`).
+pub(crate) const APPROVE_REQUIRE_MAIL_ENV: &str = "LAB_APPROVE_REQUIRE_MAIL";
+
+/// Czy `LAB_APPROVE_REQUIRE_MAIL` włącza filtr `require_mail`. Env tylko włącza:
+/// ani flaga CLI, ani argument MCP nie mogą go wyłączyć.
+pub(crate) fn approve_require_mail_from_env() -> bool {
+    env_flag_enabled(std::env::var(APPROVE_REQUIRE_MAIL_ENV).ok().as_deref())
+}
+
+/// `1`, `true`, `yes`, `on` (bez względu na wielkość liter) włączają flagę.
+pub(crate) fn env_flag_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// Domyślny rok rozliczeniowy: bieżący rok wg czasu lokalnego.
+pub(crate) fn default_year() -> i32 {
+    chrono::Local::now().year()
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "lab-cli")]
 #[command(about = "LAB — Lazy Accounting Buddy", long_about = None)]
 pub(crate) struct Cli {
     /// Dedykowana baza SQLite na rekordy, przebiegi i dopasowania.
-    #[arg(long, global = true, default_value = "lab.sqlite")]
-    pub(crate) db: PathBuf,
+    /// Domyślnie lab.sqlite w katalogu LAB (LAB_ROOT, zob. lab doctor).
+    #[arg(long, global = true)]
+    pub(crate) db: Option<PathBuf>,
     #[command(subcommand)]
     pub(crate) command: Option<Commands>,
 }
@@ -40,10 +74,10 @@ pub(crate) enum Commands {
         /// Tylko Saldeo.
         #[arg(long)]
         saldeo: bool,
-        /// Rok rozliczeniowy.
-        #[arg(long, default_value_t = 2026)]
+        /// Rok rozliczeniowy (domyślnie bieżący).
+        #[arg(long, default_value_t = default_year())]
         year: i32,
-        /// Katalog/plik z eksportem KSeF (XML, JSON, JSONL). Domyślnie data/ksef-<year>.
+        /// Katalog/plik z lokalnym eksportem KSeF (XML, JSON, JSONL). Bez tej flagi KSeF jest pobierany online.
         #[arg(long)]
         ksef_input: Option<PathBuf>,
         /// Google OAuth Desktop Client JSON do odświeżenia tokenu Gmail.
@@ -74,8 +108,12 @@ pub(crate) enum Commands {
         /// Raw documents.json z Saldeo albo JSON/JSONL z rekordami Saldeo.
         #[arg(long)]
         saldeo: Option<PathBuf>,
-        /// Minimalny score dopasowania.
-        #[arg(long, default_value_t = 45)]
+        /// Minimalny score dopasowania (50–100).
+        #[arg(
+            long,
+            default_value_t = DEFAULT_REVIEW_SCORE,
+            value_parser = clap::value_parser!(u8).range(MIN_REVIEW_SCORE as i64..=MAX_REVIEW_SCORE as i64)
+        )]
         review_score: u8,
         /// Plik JSON z raportem.
         #[arg(long)]
@@ -89,14 +127,14 @@ pub(crate) enum Commands {
         /// Zapisz temporalny snapshot tri-reconcile w SQLite.
         #[arg(long)]
         store: bool,
-        /// Rok przy --store i --status.
-        #[arg(long, default_value_t = 2026)]
+        /// Rok przy --store i --status (domyślnie bieżący).
+        #[arg(long, default_value_t = default_year())]
         year: i32,
     },
     /// Wysyła brakujące faktury do SaldeoSMART.
     Upload {
-        /// Rok rozliczeniowy.
-        #[arg(long, default_value_t = 2026)]
+        /// Rok rozliczeniowy (domyślnie bieżący).
+        #[arg(long, default_value_t = default_year())]
         year: i32,
         /// Raport tri-reconcile JSON. Jeśli brak, podaj --mail, --ksef i --saldeo.
         #[arg(long)]
@@ -110,8 +148,12 @@ pub(crate) enum Commands {
         /// Raw documents.json z Saldeo albo JSON/JSONL z rekordami Saldeo.
         #[arg(long)]
         saldeo: Option<PathBuf>,
-        /// Minimalny score dopasowania, gdy raport jest liczony z wejść.
-        #[arg(long, default_value_t = 70)]
+        /// Minimalny score dopasowania (50–100), gdy raport jest liczony z wejść.
+        #[arg(
+            long,
+            default_value_t = DEFAULT_REVIEW_SCORE,
+            value_parser = clap::value_parser!(u8).range(MIN_REVIEW_SCORE as i64..=MAX_REVIEW_SCORE as i64)
+        )]
         review_score: u8,
         /// Plik JSON z wynikiem.
         #[arg(long)]
@@ -122,17 +164,27 @@ pub(crate) enum Commands {
         /// Wykonaj upload do Saldeo. Bez tej flagi zwraca tylko plan.
         #[arg(long)]
         confirm: bool,
-        /// Po uploadzie zatwierdź w Saldeo wszystkie nieoznaczone dokumenty KSeF.
+        /// Po uploadzie zatwierdź w Saldeo nieoznaczone dokumenty KSeF (z limitem --max-approve).
         #[arg(long)]
         approve: bool,
+        /// Przy --approve: gdy dokumentów do zatwierdzenia jest więcej, nie zatwierdzaj żadnego (0 = bez limitu).
+        #[arg(long, default_value_t = DEFAULT_MAX_APPROVE)]
+        max_approve: usize,
+        /// Przy --approve: zatwierdzaj tylko dokumenty z fakturą z Gmaila (też LAB_APPROVE_REQUIRE_MAIL=1).
+        #[arg(long)]
+        require_mail: bool,
     },
     /// Uzupełnia lokalne dane Saldeo z KSeF/Gmail i zgłasza duplikaty.
     Repair {
-        /// Rok rozliczeniowy.
-        #[arg(long, default_value_t = 2026)]
+        /// Rok rozliczeniowy (domyślnie bieżący).
+        #[arg(long, default_value_t = default_year())]
         year: i32,
-        /// Minimalny score dopasowania.
-        #[arg(long, default_value_t = 70)]
+        /// Minimalny score dopasowania (50–100).
+        #[arg(
+            long,
+            default_value_t = DEFAULT_REVIEW_SCORE,
+            value_parser = clap::value_parser!(u8).range(MIN_REVIEW_SCORE as i64..=MAX_REVIEW_SCORE as i64)
+        )]
         review_score: u8,
         /// Dodatkowo odczytaj brakujące PDF-y przez LLM/OpenRouter.
         #[arg(long)]
@@ -144,17 +196,27 @@ pub(crate) enum Commands {
         #[arg(long)]
         output: Option<PathBuf>,
     },
-    /// Zatwierdza w Saldeo nieoznaczone dokumenty KSeF.
+    /// Zatwierdza w Saldeo nieoznaczone dokumenty KSeF (domyślnie najwyżej 50 naraz).
     Approve {
-        /// Rok rozliczeniowy.
-        #[arg(long, default_value_t = 2026)]
+        /// Rok rozliczeniowy (domyślnie bieżący).
+        #[arg(long, default_value_t = default_year())]
         year: i32,
-        /// Minimalny score dopasowania przy budowie listy dokumentów.
-        #[arg(long, default_value_t = 70)]
+        /// Minimalny score dopasowania (50–100) przy budowie listy dokumentów.
+        #[arg(
+            long,
+            default_value_t = DEFAULT_REVIEW_SCORE,
+            value_parser = clap::value_parser!(u8).range(MIN_REVIEW_SCORE as i64..=MAX_REVIEW_SCORE as i64)
+        )]
         review_score: u8,
         /// Wykonaj zatwierdzenie w Saldeo. Bez tej flagi zwraca tylko plan.
         #[arg(long)]
         confirm: bool,
+        /// Gdy dokumentów do zatwierdzenia jest więcej, nie zatwierdzaj żadnego (0 = bez limitu).
+        #[arg(long, default_value_t = DEFAULT_MAX_APPROVE)]
+        max_approve: usize,
+        /// Zatwierdzaj tylko dokumenty z fakturą z Gmaila (też LAB_APPROVE_REQUIRE_MAIL=1).
+        #[arg(long)]
+        require_mail: bool,
         /// Plik JSON z wynikiem.
         #[arg(long)]
         output: Option<PathBuf>,

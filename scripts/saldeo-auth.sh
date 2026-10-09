@@ -12,9 +12,10 @@ mkdir -p "$(dirname "$OUT")"
 cat <<EOF
 Saldeo auth
 ===========
-Jeśli w Keychain lub środowisku są SALDEO_USERNAME i SALDEO_PASSWORD,
-skrypt wypełni formularz sam. W przeciwnym razie otworzy Helium
-i poczeka, aż sesja będzie ważna.
+Login i hasło skrypt bierze z pliku wskazanego przez LAB_SALDEO_LOGIN_FILE
+(tak przekazuje je \`lab onboard\`) albo ze zmiennych środowiskowych
+SALDEO_USERNAME i SALDEO_PASSWORD; sam nie czyta Keychain ani .env.
+Bez danych logowania otworzy Helium i poczeka, aż zalogujesz się w oknie.
 Zapis: $OUT
 EOF
 
@@ -45,9 +46,16 @@ if [[ -n "${SALDEO_USERNAME:-}" && -n "${SALDEO_PASSWORD:-}" ]]; then
 fi
 
 PREFIX="${LAB_PLAYWRIGHT_PREFIX:-$HOME/.config/lab/playwright}"
+# Ta sama wersja co PLAYWRIGHT_VERSION w src/onboard.rs; LAB_PLAYWRIGHT_VERSION nadpisuje.
+PLAYWRIGHT_VERSION="${LAB_PLAYWRIGHT_VERSION:-1.63.0}"
+# Zainstalowana wersja zostaje, nawet jeśli inna niż przypięta.
 if [[ ! -d "$PREFIX/node_modules/playwright" ]]; then
-  echo "Instaluję Playwright w $PREFIX (bez przeglądarki Playwright)..."
-  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install --prefix "$PREFIX" --no-fund --no-audit playwright
+  if [[ ${#PLAYWRIGHT_VERSION} -gt 64 || ! "$PLAYWRIGHT_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]; then
+    echo "ERROR: LAB_PLAYWRIGHT_VERSION: oczekuję wersji albo dist-tagu (litery, cyfry, '.', '-'): $PLAYWRIGHT_VERSION" >&2
+    exit 1
+  fi
+  echo "Instaluję Playwright $PLAYWRIGHT_VERSION w $PREFIX (bez przeglądarki Playwright)..."
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install --prefix "$PREFIX" --ignore-scripts --no-fund --no-audit "playwright@$PLAYWRIGHT_VERSION"
 fi
 LAB_SALDEO_STORAGE_STATE="$OUT" \
 SALDEO_URL="$URL" \

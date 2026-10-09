@@ -1,5 +1,10 @@
 use crate::*;
 
+const KSEF_PROD_BASE_URL: &str = "https://api.ksef.mf.gov.pl/v2";
+const KSEF_CACHE_IDENTITY_FILE: &str = "ksef_cache_identity.json";
+/// Token dostępu odnawiamy, gdy do końca ważności zostało mniej niż tyle sekund.
+const KSEF_ACCESS_TOKEN_MARGIN_SECS: i64 = 120;
+
 #[derive(Debug, Clone)]
 pub(crate) struct KsefOnlineConfig {
     base_url: String,
@@ -17,6 +22,91 @@ pub(crate) struct KsefTokenCache {
     access_valid_until: DateTime<Utc>,
     refresh_token: Option<String>,
     refresh_valid_until: Option<DateTime<Utc>>,
+}
+
+impl KsefTokenCache {
+    fn matches(&self, config: &KsefOnlineConfig) -> bool {
+        self.base_url == config.base_url
+            && self.context_type == config.context_type
+            && self.context_value == config.context_value
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct KsefAccessToken {
+    token: String,
+    /// `None`, gdy ważność nie jest znana (np. `KSEF_ACCESS_TOKEN` z konfiguracji).
+    valid_until: Option<DateTime<Utc>>,
+}
+
+impl KsefAccessToken {
+    fn expires_soon(&self, now: DateTime<Utc>) -> bool {
+        self.valid_until.is_some_and(|until| {
+            until <= now + chrono::Duration::seconds(KSEF_ACCESS_TOKEN_MARGIN_SECS)
+        })
+    }
+}
+
+/// Wynik zapytania wymagającego tokenu dostępu: 401 wraca osobno, żeby można było
+/// zalogować się ponownie i powtórzyć zapytanie.
+pub(crate) enum KsefAuthorized<T> {
+    Done(T),
+    Unauthorized(String),
+}
+
+/// Dla czego mają być metadane: środowisko (base URL), kontekst i rok.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KsefCacheTarget {
+    year: i32,
+    base_url: String,
+    context_type: String,
+    context_value: String,
+}
+
+impl KsefCacheTarget {
+    fn current(year: i32) -> Self {
+        let (context_type, context_value) = ksef_context();
+        Self {
+            year,
+            base_url: ksef_base_url(),
+            context_type,
+            context_value,
+        }
+    }
+
+    fn online_identity(&self) -> KsefCacheIdentity {
+        KsefCacheIdentity {
+            year: self.year,
+            source: "online".to_string(),
+            base_url: Some(self.base_url.clone()),
+            context_type: Some(self.context_type.clone()),
+            context_value: Some(self.context_value.clone()),
+            fetched_at: Utc::now(),
+        }
+    }
+}
+
+/// Zapisywane obok `records.jsonl` w pliku `ksef_cache_identity.json`.
+/// Import lokalnego eksportu (`--ksef-input`) nie zna środowiska ani kontekstu.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub(crate) struct KsefCacheIdentity {
+    year: i32,
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    context_type: Option<String>,
+    #[serde(default)]
+    context_value: Option<String>,
+    fetched_at: DateTime<Utc>,
+}
+
+enum KsefCacheLookup {
+    Hit(KsefSyncResult),
+    Missing,
+    Stale,
+    Refused(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,11 +200,77 @@ pub(crate) fn ksef_online_sync_with_progress_and_cache(
     progress: Option<Arc<Mutex<String>>>,
     use_fresh_cache: bool,
 ) -> Result<KsefSyncResult> {
-    if use_fresh_cache {
-        if let Some(result) = ksef_fresh_cached_sync_result(year, out_dir, progress.clone())? {
-            return Ok(result);
+    let target = KsefCacheTarget::current(year);
+    let fresh_ttl = if use_fresh_cache {
+        ksef_cache_ttl()
+    } else {
+        None
+    };
+    ksef_sync_with_fetcher(year, out_dir, progress, fresh_ttl, &target, |progress| {
+        ksef_fetch_metadata_online(year, progress)
+    })
+}
+
+/// Rdzeń synchronizacji: świeży cache (gdy `fresh_ttl`), inaczej `fetch`; przy braku
+/// `KSEF_TOKEN` cache bez limitu wieku, ale tylko o tożsamości zgodnej z `target`.
+fn ksef_sync_with_fetcher(
+    year: i32,
+    out_dir: Option<&Path>,
+    progress: Option<Arc<Mutex<String>>>,
+    fresh_ttl: Option<Duration>,
+    target: &KsefCacheTarget,
+    fetch: impl FnOnce(Option<Arc<Mutex<String>>>) -> Result<Vec<Value>>,
+) -> Result<KsefSyncResult> {
+    if let Some(ttl) = fresh_ttl {
+        match ksef_cache_lookup(year, out_dir, progress.clone(), Some(ttl), target)? {
+            KsefCacheLookup::Hit(result) => return Ok(result),
+            KsefCacheLookup::Refused(reason) => {
+                eprintln!("  [KSeF] pomijam lokalny cache: {reason}");
+                if let Some(progress) = &progress {
+                    set_progress(
+                        progress,
+                        format!("KSeF: cache nie pasuje ({reason}), odświeżam online..."),
+                    );
+                }
+            }
+            KsefCacheLookup::Missing | KsefCacheLookup::Stale => {}
         }
     }
+    let metadata = match fetch(progress.clone()) {
+        Ok(metadata) => metadata,
+        Err(err) if is_missing_ksef_token(&err) => {
+            return match ksef_cache_lookup(year, out_dir, progress.clone(), None, target)? {
+                KsefCacheLookup::Hit(result) => {
+                    eprintln!(
+                        "  [KSeF] brak KSEF_TOKEN; używam lokalnego cache ({} rekordów)",
+                        result.summary.records_count
+                    );
+                    if let Some(progress) = &progress {
+                        set_progress(
+                            progress,
+                            format!(
+                                "KSeF: brak tokenu, lokalny cache ({} rekordów)",
+                                result.summary.records_count
+                            ),
+                        );
+                    }
+                    Ok(result)
+                }
+                KsefCacheLookup::Refused(reason) => Err(anyhow!(
+                    "brak KSEF_TOKEN, a lokalnego cache KSeF nie używam: {reason}"
+                )),
+                KsefCacheLookup::Missing | KsefCacheLookup::Stale => Err(err),
+            };
+        }
+        Err(err) => return Err(err),
+    };
+    ksef_store_online_metadata(year, out_dir, progress, target, &metadata)
+}
+
+fn ksef_fetch_metadata_online(
+    year: i32,
+    progress: Option<Arc<Mutex<String>>>,
+) -> Result<Vec<Value>> {
     if let Some(progress) = &progress {
         set_progress(
             progress,
@@ -129,34 +285,16 @@ pub(crate) fn ksef_online_sync_with_progress_and_cache(
     if let Some(progress) = &progress {
         set_progress(progress, "KSeF: pobieram token dostępu...");
     }
-    let access_token = match ksef_access_token(&client, &config) {
-        Ok(token) => token,
-        Err(err) if is_missing_ksef_token(&err) => {
-            if let Some(result) = ksef_cached_sync_result(year, out_dir, progress.clone(), None)? {
-                eprintln!(
-                    "  [KSeF] brak KSEF_TOKEN; używam lokalnego cache ({} rekordów)",
-                    result.summary.records_count
-                );
-                if let Some(progress) = &progress {
-                    set_progress(
-                        progress,
-                        format!(
-                            "KSeF: brak tokenu, lokalny cache ({} rekordów)",
-                            result.summary.records_count
-                        ),
-                    );
-                }
-                return Ok(result);
-            }
-            return Err(err);
-        }
-        Err(err) => return Err(err),
-    };
+    let mut access_token = ksef_access_token(&client, &config)?;
     let page_size = ksef_metadata_page_size();
+    let url = format!("{}/invoices/query/metadata", config.base_url);
     let mut metadata = Vec::new();
 
     for subject_type in ksef_subject_types() {
-        for (from, to) in ksef_year_quarter_ranges(year) {
+        let exact_ranges = ksef_year_exact_quarter_ranges(year);
+        for (range_index, (mut from, mut to)) in
+            ksef_year_quarter_ranges(year).into_iter().enumerate()
+        {
             let mut page_offset = 0usize;
             loop {
                 if let Some(progress) = &progress {
@@ -168,8 +306,6 @@ pub(crate) fn ksef_online_sync_with_progress_and_cache(
                         ),
                     );
                 }
-                ksef_rate_limit_wait_with_progress("metadata", 8, 16, 20, progress.clone())?;
-                let url = format!("{}/invoices/query/metadata", config.base_url);
                 let query = vec![
                     ("sortOrder".to_string(), "Asc".to_string()),
                     ("pageOffset".to_string(), page_offset.to_string()),
@@ -183,17 +319,52 @@ pub(crate) fn ksef_online_sync_with_progress_and_cache(
                         "to": to,
                     }
                 });
-                let response: KsefQueryMetadataResponse = ksef_send_with_retry(
-                    client
-                        .post(&url)
-                        .bearer_auth(&access_token)
-                        .header("X-Error-Format", "problem-details")
-                        .query(&query)
-                        .json(&body),
+                let response: Result<KsefQueryMetadataResponse> = ksef_authorized_request(
+                    &mut access_token,
                     "query invoice metadata",
-                )?
-                .json()
-                .context("KSeF metadata response JSON")?;
+                    || ksef_rate_limit_wait_with_progress("metadata", 8, 16, 20, progress.clone()),
+                    Utc::now,
+                    |rejected| ksef_renew_access_token(&client, &config, rejected),
+                    |token| {
+                        let response = ksef_send_with_retry_inner(
+                            client
+                                .post(&url)
+                                .bearer_auth(token)
+                                .header("X-Error-Format", "problem-details")
+                                .query(&query)
+                                .json(&body),
+                            "query invoice metadata",
+                            true,
+                        )?;
+                        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                            return Ok(KsefAuthorized::Unauthorized(
+                                response.text().unwrap_or_default(),
+                            ));
+                        }
+                        Ok(KsefAuthorized::Done(
+                            response.json().context("KSeF metadata response JSON")?,
+                        ))
+                    },
+                );
+                let response = match response {
+                    Ok(response) => response,
+                    // A KSeF version with a shorter range cap rejects the widened first or
+                    // last quarter: query the exact quarter instead.
+                    Err(err)
+                        if page_offset == 0
+                            && ksef_error_is_bad_request(&err)
+                            && exact_ranges
+                                .get(range_index)
+                                .is_some_and(|exact| *exact != (from.clone(), to.clone())) =>
+                    {
+                        eprintln!(
+                            "  [KSeF] zakres {from}..{to} odrzucony ({err}); ponawiam dokładny kwartał"
+                        );
+                        (from, to) = exact_ranges[range_index].clone();
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
 
                 if response.is_truncated {
                     return Err(anyhow!(
@@ -222,7 +393,16 @@ pub(crate) fn ksef_online_sync_with_progress_and_cache(
             }
         }
     }
+    Ok(metadata)
+}
 
+fn ksef_store_online_metadata(
+    year: i32,
+    out_dir: Option<&Path>,
+    progress: Option<Arc<Mutex<String>>>,
+    target: &KsefCacheTarget,
+    metadata: &[Value],
+) -> Result<KsefSyncResult> {
     if let Some(progress) = &progress {
         set_progress(
             progress,
@@ -232,25 +412,20 @@ pub(crate) fn ksef_online_sync_with_progress_and_cache(
             ),
         );
     }
-    let mut seen = HashSet::new();
-    let mut records = Vec::new();
-    for item in &metadata {
-        if let Some(record) = ksef_metadata_to_record(item) {
-            if seen.insert(record.content_hash.clone()) {
-                records.push(record);
-            }
-        }
-    }
+    let records = ksef_metadata_records_for_year(metadata, year);
 
     let out_dir = ksef_sync_output_dir(year, out_dir);
     fs::create_dir_all(&out_dir).with_context(|| format!("mkdir {}", out_dir.display()))?;
+    // Bez tożsamości w trakcie zapisu: przerwany zapis nie zostawi danych pod starą etykietą.
+    clear_ksef_cache_identity(&out_dir)?;
     let raw_output = out_dir.join("ksef_raw_metadata.json");
     let json_output = out_dir.join("records.json");
     let jsonl_output = out_dir.join("records.jsonl");
-    fs::write(&raw_output, serde_json::to_vec_pretty(&metadata)?)
+    fs::write(&raw_output, serde_json::to_vec_pretty(metadata)?)
         .with_context(|| format!("zapis {}", raw_output.display()))?;
     write_records(&records, OutputFormat::Json, Some(&json_output))?;
     write_records(&records, OutputFormat::Jsonl, Some(&jsonl_output))?;
+    write_ksef_cache_identity(&out_dir, &target.online_identity())?;
 
     Ok(KsefSyncResult {
         summary: KsefSyncSummary {
@@ -258,7 +433,7 @@ pub(crate) fn ksef_online_sync_with_progress_and_cache(
             records_count: records.len(),
             input: format!(
                 "online:{}:{}:{}",
-                config.base_url, config.context_type, config.context_value
+                target.base_url, target.context_type, target.context_value
             ),
             json_output: json_output.display().to_string(),
             jsonl_output: jsonl_output.display().to_string(),
@@ -269,6 +444,17 @@ pub(crate) fn ksef_online_sync_with_progress_and_cache(
 
 pub(crate) fn ksef_online_config() -> Result<KsefOnlineConfig> {
     let base_url = ksef_base_url();
+    let (context_type, context_value) = ksef_context();
+    let ksef_token = secret_value(Secret::KsefToken)?.filter(|value| !value.trim().is_empty());
+    Ok(KsefOnlineConfig {
+        base_url,
+        context_type,
+        context_value,
+        ksef_token,
+    })
+}
+
+fn ksef_context() -> (String, String) {
     let context_type = lab_config_var("KSEF_CONTEXT_TYPE").unwrap_or_else(|| "Nip".to_string());
     let raw_context = lab_config_var("KSEF_CONTEXT_NIP")
         .or_else(|| lab_config_var("KSEF_NIP"))
@@ -278,13 +464,7 @@ pub(crate) fn ksef_online_config() -> Result<KsefOnlineConfig> {
     } else {
         raw_context
     };
-    let ksef_token = secret_value(Secret::KsefToken)?.filter(|value| !value.trim().is_empty());
-    Ok(KsefOnlineConfig {
-        base_url,
-        context_type,
-        context_value,
-        ksef_token,
-    })
+    (context_type, context_value)
 }
 
 pub(crate) fn missing_ksef_token_error() -> anyhow::Error {
@@ -307,7 +487,7 @@ pub(crate) fn ksef_base_url() -> String {
             "demo" | "preprod" | "pre-production" => {
                 "https://api-demo.ksef.mf.gov.pl/v2".to_string()
             }
-            _ => "https://api.ksef.mf.gov.pl/v2".to_string(),
+            _ => KSEF_PROD_BASE_URL.to_string(),
         }
     });
     url.trim_end_matches('/').to_string()
@@ -334,39 +514,170 @@ pub(crate) fn ksef_sync_output_dir(year: i32, out_dir: Option<&Path>) -> PathBuf
         .unwrap_or_else(|| configured_ksef_out_path(year))
 }
 
+/// Katalog roku w `KSEF_DATA_DIR`: `<KSEF_DATA_DIR>/ksef-<rok>`. Dla zgodności wstecz
+/// sam `KSEF_DATA_DIR` (bez podkatalogu roku), gdy nie ma jeszcze katalogu roku, a cache
+/// w nim jest zapisany dla tego roku.
+pub(crate) fn ksef_data_dir_year_path(root: &Path, year: i32) -> PathBuf {
+    let per_year = root.join(format!("ksef-{year}"));
+    if per_year.join("records.jsonl").is_file() {
+        return per_year;
+    }
+    if root.join("records.jsonl").is_file() && ksef_cache_dir_year(root) == Some(year) {
+        return root.to_path_buf();
+    }
+    per_year
+}
+
+/// Rok cache: z `ksef_cache_identity.json`, a dla cache sprzed tej wersji z nazwy katalogu
+/// (`ksef-2026`) albo z dat wystawienia zapisanych faktur.
+fn ksef_cache_dir_year(dir: &Path) -> Option<i32> {
+    match read_ksef_cache_identity(dir) {
+        Ok(Some(identity)) => Some(identity.year),
+        Ok(None) => ksef_legacy_dir_year(dir),
+        Err(_) => None,
+    }
+}
+
+fn ksef_legacy_dir_year(dir: &Path) -> Option<i32> {
+    ksef_dir_name_year(dir).or_else(|| {
+        let records = load_records(SourceKind::Ksef, &dir.join("records.jsonl")).ok()?;
+        let mut years = records
+            .iter()
+            .filter_map(|record| record.issue_date.map(|date| date.year()));
+        let first = years.next()?;
+        years.all(|year| year == first).then_some(first)
+    })
+}
+
+fn ksef_dir_name_year(dir: &Path) -> Option<i32> {
+    let name = dir.file_name()?.to_str()?;
+    name.split(|c: char| !c.is_ascii_digit())
+        .filter(|part| part.len() == 4)
+        .filter_map(|part| part.parse::<i32>().ok())
+        .rfind(|year| (2000..=2100).contains(year))
+}
+
+fn ksef_cache_identity_path(dir: &Path) -> PathBuf {
+    dir.join(KSEF_CACHE_IDENTITY_FILE)
+}
+
+fn read_ksef_cache_identity(dir: &Path) -> Result<Option<KsefCacheIdentity>> {
+    let path = ksef_cache_identity_path(dir);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("odczyt {}", path.display())),
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .with_context(|| format!("JSON {}", path.display()))
+}
+
+fn write_ksef_cache_identity(dir: &Path, identity: &KsefCacheIdentity) -> Result<()> {
+    let path = ksef_cache_identity_path(dir);
+    fs::write(&path, serde_json::to_vec_pretty(identity)?)
+        .with_context(|| format!("zapis {}", path.display()))
+}
+
+fn clear_ksef_cache_identity(dir: &Path) -> Result<()> {
+    let path = ksef_cache_identity_path(dir);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("usunięcie {}", path.display())),
+    }
+}
+
+/// Powód odrzucenia cache z katalogu `dir` dla `target`; `None` = cache pasuje.
+fn ksef_cache_refusal(dir: &Path, target: &KsefCacheTarget) -> Option<String> {
+    match read_ksef_cache_identity(dir) {
+        Ok(stored) => ksef_identity_refusal(stored.as_ref(), target, || ksef_legacy_dir_year(dir)),
+        Err(err) => Some(format!("nieczytelna tożsamość cache: {err:#}")),
+    }
+}
+
+fn ksef_identity_refusal(
+    stored: Option<&KsefCacheIdentity>,
+    target: &KsefCacheTarget,
+    legacy_year: impl FnOnce() -> Option<i32>,
+) -> Option<String> {
+    let Some(stored) = stored else {
+        if target.base_url != KSEF_PROD_BASE_URL {
+            return Some(format!(
+                "cache bez zapisanego środowiska jest ważny tylko dla produkcyjnego KSeF ({KSEF_PROD_BASE_URL}), bieżące: {}",
+                target.base_url
+            ));
+        }
+        return match legacy_year() {
+            Some(year) if year == target.year => None,
+            Some(year) => Some(format!(
+                "cache jest dla roku {year}, potrzebny {}",
+                target.year
+            )),
+            None => Some(format!(
+                "cache bez zapisanego roku; nie potwierdzę, że dotyczy roku {}",
+                target.year
+            )),
+        };
+    };
+    if stored.year != target.year {
+        return Some(format!(
+            "cache jest dla roku {}, potrzebny {}",
+            stored.year, target.year
+        ));
+    }
+    let Some(base_url) = stored.base_url.as_deref() else {
+        // Import lokalnego eksportu: środowisko nieznane, jak w cache sprzed tej wersji.
+        return (target.base_url != KSEF_PROD_BASE_URL).then(|| {
+            format!(
+                "cache z importu lokalnego eksportu jest ważny tylko dla produkcyjnego KSeF ({KSEF_PROD_BASE_URL}), bieżące: {}",
+                target.base_url
+            )
+        });
+    };
+    if base_url != target.base_url {
+        return Some(format!(
+            "cache pochodzi ze środowiska {base_url}, bieżące: {}",
+            target.base_url
+        ));
+    }
+    let context_matches = stored
+        .context_type
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case(&target.context_type))
+        && stored.context_value.as_deref() == Some(target.context_value.as_str());
+    if !context_matches {
+        return Some(format!(
+            "cache dotyczy kontekstu {}:{}, bieżący: {}:{}",
+            stored.context_type.as_deref().unwrap_or("?"),
+            stored.context_value.as_deref().unwrap_or("?"),
+            target.context_type,
+            target.context_value
+        ));
+    }
+    None
+}
+
 pub(crate) fn ksef_cache_ttl() -> Option<Duration> {
-    let minutes = lab_config_var("KSEF_CACHE_TTL_MINS")
-        .and_then(|value| value.parse::<u64>().ok())
+    ksef_cache_ttl_from(lab_config_var("KSEF_CACHE_TTL_MINS").as_deref())
+}
+
+fn ksef_cache_ttl_from(value: Option<&str>) -> Option<Duration> {
+    let minutes = value
+        .and_then(|value| value.trim().parse::<u64>().ok())
         .unwrap_or(360);
     (minutes > 0).then_some(Duration::from_secs(minutes * 60))
 }
 
-pub(crate) fn ksef_fresh_cached_sync_result(
-    year: i32,
-    out_dir: Option<&Path>,
-    progress: Option<Arc<Mutex<String>>>,
-) -> Result<Option<KsefSyncResult>> {
-    ksef_fresh_cached_sync_result_with_ttl(year, out_dir, progress, ksef_cache_ttl())
-}
-
-fn ksef_fresh_cached_sync_result_with_ttl(
+/// Cache metadanych z katalogu roku. `ttl = None` oznacza brak limitu wieku (fallback
+/// bez tokenu); tożsamość cache musi zgadzać się z `target` w obu przypadkach.
+fn ksef_cache_lookup(
     year: i32,
     out_dir: Option<&Path>,
     progress: Option<Arc<Mutex<String>>>,
     ttl: Option<Duration>,
-) -> Result<Option<KsefSyncResult>> {
-    let Some(ttl) = ttl else {
-        return Ok(None);
-    };
-    ksef_cached_sync_result(year, out_dir, progress, Some(ttl))
-}
-
-pub(crate) fn ksef_cached_sync_result(
-    year: i32,
-    out_dir: Option<&Path>,
-    progress: Option<Arc<Mutex<String>>>,
-    ttl: Option<Duration>,
-) -> Result<Option<KsefSyncResult>> {
+    target: &KsefCacheTarget,
+) -> Result<KsefCacheLookup> {
     let out_dir = ksef_sync_output_dir(year, out_dir);
     let jsonl_output = out_dir.join("records.jsonl");
     if !jsonl_output.is_file() {
@@ -375,14 +686,20 @@ pub(crate) fn ksef_cached_sync_result(
         {
             set_progress(progress, "KSeF: brak lokalnego cache, odświeżam online...");
         }
-        return Ok(None);
+        return Ok(KsefCacheLookup::Missing);
+    }
+    if let Some(reason) = ksef_cache_refusal(&out_dir, target) {
+        return Ok(KsefCacheLookup::Refused(format!(
+            "{} ({reason})",
+            out_dir.display()
+        )));
     }
     let age = fs::metadata(&jsonl_output)
         .and_then(|metadata| metadata.modified())
         .ok()
         .and_then(|modified| modified.elapsed().ok());
     let Some(age) = age else {
-        return Ok(None);
+        return Ok(KsefCacheLookup::Stale);
     };
     if let Some(ttl) = ttl
         && age > ttl
@@ -396,7 +713,7 @@ pub(crate) fn ksef_cached_sync_result(
                 ),
             );
         }
-        return Ok(None);
+        return Ok(KsefCacheLookup::Stale);
     }
     let records = load_records(SourceKind::Ksef, &jsonl_output)?;
     if let Some(progress) = &progress {
@@ -415,7 +732,7 @@ pub(crate) fn ksef_cached_sync_result(
         );
     }
     let json_output = out_dir.join("records.json");
-    Ok(Some(KsefSyncResult {
+    Ok(KsefCacheLookup::Hit(KsefSyncResult {
         summary: KsefSyncSummary {
             year,
             records_count: records.len(),
@@ -451,9 +768,20 @@ pub(crate) fn ksef_subject_types() -> Vec<String> {
         .unwrap_or_else(|| vec!["Subject1".to_string(), "Subject2".to_string()])
 }
 
+/// Metadata query ranges for `year`, one per quarter. The year is widened by a
+/// day on both sides (31 Dec of the previous year .. 2 Jan of the next), so an
+/// invoice dated 1 Jan or 31 Dec is fetched whether KSeF compares the issue date
+/// in UTC or Polish time and treats `to` as inclusive or exclusive. Each range
+/// starts where the previous one ends, so no day falls between them. The
+/// neighbouring days are dropped afterwards by `ksef_metadata_records_for_year`.
 pub(crate) fn ksef_year_quarter_ranges(year: i32) -> Vec<(String, String)> {
-    let starts = [(year, 1, 1), (year, 4, 1), (year, 7, 1), (year, 10, 1)];
-    let ends = [(year, 4, 1), (year, 7, 1), (year, 10, 1), (year + 1, 1, 1)];
+    let starts = [
+        (year - 1, 12, 31),
+        (year, 4, 1),
+        (year, 7, 1),
+        (year, 10, 1),
+    ];
+    let ends = [(year, 4, 1), (year, 7, 1), (year, 10, 1), (year + 1, 1, 2)];
     starts
         .into_iter()
         .zip(ends)
@@ -466,22 +794,67 @@ pub(crate) fn ksef_year_quarter_ranges(year: i32) -> Vec<(String, String)> {
         .collect()
 }
 
-pub(crate) fn ksef_access_token(client: &Client, config: &KsefOnlineConfig) -> Result<String> {
+/// The year's quarters without the neighbouring days, used when KSeF rejects a
+/// widened range.
+pub(crate) fn ksef_year_exact_quarter_ranges(year: i32) -> Vec<(String, String)> {
+    let bounds = [(year, 1), (year, 4), (year, 7), (year, 10), (year + 1, 1)];
+    bounds
+        .windows(2)
+        .map(|pair| {
+            (
+                format!("{:04}-{:02}-01T00:00:00+00:00", pair[0].0, pair[0].1),
+                format!("{:04}-{:02}-01T00:00:00+00:00", pair[1].0, pair[1].1),
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn ksef_error_is_bad_request(err: &anyhow::Error) -> bool {
+    err.to_string().contains("HTTP 400")
+}
+
+/// Records of `year` from metadata fetched over the widened ranges: records
+/// issued in another year are dropped, records without a readable issue date
+/// kept, and a document returned by two overlapping ranges kept once (by KSeF
+/// number).
+pub(crate) fn ksef_metadata_records_for_year(metadata: &[Value], year: i32) -> Vec<InvoiceRecord> {
+    let mut seen = HashSet::new();
+    metadata
+        .iter()
+        .filter_map(ksef_metadata_to_record)
+        .filter(|record| record.issue_date.is_none_or(|date| date.year() == year))
+        .filter(|record| {
+            seen.insert(
+                normalized_ksef_reference(record).unwrap_or_else(|| record.content_hash.clone()),
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn ksef_access_token(
+    client: &Client,
+    config: &KsefOnlineConfig,
+) -> Result<KsefAccessToken> {
     if let Some(token) = lab_config_var("KSEF_ACCESS_TOKEN") {
-        return Ok(token);
+        return Ok(KsefAccessToken {
+            token,
+            valid_until: None,
+        });
     }
 
+    let margin = chrono::Duration::seconds(KSEF_ACCESS_TOKEN_MARGIN_SECS);
     if let Ok(cache) = read_ksef_token_cache()
-        && cache.base_url == config.base_url
-        && cache.context_type == config.context_type
-        && cache.context_value == config.context_value
+        && cache.matches(config)
     {
-        if cache.access_valid_until > Utc::now() + chrono::Duration::seconds(60) {
-            return Ok(cache.access_token);
+        if cache.access_valid_until > Utc::now() + margin {
+            return Ok(KsefAccessToken {
+                token: cache.access_token,
+                valid_until: Some(cache.access_valid_until),
+            });
         }
         if let (Some(refresh_token), Some(refresh_valid_until)) =
             (cache.refresh_token.clone(), cache.refresh_valid_until)
-            && refresh_valid_until > Utc::now() + chrono::Duration::seconds(60)
+            && refresh_valid_until > Utc::now() + margin
             && let Ok(refreshed) = ksef_refresh_access_token(client, config, &cache, &refresh_token)
         {
             return Ok(refreshed);
@@ -491,12 +864,88 @@ pub(crate) fn ksef_access_token(client: &Client, config: &KsefOnlineConfig) -> R
     ksef_authenticate_with_ksef_token(client, config)
 }
 
+/// Nowy token dostępu w trakcie synchronizacji: `rejected = None` przed wygaśnięciem
+/// (cache → refresh → logowanie), `Some(token)` po HTTP 401 dla tego tokenu.
+fn ksef_renew_access_token(
+    client: &Client,
+    config: &KsefOnlineConfig,
+    rejected: Option<&str>,
+) -> Result<KsefAccessToken> {
+    let Some(rejected) = rejected else {
+        return ksef_access_token(client, config);
+    };
+    if lab_config_var("KSEF_ACCESS_TOKEN").is_some() {
+        return Err(anyhow!(
+            "KSeF odrzucił KSEF_ACCESS_TOKEN (HTTP 401); usuń tę zmienną albo ustaw ważny token"
+        ));
+    }
+    let margin = chrono::Duration::seconds(KSEF_ACCESS_TOKEN_MARGIN_SECS);
+    if let Ok(cache) = read_ksef_token_cache()
+        && cache.matches(config)
+    {
+        if cache.access_token != rejected && cache.access_valid_until > Utc::now() + margin {
+            return Ok(KsefAccessToken {
+                token: cache.access_token,
+                valid_until: Some(cache.access_valid_until),
+            });
+        }
+        if let (Some(refresh_token), Some(refresh_valid_until)) =
+            (cache.refresh_token.clone(), cache.refresh_valid_until)
+            && refresh_valid_until > Utc::now() + margin
+        {
+            match ksef_refresh_access_token(client, config, &cache, &refresh_token) {
+                Ok(token) if token.token != rejected => return Ok(token),
+                Ok(_) => eprintln!("  [KSeF] refresh zwrócił odrzucony token; loguję się od nowa"),
+                Err(err) => {
+                    eprintln!("  [KSeF] refresh tokenu nieudany ({err:#}); loguję się od nowa")
+                }
+            }
+        }
+    }
+    ksef_authenticate_with_ksef_token(client, config)
+}
+
+/// Jedno zapytanie z tokenem dostępu. Przed wysłaniem (po `before_send`, np. lokalnym
+/// limiterze, który potrafi długo czekać) odnawia token bliski wygaśnięcia; po HTTP 401
+/// loguje się ponownie i powtarza zapytanie raz. Drugie 401 kończy się błędem.
+pub(crate) fn ksef_authorized_request<T>(
+    token: &mut KsefAccessToken,
+    description: &str,
+    mut before_send: impl FnMut() -> Result<()>,
+    mut now: impl FnMut() -> DateTime<Utc>,
+    mut renew: impl FnMut(Option<&str>) -> Result<KsefAccessToken>,
+    mut send: impl FnMut(&str) -> Result<KsefAuthorized<T>>,
+) -> Result<T> {
+    let mut reauthenticated = false;
+    loop {
+        before_send()?;
+        if token.expires_soon(now()) {
+            eprintln!("  [KSeF] token dostępu wygasa ({description}), odnawiam...");
+            *token = renew(None)?;
+        }
+        match send(&token.token)? {
+            KsefAuthorized::Done(value) => return Ok(value),
+            KsefAuthorized::Unauthorized(body) if reauthenticated => {
+                return Err(anyhow!(
+                    "KSeF {description} HTTP 401 Unauthorized także po ponownym logowaniu: {body}"
+                ));
+            }
+            KsefAuthorized::Unauthorized(_) => {
+                eprintln!("  [KSeF] HTTP 401 ({description}), loguję się ponownie...");
+                reauthenticated = true;
+                let rejected = token.token.clone();
+                *token = renew(Some(&rejected))?;
+            }
+        }
+    }
+}
+
 pub(crate) fn ksef_refresh_access_token(
     client: &Client,
     config: &KsefOnlineConfig,
     cache: &KsefTokenCache,
     refresh_token: &str,
-) -> Result<String> {
+) -> Result<KsefAccessToken> {
     let url = format!("{}/auth/token/refresh", config.base_url);
     let response: KsefRefreshResponse = ksef_send_with_retry(
         client
@@ -517,13 +966,16 @@ pub(crate) fn ksef_refresh_access_token(
         refresh_valid_until: cache.refresh_valid_until,
     };
     save_ksef_token_cache(&new_cache)?;
-    Ok(new_cache.access_token)
+    Ok(KsefAccessToken {
+        token: new_cache.access_token,
+        valid_until: Some(new_cache.access_valid_until),
+    })
 }
 
 pub(crate) fn ksef_authenticate_with_ksef_token(
     client: &Client,
     config: &KsefOnlineConfig,
-) -> Result<String> {
+) -> Result<KsefAccessToken> {
     let ksef_token = config
         .ksef_token
         .as_deref()
@@ -586,7 +1038,10 @@ pub(crate) fn ksef_authenticate_with_ksef_token(
         refresh_valid_until: Some(tokens.refresh_token.valid_until),
     };
     save_ksef_token_cache(&cache)?;
-    Ok(cache.access_token)
+    Ok(KsefAccessToken {
+        token: cache.access_token,
+        valid_until: Some(cache.access_valid_until),
+    })
 }
 
 pub(crate) fn ksef_wait_for_auth(
@@ -735,6 +1190,15 @@ pub(crate) fn ksef_send_with_retry(
     builder: reqwest::blocking::RequestBuilder,
     description: &str,
 ) -> Result<reqwest::blocking::Response> {
+    ksef_send_with_retry_inner(builder, description, false)
+}
+
+/// `pass_unauthorized`: HTTP 401 wraca jako odpowiedź (do ponownego logowania), nie błąd.
+fn ksef_send_with_retry_inner(
+    builder: reqwest::blocking::RequestBuilder,
+    description: &str,
+    pass_unauthorized: bool,
+) -> Result<reqwest::blocking::Response> {
     let mut delay = Duration::from_secs(1);
     for attempt in 0..6 {
         let request = builder
@@ -768,6 +1232,9 @@ pub(crate) fn ksef_send_with_retry(
                     sleep(delay);
                     delay = (delay * 2).min(Duration::from_secs(60));
                     continue;
+                }
+                if pass_unauthorized && status == reqwest::StatusCode::UNAUTHORIZED {
+                    return Ok(response);
                 }
                 if !status.is_success() {
                     let body = response.text().unwrap_or_default();
@@ -953,20 +1420,35 @@ pub(crate) fn ksef_metadata_to_record(item: &Value) -> Option<InvoiceRecord> {
             }
         });
     }
-    record.warnings.push("ksef online metadata".to_string());
+    record
+        .warnings
+        .push(KSEF_ONLINE_METADATA_MARKER.to_string());
     Some(record)
 }
 
+/// Provenance marker of a record built from KSeF online metadata; not a note for the user.
+pub(crate) const KSEF_ONLINE_METADATA_MARKER: &str = "ksef online metadata";
+
 pub(crate) fn ksef_sync(year: i32, input: &Path, out_dir: Option<&Path>) -> Result<KsefSyncResult> {
     let records = load_records(SourceKind::Ksef, input)?;
-    let out_dir = out_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(|| configured_ksef_out_path(year));
+    let out_dir = ksef_sync_output_dir(year, out_dir);
     fs::create_dir_all(&out_dir).with_context(|| format!("mkdir {}", out_dir.display()))?;
+    clear_ksef_cache_identity(&out_dir)?;
     let json_output = out_dir.join("records.json");
     let jsonl_output = out_dir.join("records.jsonl");
     write_records(&records, OutputFormat::Json, Some(&json_output))?;
     write_records(&records, OutputFormat::Jsonl, Some(&jsonl_output))?;
+    write_ksef_cache_identity(
+        &out_dir,
+        &KsefCacheIdentity {
+            year,
+            source: "import".to_string(),
+            base_url: None,
+            context_type: None,
+            context_value: None,
+            fetched_at: Utc::now(),
+        },
+    )?;
     Ok(KsefSyncResult {
         summary: KsefSyncSummary {
             year,
@@ -994,42 +1476,376 @@ mod tests {
         assert!(!is_missing_ksef_token(&anyhow!("inny błąd KSeF")));
     }
 
-    #[test]
-    fn disabled_fresh_cache_preserves_explicit_tokenless_fallback() {
+    fn temp_root(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "lab-ksef-cache-{}-{}",
+            "lab-ksef-{tag}-{}-{}",
             std::process::id(),
             Utc::now().timestamp_nanos_opt().unwrap_or(0)
         ));
         fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn target(year: i32, base_url: &str, context_value: &str) -> KsefCacheTarget {
+        KsefCacheTarget {
+            year,
+            base_url: base_url.to_string(),
+            context_type: "Nip".to_string(),
+            context_value: context_value.to_string(),
+        }
+    }
+
+    const TEST_BASE_URL: &str = "https://api-test.ksef.mf.gov.pl/v2";
+
+    fn write_cached_records(dir: &Path, issue_date: Option<&str>) {
+        fs::create_dir_all(dir).unwrap();
         let mut record = empty_record(SourceKind::Ksef);
         record.content_hash = "ksef:cache-test".to_string();
+        record.issue_date = issue_date.and_then(parse_date);
         fs::write(
-            root.join("records.jsonl"),
+            dir.join("records.jsonl"),
             serde_json::to_string(&record).unwrap(),
         )
         .unwrap();
+    }
 
-        assert!(
-            ksef_fresh_cached_sync_result_with_ttl(2026, Some(&root), None, None)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            ksef_fresh_cached_sync_result_with_ttl(
-                2026,
-                Some(&root),
-                None,
-                Some(Duration::from_secs(3600)),
-            )
-            .unwrap()
-            .is_some()
-        );
-        let fallback = ksef_cached_sync_result(2026, Some(&root), None, None)
-            .unwrap()
-            .unwrap();
-        assert_eq!(fallback.records.len(), 1);
+    fn metadata_page() -> Vec<Value> {
+        vec![serde_json::json!({
+            "ksefNumber": "1111111111-20260201-ABCDEF-01",
+            "invoiceNumber": "FV/1/2026",
+            "issueDate": "2026-02-01",
+        })]
+    }
+
+    #[test]
+    fn disabled_fresh_cache_preserves_explicit_tokenless_fallback() {
+        let root = temp_root("cache");
+        // Cache sprzed zapisu tożsamości: rok z nazwy katalogu, środowisko produkcyjne.
+        let dir = root.join("ksef-2026");
+        write_cached_records(&dir, None);
+        let prod = target(2026, KSEF_PROD_BASE_URL, "1111111111");
+
+        let fetches = std::cell::Cell::new(0);
+        let result = ksef_sync_with_fetcher(2026, Some(&dir), None, None, &prod, |_| {
+            fetches.set(fetches.get() + 1);
+            Err(missing_ksef_token_error())
+        })
+        .unwrap();
+        assert_eq!(fetches.get(), 1, "bez TTL zawsze najpierw online");
+        assert_eq!(result.records.len(), 1);
+        assert!(result.summary.input.starts_with("cache:"));
+
+        let fresh = ksef_sync_with_fetcher(
+            2026,
+            Some(&dir),
+            None,
+            Some(Duration::from_secs(3600)),
+            &prod,
+            |_| panic!("świeży cache nie powinien iść online"),
+        )
+        .unwrap();
+        assert_eq!(fresh.records.len(), 1);
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn second_call_within_ttl_reuses_cache_and_ttl_zero_forces_refresh() {
+        let root = temp_root("ttl");
+        let dir = root.join("cache");
+        let prod = target(2026, KSEF_PROD_BASE_URL, "1111111111");
+        let fetches = std::cell::Cell::new(0);
+        let fetch = |_: Option<Arc<Mutex<String>>>| {
+            fetches.set(fetches.get() + 1);
+            Ok(metadata_page())
+        };
+        let ttl = ksef_cache_ttl_from(None);
+        assert_eq!(ttl, Some(Duration::from_secs(360 * 60)));
+
+        // `sync`: brak cache → online, zapis z tożsamością.
+        let first = ksef_sync_with_fetcher(2026, Some(&dir), None, ttl, &prod, fetch).unwrap();
+        assert_eq!(fetches.get(), 1);
+        assert!(first.summary.input.starts_with("online:"));
+        let identity = read_ksef_cache_identity(&dir).unwrap().unwrap();
+        assert_eq!(identity.year, 2026);
+        assert_eq!(identity.base_url.as_deref(), Some(KSEF_PROD_BASE_URL));
+        assert_eq!(identity.context_value.as_deref(), Some("1111111111"));
+
+        // `reconcile` chwilę później: ten sam cache, bez zapytania online.
+        let second = ksef_sync_with_fetcher(2026, Some(&dir), None, ttl, &prod, fetch).unwrap();
+        assert_eq!(fetches.get(), 1);
+        assert!(second.summary.input.starts_with("cache:"));
+        assert_eq!(second.records.len(), 1);
+
+        // KSEF_CACHE_TTL_MINS=0: zawsze online.
+        let zero = ksef_cache_ttl_from(Some("0"));
+        assert_eq!(zero, None);
+        let third = ksef_sync_with_fetcher(2026, Some(&dir), None, zero, &prod, fetch).unwrap();
+        assert_eq!(fetches.get(), 2);
+        assert!(third.summary.input.starts_with("online:"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cache_refused_when_environment_context_or_year_differs() {
+        let root = temp_root("identity");
+        let dir = root.join("cache");
+        let prod = target(2026, KSEF_PROD_BASE_URL, "1111111111");
+        let ttl = Some(Duration::from_secs(3600));
+        ksef_sync_with_fetcher(2026, Some(&dir), None, None, &prod, |_| Ok(metadata_page()))
+            .unwrap();
+
+        let refused = |year: i32, target: &KsefCacheTarget| match ksef_cache_lookup(
+            year,
+            Some(&dir),
+            None,
+            ttl,
+            target,
+        )
+        .unwrap()
+        {
+            KsefCacheLookup::Refused(reason) => reason,
+            KsefCacheLookup::Hit(_) => panic!("cache nie powinien pasować"),
+            KsefCacheLookup::Missing | KsefCacheLookup::Stale => panic!("brak/stary cache"),
+        };
+        assert!(matches!(
+            ksef_cache_lookup(2026, Some(&dir), None, ttl, &prod).unwrap(),
+            KsefCacheLookup::Hit(_)
+        ));
+        assert!(refused(2026, &target(2026, TEST_BASE_URL, "1111111111")).contains("środowiska"));
+        assert!(
+            refused(2026, &target(2026, KSEF_PROD_BASE_URL, "2222222222")).contains("kontekstu")
+        );
+        assert!(refused(2025, &target(2025, KSEF_PROD_BASE_URL, "1111111111")).contains("roku"));
+
+        // Brak tokenu + cache z innego środowiska: błąd z powodem, nadal "brak KSEF_TOKEN".
+        let test_env = target(2026, TEST_BASE_URL, "1111111111");
+        let err = ksef_sync_with_fetcher(2026, Some(&dir), None, None, &test_env, |_| {
+            Err(missing_ksef_token_error())
+        })
+        .err()
+        .unwrap();
+        assert!(is_missing_ksef_token(&err));
+        assert!(err.to_string().contains("nie używam"), "{err}");
+
+        // Świeży, ale niepasujący cache → online; nowa tożsamość zastępuje starą.
+        let fetches = std::cell::Cell::new(0);
+        ksef_sync_with_fetcher(2026, Some(&dir), None, ttl, &test_env, |_| {
+            fetches.set(fetches.get() + 1);
+            Ok(metadata_page())
+        })
+        .unwrap();
+        assert_eq!(fetches.get(), 1);
+        let identity = read_ksef_cache_identity(&dir).unwrap().unwrap();
+        assert_eq!(identity.base_url.as_deref(), Some(TEST_BASE_URL));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn legacy_cache_without_identity_only_for_production_and_its_year() {
+        let root = temp_root("legacy");
+        let ttl = Some(Duration::from_secs(3600));
+        let prod = |year| target(year, KSEF_PROD_BASE_URL, "1111111111");
+        let is_hit = |dir: &Path, year: i32, target: &KsefCacheTarget| {
+            matches!(
+                ksef_cache_lookup(year, Some(dir), None, ttl, target).unwrap(),
+                KsefCacheLookup::Hit(_)
+            )
+        };
+
+        let named = root.join("ksef-2026");
+        write_cached_records(&named, None);
+        assert!(is_hit(&named, 2026, &prod(2026)));
+        assert!(!is_hit(&named, 2025, &prod(2025)));
+        assert!(!is_hit(
+            &named,
+            2026,
+            &target(2026, TEST_BASE_URL, "1111111111")
+        ));
+
+        // Katalog bez roku w nazwie: rok z dat wystawienia; bez dat — odrzucony.
+        let dated = root.join("dane");
+        write_cached_records(&dated, Some("2026-03-15"));
+        assert!(is_hit(&dated, 2026, &prod(2026)));
+        assert!(!is_hit(&dated, 2025, &prod(2025)));
+        let undated = root.join("bez-dat");
+        write_cached_records(&undated, None);
+        assert!(!is_hit(&undated, 2026, &prod(2026)));
+
+        // Następny udany fetch zapisuje tożsamość.
+        assert!(read_ksef_cache_identity(&named).unwrap().is_none());
+        ksef_sync_with_fetcher(2026, Some(&named), None, None, &prod(2026), |_| {
+            Ok(metadata_page())
+        })
+        .unwrap();
+        let identity = read_ksef_cache_identity(&named).unwrap().unwrap();
+        assert_eq!(identity.source, "online");
+        assert_eq!(identity.base_url.as_deref(), Some(KSEF_PROD_BASE_URL));
+
+        // Import lokalnego eksportu: rok zapisany, środowisko nieznane → tylko produkcja.
+        let imported = root.join("import");
+        let input = root.join("export.jsonl");
+        write_cached_records(&root.join("export-src"), None);
+        fs::copy(root.join("export-src").join("records.jsonl"), &input).unwrap();
+        ksef_sync(2026, &input, Some(&imported)).unwrap();
+        let identity = read_ksef_cache_identity(&imported).unwrap().unwrap();
+        assert_eq!((identity.year, identity.source.as_str()), (2026, "import"));
+        assert!(is_hit(&imported, 2026, &prod(2026)));
+        assert!(!is_hit(&imported, 2025, &prod(2025)));
+        assert!(!is_hit(
+            &imported,
+            2026,
+            &target(2026, TEST_BASE_URL, "1111111111")
+        ));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn ksef_data_dir_uses_per_year_directory() {
+        let root = temp_root("datadir");
+        let data_dir = root.join("dane");
+        fs::create_dir_all(&data_dir).unwrap();
+        assert_eq!(
+            ksef_data_dir_year_path(&data_dir, 2026),
+            data_dir.join("ksef-2026")
+        );
+        assert_eq!(
+            ksef_data_dir_year_path(&data_dir, 2025),
+            data_dir.join("ksef-2025")
+        );
+
+        // Stary katalog bez podkatalogu roku: czytany tylko dla roku z jego tożsamości.
+        write_cached_records(&data_dir, Some("2026-01-10"));
+        assert_eq!(ksef_data_dir_year_path(&data_dir, 2026), data_dir);
+        assert_eq!(
+            ksef_data_dir_year_path(&data_dir, 2025),
+            data_dir.join("ksef-2025")
+        );
+        write_ksef_cache_identity(
+            &data_dir,
+            &target(2025, KSEF_PROD_BASE_URL, "1111111111").online_identity(),
+        )
+        .unwrap();
+        assert_eq!(ksef_data_dir_year_path(&data_dir, 2025), data_dir);
+        assert_eq!(
+            ksef_data_dir_year_path(&data_dir, 2026),
+            data_dir.join("ksef-2026")
+        );
+
+        // Istniejący katalog roku ma pierwszeństwo.
+        write_cached_records(&data_dir.join("ksef-2025"), Some("2025-05-05"));
+        assert_eq!(
+            ksef_data_dir_year_path(&data_dir, 2025),
+            data_dir.join("ksef-2025")
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn token(value: &str, valid_until: Option<DateTime<Utc>>) -> KsefAccessToken {
+        KsefAccessToken {
+            token: value.to_string(),
+            valid_until,
+        }
+    }
+
+    #[test]
+    fn access_token_renewed_before_request_when_near_expiry() {
+        let now = Utc::now();
+        let renewals = std::cell::RefCell::new(Vec::new());
+        let sent = std::cell::RefCell::new(Vec::new());
+        let mut current = token("stary", Some(now + chrono::Duration::seconds(30)));
+        let value = ksef_authorized_request(
+            &mut current,
+            "test",
+            || Ok(()),
+            || now,
+            |rejected| {
+                renewals.borrow_mut().push(rejected.map(str::to_string));
+                Ok(token("nowy", Some(now + chrono::Duration::minutes(15))))
+            },
+            |token| {
+                sent.borrow_mut().push(token.to_string());
+                Ok(KsefAuthorized::Done(7))
+            },
+        )
+        .unwrap();
+        assert_eq!(value, 7);
+        assert_eq!(*renewals.borrow(), vec![None]);
+        assert_eq!(*sent.borrow(), vec!["nowy".to_string()]);
+        assert_eq!(current.token, "nowy");
+
+        // Ważny token i token bez znanej ważności: bez odnawiania.
+        for mut valid in [
+            token("ważny", Some(now + chrono::Duration::minutes(10))),
+            token("env", None),
+        ] {
+            ksef_authorized_request(
+                &mut valid,
+                "test",
+                || Ok(()),
+                || now,
+                |_| panic!("nie odnawiaj ważnego tokenu"),
+                |_| Ok(KsefAuthorized::Done(())),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn unauthorized_response_retried_once_after_reauthentication() {
+        let now = Utc::now();
+        let far = Some(now + chrono::Duration::minutes(15));
+        let renewals = std::cell::RefCell::new(Vec::new());
+        let sent = std::cell::RefCell::new(Vec::new());
+        let waits = std::cell::Cell::new(0);
+        let mut current = token("odrzucony", far);
+        let value = ksef_authorized_request(
+            &mut current,
+            "test",
+            || {
+                waits.set(waits.get() + 1);
+                Ok(())
+            },
+            || now,
+            |rejected| {
+                renewals.borrow_mut().push(rejected.map(str::to_string));
+                Ok(token("nowy", far))
+            },
+            |token| {
+                sent.borrow_mut().push(token.to_string());
+                Ok(if token == "odrzucony" {
+                    KsefAuthorized::Unauthorized("expired".to_string())
+                } else {
+                    KsefAuthorized::Done("ok")
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(value, "ok");
+        assert_eq!(*renewals.borrow(), vec![Some("odrzucony".to_string())]);
+        assert_eq!(*sent.borrow(), vec!["odrzucony", "nowy"]);
+        assert_eq!(waits.get(), 2, "powtórka też przechodzi przez limiter");
+
+        // Ciągłe 401: jedno ponowne logowanie, dwa zapytania, potem błąd.
+        let renew_count = std::cell::Cell::new(0);
+        let send_count = std::cell::Cell::new(0);
+        let mut current = token("a", far);
+        let err = ksef_authorized_request(
+            &mut current,
+            "test",
+            || Ok(()),
+            || now,
+            |_| {
+                renew_count.set(renew_count.get() + 1);
+                Ok(token("b", far))
+            },
+            |_| {
+                send_count.set(send_count.get() + 1);
+                Ok(KsefAuthorized::<()>::Unauthorized("nope".to_string()))
+            },
+        )
+        .unwrap_err();
+        assert_eq!((renew_count.get(), send_count.get()), (1, 2));
+        assert!(err.to_string().contains("401"), "{err}");
     }
 
     #[test]
@@ -1043,5 +1859,124 @@ mod tests {
         let config = ksef_online_config().unwrap();
         assert!(config.ksef_token.is_none());
         assert_eq!(config.context_value, DEFAULT_PRODUCTMESH_NIP);
+    }
+
+    #[test]
+    fn exact_ranges_are_the_plain_quarters_and_bad_request_is_detected() {
+        let exact = ksef_year_exact_quarter_ranges(2026);
+        assert_eq!(exact.len(), ksef_year_quarter_ranges(2026).len());
+        assert_eq!(exact[0].0, "2026-01-01T00:00:00+00:00");
+        assert_eq!(exact[0].1, "2026-04-01T00:00:00+00:00");
+        assert_eq!(exact[3].0, "2026-10-01T00:00:00+00:00");
+        assert_eq!(exact[3].1, "2027-01-01T00:00:00+00:00");
+        // Only the first and last widened ranges differ from the exact ones.
+        let wide = ksef_year_quarter_ranges(2026);
+        assert_ne!(wide[0], exact[0]);
+        assert_eq!(wide[1], exact[1]);
+        assert_eq!(wide[2], exact[2]);
+        assert_ne!(wide[3], exact[3]);
+        assert!(ksef_error_is_bad_request(&anyhow!(
+            "KSeF query invoice metadata HTTP 400 Bad Request: zakres"
+        )));
+        assert!(!ksef_error_is_bad_request(&anyhow!(
+            "KSeF query invoice metadata HTTP 403 Forbidden: x"
+        )));
+    }
+
+    #[test]
+    fn year_ranges_cover_neighbour_days_without_gaps() {
+        let parse = |value: &str| {
+            DateTime::parse_from_rfc3339(value)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        let day = |y: i32, m: u32, d: u32| {
+            NaiveDate::from_ymd_opt(y, m, d)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+        };
+        for year in [2024, 2026] {
+            let ranges = ksef_year_quarter_ranges(year);
+            // Same number of metadata requests per subject type as before.
+            assert_eq!(ranges.len(), 4);
+            let bounds = ranges
+                .iter()
+                .map(|(from, to)| (parse(from), parse(to)))
+                .collect::<Vec<_>>();
+            assert!(bounds[0].0 <= day(year - 1, 12, 31));
+            // 1 Jan of the next year is wholly inside, even with an exclusive `to`.
+            assert!(bounds[3].1 >= day(year + 1, 1, 2));
+            for (from, to) in &bounds {
+                assert!(from < to, "{from}..{to}");
+            }
+            for pair in bounds.windows(2) {
+                assert!(pair[1].0 <= pair[0].1, "gap between {pair:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn year_records_drop_neighbour_days_and_dedupe_overlaps() {
+        let item = |number: &str, issue_date: Option<&str>| {
+            let mut item = serde_json::json!({
+                "ksefNumber": number,
+                "invoiceNumber": format!("FV/{number}"),
+            });
+            if let Some(date) = issue_date {
+                item["issueDate"] = serde_json::json!(date);
+            }
+            item
+        };
+        let metadata = vec![
+            item("1111111111-20251231-AAAAAAAAAAAA-01", Some("2025-12-31")),
+            item("1111111111-20260101-BBBBBBBBBBBB-02", Some("2026-01-01")),
+            item("1111111111-20260401-CCCCCCCCCCCC-03", Some("2026-04-01")),
+            // Same document from the overlapping neighbour range.
+            item("1111111111-20260401-CCCCCCCCCCCC-03", Some("2026-04-01")),
+            item("1111111111-20260101-bbbbbbbbbbbb-02", Some("2026-01-01")),
+            item("1111111111-20261231-DDDDDDDDDDDD-04", Some("2026-12-31")),
+            item("1111111111-20270101-EEEEEEEEEEEE-05", Some("2027-01-01")),
+            item("1111111111-20260000-FFFFFFFFFFFF-06", None),
+            item("1111111111-20260000-GGGGGGGGGGGG-07", Some("bez daty")),
+        ];
+        let records = ksef_metadata_records_for_year(&metadata, 2026);
+        let numbers = records
+            .iter()
+            .map(|record| record.ksef_reference.clone().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            numbers,
+            vec![
+                "1111111111-20260101-BBBBBBBBBBBB-02",
+                "1111111111-20260401-CCCCCCCCCCCC-03",
+                "1111111111-20261231-DDDDDDDDDDDD-04",
+                "1111111111-20260000-FFFFFFFFFFFF-06",
+                "1111111111-20260000-GGGGGGGGGGGG-07",
+            ]
+        );
+    }
+
+    #[test]
+    fn stored_online_metadata_keeps_only_the_requested_year() {
+        let root = temp_root("year-filter");
+        let dir = root.join("cache");
+        let prod = target(2026, KSEF_PROD_BASE_URL, "1111111111");
+        let mut metadata = metadata_page();
+        metadata.push(serde_json::json!({
+            "ksefNumber": "1111111111-20270101-ABCDEF-02",
+            "invoiceNumber": "FV/1/2027",
+            "issueDate": "2027-01-01",
+        }));
+        let result =
+            ksef_sync_with_fetcher(2026, Some(&dir), None, None, &prod, |_| Ok(metadata)).unwrap();
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.summary.records_count, 1);
+        assert_eq!(
+            result.records[0].invoice_number.as_deref(),
+            Some("FV/1/2026")
+        );
+        fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -6,3 +6,6 @@
 .env
 .env.*
 !.env.example
+.DS_Store
+# Temp files left by an interrupted secret write, e.g. ..env.lab-tmp-123
+.*.lab-tmp-*
